@@ -15,3 +15,9 @@ async-trait.workspace = true
 futures-core.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+
+# Round-trip tests need a self-describing format to round-trip through. JSON is not a
+# wire format of this project — the wire format is `a{sv}`, produced in the daemon —
+# so this stays a dev-dependency.
+[dev-dependencies]
+serde_json.workspace = true

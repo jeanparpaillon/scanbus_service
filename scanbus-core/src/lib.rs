@@ -9,4 +9,8 @@ pub mod backend;
 pub mod error;
 pub mod model;
 
-pub use error::BackendError;
+pub use error::{BackendError, InvalidScannerId, ParseError};
+pub use model::{
+    ButtonInfo, ButtonsCapability, Capabilities, ColorMode, PageFormat, PairingState, ProfileKind,
+    RawPage, ScannerId, ScannerInfo, Source, Status, Value,
+};
