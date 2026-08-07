@@ -9,6 +9,7 @@ pub mod backend;
 pub mod error;
 pub mod model;
 
+pub use backend::{ButtonPressedEvent, PairingProgress, ScannerBackend};
 pub use error::{BackendError, InvalidScannerId, ParseError};
 pub use model::{
     ButtonInfo, ButtonsCapability, Capabilities, ColorMode, PageFormat, PairingState, ProfileKind,

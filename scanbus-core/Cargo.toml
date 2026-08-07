@@ -6,6 +6,12 @@ edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 
+# `mock` exports the fake backend to other crates; inside this crate it is compiled for
+# `cargo test` regardless, so `cargo test` here needs no feature flag. The daemon's
+# tests (2.8) enable it as `scanbus-core = { workspace = true, features = ["mock"] }`.
+[features]
+mock = []
+
 # Nothing here may pull in zbus or dbus, directly or transitively: everything worth
 # testing (the pairing state machine, the profile pipeline, the button -> profile
 # mapping) has to be reachable without a bus connection. scripts/check-core-deps.sh
@@ -15,9 +21,18 @@ async-trait.workspace = true
 futures-core.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+# `sync` only: the mpsc channel `ensure_installed` reports progress through is part of
+# the trait's signature, so it is a public dependency of core. The runtime itself is the
+# daemon's business.
+tokio = { workspace = true, features = ["sync"] }
 
 # Round-trip tests need a self-describing format to round-trip through. JSON is not a
 # wire format of this project — the wire format is `a{sv}`, produced in the daemon —
 # so this stays a dev-dependency.
 [dev-dependencies]
+# Stream combinators (`next`, `collect`) and `poll!`, which is how the cancellation test
+# drops a future mid-flight without a timer. Consumers of the streams live in the
+# daemon, so this is not a dependency of the library itself.
+futures-util.workspace = true
 serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }

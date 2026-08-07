@@ -21,6 +21,8 @@ hplip = ["dep:scanbus-backend-hplip"]
 scanbus-core.workspace = true
 scanbus-backend-brother = { workspace = true, optional = true }
 scanbus-backend-hplip = { workspace = true, optional = true }
-tokio.workspace = true
+# The runtime lives here, not in the workspace defaults: `signal` is what the shutdown
+# path needs and `rt-multi-thread` what `#[tokio::main]` starts.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
