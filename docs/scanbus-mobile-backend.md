@@ -1,0 +1,386 @@
+# The mobile backend — a scanner that dials us
+
+Host-side design for `scanbus-backend-mobile`, the backend that makes a phone running
+the scanbus mobile app appear as a `Scanner1`. The device-side protocol is specified in
+[app-specs.md](https://github.com/jeanparpaillon/scanbus_android_app/blob/master/docs/app-specs.md)
+(the `scanbus_android_app` repository); this document is what the daemon does with it,
+which of its assumptions do not survive contact with the D-Bus API of
+[scanbus-dbus-api.md](scanbus-dbus-api.md), and what has to change on either side.
+
+Read §10 first if you are working on the app: it is the list of things the app has to do
+that its own spec does not say.
+
+## 1. Why it looks nothing like Brother or HP
+
+Every assumption baked into `ScannerBackend`
+([scanbus-rust-implementation.md](scanbus-rust-implementation.md) §3) is inverted here,
+and each inversion is load-bearing rather than cosmetic:
+
+| | Brother / HP | Mobile |
+|---|---|---|
+| Who is discovered | the device, by us | the device advertises, we browse |
+| Who opens the connection | the host, to the device | **the app, to the host** |
+| What triggers a scan | a physical key | an upload that arrives with its profile already chosen |
+| Where the data comes from | we pull it after the trigger | it is already on the wire behind the trigger |
+| Listener lifetime | one per paired scanner | **one for all of them**, for the life of the daemon |
+| `ensure_installed` | downloads a `.deb` | there is nothing to install; the handshake happens here instead |
+| Buttons | 1–4 fixed keys | none |
+
+The consequence worth stating up front: **after pairing, the host never dials the phone
+again.** Not to check it is alive, not to fetch pages, not to configure it. That single
+fact removes an entire class of problem the other two backends have — a stale IP address
+does not matter, NAT does not matter, the phone sleeping does not matter — and creates
+exactly one new one, which is that the host cannot tell whether a paired phone is
+reachable (§7).
+
+## 2. Naming
+
+The backend is `mobile`, not `android`. app-specs.md §4 calls it `AndroidBackend` with
+`Backend="android"`; the protocol has nothing Android-specific in it — no ADB, no
+Play-services dependency, no `NsdManager` detail on the wire — and an iOS or a desktop
+implementation of the same three messages would be indistinguishable to this daemon. A
+`Backend` property that names an OS would then be a lie we could not fix without
+breaking clients that match on it.
+
+| Thing | Value |
+|---|---|
+| Crate | `scanbus-backend-mobile` |
+| Daemon feature | `mobile` |
+| `ScannerBackend::id()` | `"mobile"` |
+| `Scanner1.Backend` | `"mobile"` |
+| `ScannerId` | `ScannerId::from_backend("mobile", <TXT id>)` |
+| mDNS service type | `_scanbus-mobile._tcp.local.` (unchanged — already correct) |
+
+## 3. The wire protocol
+
+One framing rule for everything: a big-endian `u32` byte count, then that many bytes.
+Control frames are UTF-8 JSON; page frames are the encoded image. This is app-specs.md
+§2 unchanged, and it is the right call — it is four lines of Kotlin and four lines of
+Rust, and no sub-protocol needs a second parser.
+
+What the spec leaves out, and what the host imposes:
+
+- **A length prefix is an allocation request from an unauthenticated peer.** Validate
+  before allocating: control frames are capped at 64 KiB, page frames at a configurable
+  `max_page_bytes` (default 64 MiB), and a zero length is a protocol error. Read the
+  cap, then `read_exact`, never `read_to_end`.
+- **Version goes in the frame, not only in TXT.** The mDNS TXT record carries `v=1`, but
+  the upload connection (§5) has no mDNS context at all — the app dials a remembered
+  address. Both `pair_request` and `upload` carry `"v":1`, and a version this daemon
+  does not implement is refused with a named reason rather than a parse failure. This is
+  errata against app-specs.md §2 and §3.
+- **Unknown fields are ignored, unknown `type` is refused.** Serde defaults on the way
+  in, so a later app may add fields; an unrecognised `type` gets
+  `{"type":"ack","status":"error","reason":"unsupported"}` and the connection closes.
+- **Every read has a deadline.** 5 s for the handshake frames, 30 s per frame during an
+  upload. A peer that opens a connection and says nothing must not hold a slot.
+
+Named `reason` values on an error ack — `unauthorized` is the only one app-specs.md
+defines, and the app needs to distinguish "re-pair me" from "try again later":
+
+| `reason` | Meaning | What the app should do |
+|---|---|---|
+| `unauthorized` | unknown `device_id`, or the token does not match | discard the stored pairing, ask the user to pair again |
+| `unsupported_version` | `v` is not one this host speaks | tell the user to update the host |
+| `not_connected` | paired, but the daemon is not currently accepting for it | retry later |
+| `malformed` | framing or JSON the host could not parse | a bug on one side; log it |
+| `too_large` | a frame exceeded the cap | scale the image down and retry |
+
+## 4. Pairing, and the six digits the API cannot currently show
+
+`Scanner1.Pair()` is what starts it (app-specs.md §2). The host generates the nonce, so
+the host has to display it — and `Scanner1` as specified has no property that can carry
+it and no state that means "waiting for a human to look at the phone".
+
+### 4.1 The D-Bus delta
+
+Two additions to [scanbus-dbus-api.md](scanbus-dbus-api.md) §3, deliberately generic
+rather than mobile-specific:
+
+```
+PairingState : "none" | "pairing" | "awaiting_confirmation"
+             | "installing_backend" | "done" | "failed"
+
+PairingInfo  a{sv}  read   {"code": "482913"}   — empty in every other state
+```
+
+`awaiting_confirmation` is not a mobile concept. Any backend that needs a human to do
+something on the device — a PIN on an eSCL panel, a physical confirm button — lands in
+the same state, and a client that renders it correctly once renders all of them. A
+mobile-only second interface would have made every client special-case phones in order
+to show a code at all.
+
+`PairingInfo` is `a{sv}` and not a bare `Code` string for the same reason `Capabilities`
+is: the next backend to reach this state will want to say something slightly different,
+and adding a key is not a breaking change.
+
+This revises issue 2.3, which owns the `Scanner1` properties, and §6/§9 of the API
+document.
+
+### 4.2 The handshake, host side
+
+1. `Pair()` → `PairingState="pairing"`. The address comes from a discovery record; if
+   there is none — the phone was never seen, or the session that saw it ended (2.9) —
+   fail with `org.scanbus.Error.NotReachable` rather than dialling a remembered address.
+   Pairing is the one moment the host initiates, and it must not initiate at a guess.
+2. TCP connect, 5 s timeout. Send `pair_request` with a nonce drawn from a CSPRNG,
+   uniform over `000000`–`999999`, formatted with leading zeros.
+3. `PairingState="awaiting_confirmation"`, `PairingInfo={"code":…}`,
+   `PropertiesChanged`. This is where a UI shows the code next to the phone's name.
+4. Wait for `pair_response`, 120 s. Somebody has to pick up a phone and read a screen;
+   anything under a minute turns a normal pairing into a failure. On timeout:
+   `PairingState="failed"`, `PairingError="the phone did not confirm within 120 s"`.
+5. `accepted:false` → `failed`, `PairingError="rejected on the device"`.
+6. **`device_id` in the response must equal the `id` in the TXT record.** They come over
+   different paths and a mismatch means the thing that answered is not the thing that
+   advertised. Without this check a phone on the network could answer a pairing meant
+   for another and take over its `ScannerId` — and with it, its token slot.
+7. Store `device_id`, the token and `capabilities.profiles` (§8), clear `PairingInfo`,
+   `Paired=true`, `PairingState="done"`.
+
+`CancelPairing()` closes the socket. The app sees the connection drop and dismisses its
+dialog; there is no cancel message, and adding one would only cover the case where the
+host is still alive to send it.
+
+### 4.3 Where the handshake lives in the trait
+
+`ScannerBackend` has no `pair()` — pairing is `ensure_installed` followed by
+`start_listening` (implementation plan §3, issue 1.4). For mobile there is nothing to
+install, and app-specs.md §4 concludes from that that `ensure_installed` returns
+`Ok(())` immediately. That leaves the handshake with no home.
+
+So it goes *in* `ensure_installed`, which is already the method that takes an
+`mpsc::Sender<PairingProgress>` and is already the step the pairing state machine treats
+as "the slow part that must not block `Pair()`". Waiting on a human is exactly that. It
+needs one new `PairingProgress` variant:
+
+```rust
+PairingProgress::AwaitingConfirmation { code: String }
+```
+
+which is what moves 1.4's state machine into `awaiting_confirmation`. This is a smaller
+change than a `pair()` method on the trait, and it keeps one answer to "which call can
+take two minutes".
+
+### 4.4 `Unpair()` needs a trait method that does not exist
+
+Revoking the token is backend state, and nothing on `ScannerBackend` says "forget this
+scanner". `stop_listening` is not it — a paired phone whose listener is stopped must
+still be recognised when it uploads.
+
+Add `async fn forget(&self, scanner_id: &ScannerId) -> Result<(), BackendError>`, with a
+default `Ok(())`. Brother needs the same hook to drop its `brscan-skey.config` entry
+(5.4), so this is two callers, not one.
+
+After `forget`, an upload bearing the old token gets `unauthorized` and no `Job1`. The
+phone is not notified — there is no channel to notify it on — and learns at its next
+upload. That is the intended design: `Unpair()` on the host must work with the phone
+switched off.
+
+## 5. One listener, on a port that must outlive the daemon
+
+There is no per-scanner `start_listening` in the network sense: a single TCP listener
+serves every paired phone (app-specs.md §4). It is bound once, by the backend, at
+construction — before the bus name appears (4.2) — and `start_listening(scanner)` only
+subscribes to a `device_id`-filtered view of it.
+
+**The port cannot be ephemeral.** app-specs.md §1 says "ephemeral" and §2 says
+`upload_port` is communicated once during pairing so the app never needs discovery
+again. Both cannot be true: a port picked afresh at each start silently breaks every
+phone paired before the last restart, and the failure looks like "the app says sent, the
+computer has nothing".
+
+So:
+
+- `mobile.upload_port` in the daemon config. `0` — the default — means *pick one now and
+  write it down*, not *pick one each time*. The chosen port is persisted with the device
+  table (§8) and reused forever after.
+- If the persisted port is taken at startup, that is a hard, loud failure: log it, and
+  every mobile scanner comes up `Status="offline"`. **Do not silently re-pick.** A
+  re-pick trades one visible failure for N invisible ones.
+- Bind `[::]` with dual-stack when available, `0.0.0.0` otherwise. It has to be
+  reachable from the LAN; there is no useful loopback-only mode except in tests.
+
+Caps, because this socket is open to the local network:
+
+| | Default |
+|---|---|
+| Concurrent authenticated uploads | 8 |
+| Connections awaiting their first frame | 16, 5 s deadline each |
+| Control frame | 64 KiB |
+| Page frame | 64 MiB (`mobile.max_page_bytes`) |
+| Pages per job (`of`) | 200 |
+
+## 6. From an upload to a `Job1`
+
+An upload arrives with its profile chosen and its bytes on the same connection. The
+trait expects `start_listening` to yield `ButtonPressedEvent` and `fetch_pages` to be a
+pull the daemon makes afterwards. Two amendments to issue 1.3 reconcile them.
+
+### 6.1 The trigger is not always a button
+
+```rust
+pub struct ScanTrigger {
+    pub id: TriggerId,
+    pub scanner_id: ScannerId,
+    pub kind: TriggerKind,
+    pub timestamp: SystemTime,
+}
+
+pub enum TriggerKind {
+    /// A physical key. The profile lives in `Button1.Profile` on the host.
+    Button { index: u32 },
+    /// The device chose the profile and is sending the data now.
+    Push { profile: ProfileKind },
+}
+```
+
+Issue 1.3 argues that a backend reporting a profile "is telling us something it learned
+from a config file *we* wrote". That argument is exactly right for Brother and does not
+apply here: the profile in an upload was chosen by a human in the app, on the phone, and
+the host has never written anything about it. `Push` carries a profile because the
+profile genuinely originates there.
+
+`Job1.Button = -1` for `Push`, which app-specs.md §3 already requires and which §4 of
+the API already defines as "not triggered by a key".
+
+Profile precedence for a mobile job: the upload's profile wins over the session profile
+from `Connect(options)` and over `DefaultProfile`. It is the most specific and the most
+recent statement of intent. Precedence for the other cases is 2.4's.
+
+### 6.2 `fetch_pages` should take the trigger, not a job id
+
+`fetch_pages(scanner_id, job_id)` asks the backend to key a page stream by an identifier
+the backend has never seen — `job_id` is minted by the daemon after the trigger arrives.
+For Brother that works by accident, because there is one scan in flight per scanner. For
+mobile, two uploads from one phone would race, and the backend's only recovery would be
+FIFO guesswork.
+
+`fetch_pages(&self, trigger: &TriggerId)` removes the guess. The backend hands out the
+id, the daemon hands it back, and the correlation is exact. 1.3's "callable exactly once
+per job id" becomes "exactly once per trigger id" and stays true.
+
+### 6.3 Ack semantics
+
+The ack for page *n* is sent once its bytes are in the daemon's page stream — not once
+the profile pipeline has finished with them. PDF assembly happens after `page == of` and
+can take seconds; an app whose progress bar waits on it looks hung.
+
+The gap this leaves is real and is not closed here: a job that fails during processing
+(no disk space, unwritable output directory) has already been acked as `ok`. The app
+reports success, the host reports an error, and only the host is right. Closing it needs
+a fourth message type — see §10.
+
+### 6.4 The failure cases
+
+- Connection drops mid-job → `Job1.State="error"`,
+  `Error="connection lost after page 2 of 3"`, **pages received so far are discarded.**
+  A three-page PDF containing two pages is worse than no PDF, because it looks fine.
+- `page` not `1`-based and strictly incrementing, or `of` changing between frames →
+  error ack `malformed`, close, job errors.
+- Upload for a `device_id` that is paired but has no active subscriber → `not_connected`
+  and no `Job1`. Reachable when an upload lands during daemon startup.
+- Backpressure is TCP's: the page channel is bounded, and a stalled pipeline stops the
+  socket being read. This is the correct behaviour — the phone waits.
+
+## 7. `Status`, `Connect`, and reachability the host cannot observe
+
+`Connect()`/`Disconnect()` are functional no-ops (app-specs.md §4): they set `Connected`
+and nothing goes on the wire. That part is straightforward.
+
+`Status` is not. The API says `Status` is reachability of the *device* (§3, §9), and for
+a paired phone the host has no way to know it: it never dials, and mDNS is not a proxy
+for it — Android stops advertising when the app is not in the foreground, so a perfectly
+usable phone in a pocket would read `offline`, and a client would grey out the scanner
+that is about to send a scan.
+
+So, for mobile only, and documented as such: **`Status` reports the host's readiness to
+receive.** `online` whenever the shared listener is bound; `offline` when it is not.
+`busy` while an upload is in flight for that device. An unpaired phone seen during
+discovery is `online` because it is, by definition, advertising right now.
+
+This is a deviation from §9's "reachable ≠ paired" reading, and the honest alternative —
+inventing a heartbeat so the host can observe the phone — is a protocol addition that
+buys a status field and costs battery.
+
+## 8. Persistence: the token is the backend's, not the daemon's
+
+The pairing store of 4.1 holds the host's half of a pairing — `Paired`, button
+assignments, profile options — as `scanbus-core`'s model documentation already puts it:
+the backend's `ScannerInfo` and the daemon's registry state are deliberately separate,
+so that a rediscovery cannot reset a pairing.
+
+The token is the backend's half, and it stays there:
+`$XDG_DATA_HOME/scanbus/mobile/devices.json`, mode `0600`, holding per device the
+`device_id`, the profiles it advertised, a timestamp, and the token — **stored as a
+SHA-256 hash, not in clear.** The host only ever needs to compare, comparison is against
+a hash just as easily, and a readable file is one backup or one screen-share away from a
+leaked credential. Compare in constant time regardless: the token is a bearer secret.
+
+The same file holds the chosen `upload_port` (§5).
+
+Two stores means they can disagree. The reconciliation rule at startup:
+
+- daemon says paired, backend has no token → `Paired=false`, `PairingState="failed"`,
+  `PairingError="the pairing secret is missing; pair the phone again"`. Silently
+  reporting `Paired=true` would produce a scanner that can never receive anything and
+  never says why.
+- backend has a token, daemon knows no such scanner → drop the token. It is unreachable
+  state.
+
+The alternative — a `PairingProgress::BackendState(json)` variant the daemon persists
+opaquely on the backend's behalf — keeps one store and puts a secret through the
+daemon's serialiser and into its log statements. It is worth revisiting if a third
+backend needs persistent state, and not before.
+
+## 9. Testing without a phone
+
+The entire protocol is loopback-testable, which makes this the first backend whose
+acceptance criteria do not read "plug in a printer":
+
+- The codec and the message types are pure and unit-tested (9.1) — truncated frames,
+  oversized lengths, unknown `type`, `v` of 2.
+- Integration tests drive both sides over a loopback socket with mDNS bypassed by
+  injecting the address, covering rejection, timeout, bad token, dropped connection
+  mid-page, and a 3-page document.
+- `scanbus-mobile-sim`, a dev binary that advertises over mDNS and plays the app: pair,
+  then upload N pages of a fixture image. This is what lets the daemon, the CLI (8.x)
+  and the GNOME extension be exercised end to end while the Android app is still being
+  written, and what the app itself can be diffed against when it is.
+- The conformance suite (2.8) gains a mobile scenario on its private bus.
+
+CI compiles and tests this backend by default, unlike `brother` and `hplip`: it shells
+out to nothing and needs no hardware. The `mobile` feature exists to allow it to be
+turned *off*, not because it is exotic.
+
+## 10. Errata and open questions for app-specs.md
+
+Things the app has to do that its own specification does not say, or says wrongly. Each
+needs agreement in the `scanbus_android_app` repository before the app implements it.
+
+1. **The port in §1 must not be ephemeral** in the sense of "different each run" — see
+   §5. The pairing port genuinely can be ephemeral; the host's `upload_port` cannot.
+2. **`"v":1` in `pair_request` and `upload`** — §3 above.
+3. **The named `reason` values** an app must handle — §3 above. In particular
+   `unauthorized` means *discard the stored pairing*, not *retry*.
+4. **Which host address the app dials.** §3 says `{host_ip}` without saying where it
+   comes from. It is the source address of the pairing connection — the interface the
+   host actually reached the phone on. A `host_ip` field in `pair_request` would be
+   wrong for exactly the multi-homed and VPN cases that make the question interesting.
+5. **A host whose DHCP lease changes breaks every paired phone**, permanently, because
+   §2 removes discovery from the upload path. The cheap fix is for the host to advertise
+   `_scanbus-host._tcp` with `id=<host_id>`, and for the app to fall back to browsing
+   for its paired `host_id` when the stored address refuses a connection. Recommended,
+   not in the base protocol, and it needs the app side to agree.
+6. **`page`/`of` bounds**: 1-based, strictly incrementing, `of` constant for the life of
+   the connection, `of` ≤ 200.
+7. **A per-job final status.** §6.3 above: the ack means "received", and there is no
+   message that means "your document was written". A `{"type":"job","status":…}` frame
+   the host sends after the pipeline finishes would close it. Deferred, because it turns
+   a fire-and-forget upload into a session the app has to keep alive.
+8. **TLS**, which §5 of app-specs.md already names as the first hardening step: a
+   self-signed certificate generated by the host, its fingerprint in `pair_response`,
+   pinned by the app. Nothing in this design blocks it — it is a wrapper around the same
+   framed stream — and nothing here should be built in a way that assumes cleartext.
+   Until then, the security model is "a trusted home network", and it should be said out
+   loud in the app's pairing screen rather than only in a specification.
