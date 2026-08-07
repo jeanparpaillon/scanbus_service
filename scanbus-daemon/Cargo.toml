@@ -1,0 +1,26 @@
+[package]
+name = "scanbus-daemon"
+description = "scanbus D-Bus service"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "scanbus-daemon"
+path = "src/main.rs"
+
+# Both backends are off by default: they shell out to hardware-specific tooling that
+# CI does not have. `cargo build` compiles neither crate.
+[features]
+default = []
+brother = ["dep:scanbus-backend-brother"]
+hplip = ["dep:scanbus-backend-hplip"]
+
+[dependencies]
+scanbus-core.workspace = true
+scanbus-backend-brother = { workspace = true, optional = true }
+scanbus-backend-hplip = { workspace = true, optional = true }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # MSRV, matching `rust-version` in the workspace Cargo.toml and the compiler on the
+  # development machine.
+  RUST_VERSION: 1.93.1
+
+jobs:
+  check:
+    name: fmt / clippy / test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal \
+            --component rustfmt,clippy
+          rustup default "$RUST_VERSION"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            target
+          key: ${{ runner.os }}-cargo-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-${{ env.RUST_VERSION }}-
+
+      - run: cargo fmt --all --check
+
+      # Default features: neither backend is compiled into the daemon, because both
+      # shell out to hardware-specific tooling no runner has.
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - run: cargo test --workspace --locked
+
+  features:
+    name: feature matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --component clippy
+          rustup default "$RUST_VERSION"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            target
+          key: ${{ runner.os }}-features-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-features-${{ env.RUST_VERSION }}-
+
+      - run: cargo build --workspace --locked
+
+      # The backend crates only ever reach the daemon through these features, so this
+      # is the one build that links them.
+      - run: cargo build -p scanbus-daemon --features brother,hplip --locked
+
+      - run: cargo clippy -p scanbus-daemon --features brother,hplip --all-targets --locked -- -D warnings
+
+  core-isolation:
+    name: scanbus-core has no D-Bus dependency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
+
+      # Reads Cargo.lock and the manifests only; no compilation, so no cache needed.
+      - run: ./scripts/check-core-deps.sh
