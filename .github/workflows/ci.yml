@@ -69,6 +69,11 @@ jobs:
 
       - run: cargo clippy -p scanbus-daemon --features brother,hplip --all-targets --locked -- -D warnings
 
+      # `cargo test` compiles the mock backend for core's own tests, but only this
+      # feature exports it as a public module — which is how the daemon's tests get at
+      # it, and therefore the shape that has to keep compiling.
+      - run: cargo clippy -p scanbus-core --features mock --all-targets --locked -- -D warnings
+
   core-isolation:
     name: scanbus-core has no D-Bus dependency
     runs-on: ubuntu-latest
