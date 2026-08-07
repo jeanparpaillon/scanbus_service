@@ -21,10 +21,12 @@ async-trait.workspace = true
 futures-core.workspace = true
 serde.workspace = true
 thiserror.workspace = true
-# `sync` only: the mpsc channel `ensure_installed` reports progress through is part of
-# the trait's signature, so it is a public dependency of core. The runtime itself is the
+# `sync` for the mpsc/watch channels the trait and the pairing machine are built on;
+# `rt` because `PairingMachine` (1.4) spawns the driver task itself — cancellation is
+# `AbortHandle::abort` on that task, so the spawn has to happen here rather than be
+# handed back to whoever calls `pair()`. Starting the runtime itself is still the
 # daemon's business.
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync", "rt"] }
 
 # Round-trip tests need a self-describing format to round-trip through. JSON is not a
 # wire format of this project — the wire format is `a{sv}`, produced in the daemon —
@@ -35,4 +37,7 @@ tokio = { workspace = true, features = ["sync"] }
 # daemon, so this is not a dependency of the library itself.
 futures-util.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["macros", "rt"] }
+# `time` is test-only: the pairing machine's own tests bound how long they wait for a
+# transition and how long they give an aborted task to unwind, so a bug fails the test
+# instead of hanging CI. Production code has no timers.
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
