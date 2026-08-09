@@ -30,6 +30,10 @@ scanbus-core.workspace = true
 async-trait.workspace = true
 scanbus-backend-brother = { workspace = true, optional = true }
 scanbus-backend-hplip = { workspace = true, optional = true }
+# `StreamExt::next` and `BoxStream`, for the task that consumes a backend's button
+# stream (2.4). Core stays on `futures-core`, which only defines the trait; the daemon is
+# where the streams are actually driven.
+futures-util.workspace = true
 # The runtime lives here, not in the workspace defaults: `signal` is what the shutdown
 # path needs, `rt-multi-thread` what `#[tokio::main]` starts, and `time` what bounds a
 # backend probe (2.2) — a hung `discover()` must not hold up the round.
@@ -47,5 +51,3 @@ scanbus-core = { workspace = true, features = ["mock"] }
 # and reads its address off a pipe — hence `io-util`, `process` and the timeouts that
 # stop a missing signal from hanging the suite. The daemon itself needs none of them.
 tokio = { workspace = true, features = ["io-util", "process", "time"] }
-# `StreamExt::next`, for consuming the InterfacesAdded/Removed streams.
-futures-util.workspace = true

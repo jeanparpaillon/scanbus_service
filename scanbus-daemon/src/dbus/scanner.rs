@@ -21,6 +21,19 @@
 //! no `&mut self` in a spawned pairing task to hang a `*_changed` call off, so the
 //! emission has to be driven from the transition stream or not at all.
 //!
+//! # `Connect()` starts nothing it owns
+//!
+//! The listener task belongs to [`ScannerRegistry`], not to this object: `Connect()` asks
+//! it to *ensure* one exists and `Disconnect()` asks it to stop, so two `Connect()` calls
+//! — or a `Connect()` after the pairing that already started one — converge on a single
+//! task instead of racing to create a second. [`crate::listeners`] is where that decision
+//! is argued.
+//!
+//! What lives here is the state a client can see or set: `Connected`, which is exactly
+//! "the registry has a listener task for this scanner", and the session profile of §3,
+//! which is not a property at all — it is per connection, it dies with `Disconnect()`,
+//! and publishing it would invite a client to set it out of band.
+//!
 //! # Every method takes `&self`, and that is load-bearing
 //!
 //! zbus holds a read lock on the interface for the whole of a `&self` method and a
@@ -47,7 +60,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
 
 use scanbus_core::{
-    PairOutcome, PairingMachine, PairingState, ProfileKind, ScannerId, ScannerInfo, UnpairError,
+    BackendError, PairOutcome, PairingMachine, PairingState, ProfileKind, ScannerId, ScannerInfo,
+    Status, UnpairError,
 };
 use tokio::sync::broadcast;
 use tracing::{debug, info, instrument, warn};
@@ -58,10 +72,14 @@ use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 use crate::dbus::convert::{self, Dict};
 use crate::dbus::error::ScanbusError;
 use crate::dbus::objects::ObjectRegistry;
+use crate::listeners::ListenError;
 use crate::scanners::{Retired, ScannerRegistry};
 
 /// The interface name, spelled once: [`emit`] builds its own `PropertiesChanged`.
 pub const INTERFACE: &str = "org.scanbus.Scanner1";
+
+/// The one `Connect()` option §3 documents: `{"profile": "document"}`.
+const PROFILE_OPTION: &str = "profile";
 
 /// The `org.scanbus.Scanner1` object of §3.
 ///
@@ -78,6 +96,18 @@ pub struct Scanner1 {
     scanners: Weak<ScannerRegistry>,
     /// `None` is the `""` of §3: data received with no profile attached is left raw.
     default_profile: Mutex<Option<ProfileKind>>,
+    /// The `{"profile": …}` of the `Connect()` that opened the current session.
+    ///
+    /// Not a D-Bus property: §3 gives it to `Connect()` as an option, it ranks *between*
+    /// `Button1.Profile` and `DefaultProfile` (see
+    /// [`ButtonEvent::profile`](crate::listeners::ButtonEvent::profile)), and it is
+    /// cleared by `Disconnect()`. A property would outlive the connection it belongs to.
+    session_profile: Mutex<Option<ProfileKind>>,
+    /// Whether the registry is holding a listener task for this scanner.
+    ///
+    /// The registry is the only writer, through [`set_connected`] — the same
+    /// one-writer-per-property rule that makes [`supervise`] the only source of `Paired`.
+    connected: Mutex<bool>,
 }
 
 impl Scanner1 {
@@ -87,6 +117,8 @@ impl Scanner1 {
             machine,
             scanners,
             default_profile: Mutex::new(None),
+            session_profile: Mutex::new(None),
+            connected: Mutex::new(false),
         }
     }
 
@@ -116,11 +148,32 @@ impl Scanner1 {
         &self.machine
     }
 
-    fn default_profile_value(&self) -> Option<ProfileKind> {
+    /// `DefaultProfile` as a [`ProfileKind`] rather than as the `""`-for-none string the
+    /// property carries.
+    ///
+    /// Named apart from the `DefaultProfile` getter below, which the interface macro
+    /// owns; both read the same field.
+    pub fn default_profile_value(&self) -> Option<ProfileKind> {
         *self
             .default_profile
             .lock()
             .expect("default profile lock poisoned")
+    }
+
+    /// The profile the current `Connect()` asked for, if it asked for one.
+    pub fn session_profile(&self) -> Option<ProfileKind> {
+        *self
+            .session_profile
+            .lock()
+            .expect("session profile lock poisoned")
+    }
+
+    /// Whether a listener task is running for this scanner.
+    ///
+    /// Named apart from the `Connected` property getter below, which the interface macro
+    /// owns; both read the same field.
+    pub fn is_connected(&self) -> bool {
+        *self.connected.lock().expect("connected lock poisoned")
     }
 }
 
@@ -180,11 +233,18 @@ impl Scanner1 {
 
     /// Whether the host is listening for this scanner's events.
     ///
-    /// Always `false` until 2.4, which is what owns the listener task; a property that
-    /// lied here would have a client skip the `Connect()` it still has to make.
+    /// Exactly "the registry holds a listener task for this scanner", which is why it is
+    /// `true` after a successful `Pair()` without a `Connect()`: pairing ends by asking
+    /// for the same task (see [`crate::listeners`]), and a scanner that is paired and
+    /// reachable is one this daemon is ready to receive from. `Disconnect()` is how a
+    /// client opts out of that.
+    ///
+    /// It also goes `false` on its own, together with `Status="error"`, when a listener
+    /// could not be restarted within its budget — a scanner that will never deliver
+    /// another press must not keep claiming it is connected.
     #[zbus(property)]
     fn connected(&self) -> bool {
-        false
+        self.is_connected()
     }
 
     /// Reachability: `"offline"`, `"online"`, `"busy"`, `"error"`.
@@ -282,7 +342,7 @@ impl Scanner1 {
     /// [`scanbus-cli.md`]: https://github.com/jeanparpaillon/scanbus_service/blob/master/docs/scanbus-cli.md
     #[instrument(level = "info", skip_all, fields(id = %self.info().id))]
     fn pair(&self, options: HashMap<String, OwnedValue>) -> Result<(), ScanbusError> {
-        reject_unknown_options("Pair", &options)?;
+        reject_unknown_options("Pair", &options, &[])?;
 
         match self.machine.pair() {
             PairOutcome::Started => {
@@ -318,11 +378,129 @@ impl Scanner1 {
         }
     }
 
+    /// Declares the host ready to receive: starts consuming this scanner's button
+    /// stream, and keeps consuming it until `Disconnect()`.
+    ///
+    /// Idempotent, because the task belongs to the registry and this only ensures it
+    /// exists — a second `Connect()` finds the first one's listener and returns, which is
+    /// also what a `Connect()` after a `Pair()` does.
+    ///
+    /// `options` may carry `{"profile": "document"}`, the session profile of §3. It is a
+    /// per-connection override ranking *between* the button's own `Profile` and
+    /// `DefaultProfile`; the order is written down in
+    /// [`ButtonEvent::profile`](crate::listeners::ButtonEvent::profile) and read by 2.6.
+    /// `Disconnect()` clears it.
+    ///
+    /// # Errors
+    ///
+    /// `org.scanbus.Error.NotPaired` on a scanner that has no association — connecting to
+    /// a device found by discovery is meaningless, since nothing has configured its keys.
+    /// `org.scanbus.Error.NotReachable` when `Status="offline"`, which is §3's own
+    /// condition, and again when the backend cannot reach the device to arm it.
+    /// `org.scanbus.Error.Busy` when something else already holds the device's event
+    /// channel. `org.scanbus.Error.UnsupportedProfile` for a `profile` outside
+    /// `SupportedProfiles` — a method, unlike the `DefaultProfile` setter, can answer with
+    /// §8's name for this (see [`crate::dbus::error`]).
+    /// `org.freedesktop.DBus.Error.InvalidArgs` for any other key in `options`.
+    ///
+    /// A refused call changes nothing, session profile included.
+    #[instrument(level = "info", skip_all, fields(id = %self.info().id))]
+    async fn connect(&self, options: HashMap<String, OwnedValue>) -> Result<(), ScanbusError> {
+        let info = self.info();
+        let profile = session_profile(&options, &info)?;
+
+        if !self.is_paired() {
+            return Err(ScanbusError::NotPaired(format!(
+                "scanner {} is not paired; pair it before connecting",
+                info.id
+            )));
+        }
+        // §3's own precondition. Checked against the property a client can read, so a
+        // refusal is one it could have predicted.
+        if info.status == Status::Offline {
+            return Err(ScanbusError::NotReachable(format!(
+                "scanner {} is offline",
+                info.id
+            )));
+        }
+
+        let Some(scanners) = self.scanners.upgrade() else {
+            return Err(ScanbusError::Failed(
+                "the daemon is shutting down".to_owned(),
+            ));
+        };
+
+        // Set before the listener starts, and restored if it does not: a press arriving
+        // in the same instant has to be stamped with the profile this call asked for,
+        // and a `Connect()` that failed must not have changed one.
+        let previous = std::mem::replace(
+            &mut *self
+                .session_profile
+                .lock()
+                .expect("session profile lock poisoned"),
+            profile,
+        );
+
+        match scanners.ensure_listening(&info.id).await {
+            Ok(()) => {
+                info!(profile = ProfileKind::optional_as_str(profile), "connected");
+                Ok(())
+            }
+            Err(error) => {
+                *self
+                    .session_profile
+                    .lock()
+                    .expect("session profile lock poisoned") = previous;
+                Err(connect_error(error))
+            }
+        }
+    }
+
+    /// Stops listening on the host side, and forgets the session profile.
+    ///
+    /// Succeeds when nothing is connected: §3 gives it no error, and a client that lost
+    /// the race with a listener which had already given up
+    /// (`Status="error"`) should not have to tell that apart from a real failure. The
+    /// pairing is untouched — `Disconnect()` is not `Unpair()`, and a disconnected
+    /// scanner keeps its keys, its mappings and its `Paired=true`.
+    #[instrument(level = "info", skip_all, fields(id = %self.info().id))]
+    async fn disconnect(&self) {
+        let id = self.info().id;
+
+        *self
+            .session_profile
+            .lock()
+            .expect("session profile lock poisoned") = None;
+
+        // Awaited, like `Unpair()`'s retire below: a client that calls `Disconnect()` and
+        // then presses the key must not still be listened to. Safe to await from inside a
+        // method handler only because every method here takes `&self` — see the module
+        // documentation.
+        match self.scanners.upgrade() {
+            Some(scanners) => {
+                if scanners.stop_listening(&id).await {
+                    info!("disconnected");
+                } else {
+                    debug!("nothing was listening");
+                }
+            }
+            None => debug!("disconnected during shutdown; nothing left to stop"),
+        }
+    }
+
     /// Removes the association, and with it the object — unless discovery still sees it.
     ///
-    /// The three things `Unpair()` undoes are done by [`PairingMachine::unpair`]: the
-    /// listener is stopped, the persisted entry is removed ([4.1]) and `Paired` goes
-    /// false. What is left here is the object's lifetime, which is the registry's to
+    /// Two of the three things `Unpair()` undoes are done by [`PairingMachine::unpair`]:
+    /// the persisted entry is removed ([4.1]) and `Paired` goes false. The third — the
+    /// listener — is stopped *here*, before the machine runs, because the task consuming
+    /// the stream is the registry's and not the machine's: letting the machine's own
+    /// [`stop_listening`](scanbus_core::ScannerBackend::stop_listening) end a stream a
+    /// live task is still reading would look to that task exactly like a device going
+    /// away, and it would dutifully start reconnecting to a scanner that has just been
+    /// unpaired. The machine's call then finds nothing left to stop, which the trait
+    /// requires to be a no-op rather than an error.
+    ///
+    /// What is left after that is the object's lifetime, which is the registry's to
     /// decide (§1): a scanner the current discovery session has seen keeps its object
     /// with `Paired=false`, exactly as if it had just been discovered, and one that
     /// exists only because it was paired goes away with an `InterfacesRemoved`.
@@ -339,6 +517,18 @@ impl Scanner1 {
     #[instrument(level = "info", skip_all, fields(id = %self.info().id))]
     async fn unpair(&self) -> Result<(), ScanbusError> {
         let id = self.info().id;
+        let scanners = self.scanners.upgrade();
+
+        // Before the machine, for the reason given above. `None` when the whole registry
+        // is going away, which stops every listener anyway.
+        let was_listening = match &scanners {
+            Some(scanners) => scanners.stop_listening(&id).await,
+            None => false,
+        };
+        *self
+            .session_profile
+            .lock()
+            .expect("session profile lock poisoned") = None;
 
         match self.machine.unpair().await {
             Ok(None) => {}
@@ -350,6 +540,15 @@ impl Scanner1 {
                 )));
             }
             Err(error @ UnpairError::Store { .. }) => {
+                // The scanner stays paired, so it must also stay connected: a failed
+                // `Unpair()` the user can retry must not silently cost them the listener
+                // that makes the scanner useful in the meantime.
+                if was_listening
+                    && let Some(scanners) = &scanners
+                    && let Err(error) = scanners.ensure_listening(&id).await
+                {
+                    warn!(%error, "the unpairing failed and the listener could not be restored");
+                }
                 return Err(ScanbusError::Failed(error.to_string()));
             }
         }
@@ -358,7 +557,7 @@ impl Scanner1 {
         // GetManagedObjects() must not still be shown an object the daemon has retired.
         // Safe to await from inside a method handler only because every method here takes
         // `&self` — see the module documentation.
-        match self.scanners.upgrade() {
+        match scanners {
             Some(scanners) => match scanners.retire(&id).await {
                 Retired::Removed => info!("unpaired; object removed"),
                 Retired::Kept => info!("unpaired; object kept for the discovery session"),
@@ -383,25 +582,136 @@ fn unsupported_profile_message(value: &str, supported: &[ProfileKind]) -> String
     )
 }
 
-/// Refuses a `a{sv}` argument with anything in it.
+/// Refuses any key of a `a{sv}` argument that is not in `known`.
 ///
-/// §3 documents no option for any of these methods, so the honest answer to a key is
-/// that this daemon does not implement it. Accepting and ignoring it would have a client
-/// believe a pairing hint took effect — and it is the same reasoning that has
-/// `StartDiscovery` refuse a filter key it does not know ([`crate::dbus::manager`]).
-/// Whatever adds the first real option ([9.3] wants a PIN) declares it here.
+/// §3 documents one option across these methods — `Connect`'s `profile` — so the honest
+/// answer to anything else is that this daemon does not implement it. Accepting and
+/// ignoring it would have a client believe a pairing hint took effect, and it is the same
+/// reasoning that has `StartDiscovery` refuse a filter key it does not know
+/// ([`crate::dbus::manager`]). Whatever adds the next real option ([9.3] wants a PIN)
+/// declares it here.
 ///
 /// [9.3]: https://github.com/jeanparpaillon/scanbus_service/issues/42
 fn reject_unknown_options(
     method: &str,
     options: &HashMap<String, OwnedValue>,
+    known: &[&str],
 ) -> Result<(), ScanbusError> {
-    match options.keys().next() {
-        None => Ok(()),
-        Some(key) => Err(ScanbusError::InvalidArgs(format!(
-            "unknown {method} option {key:?}; this daemon understands none"
-        ))),
+    let Some(key) = options.keys().find(|key| !known.contains(&key.as_str())) else {
+        return Ok(());
+    };
+
+    let understood = if known.is_empty() {
+        "none".to_owned()
+    } else {
+        format!("[{}]", known.join(", "))
+    };
+    Err(ScanbusError::InvalidArgs(format!(
+        "unknown {method} option {key:?}; this daemon understands {understood}"
+    )))
+}
+
+/// Reads the session profile out of a `Connect()` `options` map.
+///
+/// Validated at connect time rather than at scan time, for the same reason the
+/// `DefaultProfile` setter validates on write: a profile accepted here and refused when a
+/// key is pressed turns a client's mistake into a scan the user watches fail, with
+/// nothing on screen to connect the two.
+///
+/// `""` is `None` — §4's spelling of "deliver it raw" — so a client can clear the session
+/// profile with a second `Connect()` instead of having to disconnect.
+///
+/// # Errors
+///
+/// `org.freedesktop.DBus.Error.InvalidArgs` for an unknown key or a `profile` that is not
+/// a string; `org.scanbus.Error.UnsupportedProfile` for a name outside
+/// `SupportedProfiles`, including one that is not a profile name at all — a client asking
+/// for `"pdf"` and a client asking for `"ocr"` are both asking for something this scanner
+/// will not run, and §8 has one name for that.
+fn session_profile(
+    options: &HashMap<String, OwnedValue>,
+    info: &ScannerInfo,
+) -> Result<Option<ProfileKind>, ScanbusError> {
+    reject_unknown_options("Connect", options, &[PROFILE_OPTION])?;
+
+    let Some(value) = options.get(PROFILE_OPTION) else {
+        return Ok(None);
+    };
+
+    let name = String::try_from(value.clone()).map_err(|_| {
+        ScanbusError::InvalidArgs(format!(
+            "the {PROFILE_OPTION:?} option must be a string, got signature {}",
+            value.value_signature()
+        ))
+    })?;
+
+    let supported = info.supported_profiles();
+    let profile = ProfileKind::parse_optional(&name).map_err(|_| {
+        ScanbusError::UnsupportedProfile(unsupported_profile_message(&name, &supported))
+    })?;
+
+    if let Some(profile) = profile
+        && !supported.contains(&profile)
+    {
+        return Err(ScanbusError::UnsupportedProfile(
+            unsupported_profile_message(&name, &supported),
+        ));
     }
+
+    Ok(profile)
+}
+
+/// The subset of §8's names a `Connect()` can come back with.
+///
+/// Not the general mapping — that is [2.7]'s, and it maps every
+/// [`BackendError`] variant in one place. What is here is only what
+/// [`ScannerRegistry::ensure_listening`] can produce, mapped so that the two conditions a
+/// client can act on are distinguishable: a device that is not answering, and one whose
+/// event channel something else is holding.
+///
+/// [2.7]: https://github.com/jeanparpaillon/scanbus_service/issues/11
+fn connect_error(error: ListenError) -> ScanbusError {
+    match error {
+        // The object went away between the client reading its path and calling — a
+        // discovery session that ended, or an `Unpair()` that raced this.
+        ListenError::Unknown(id) => {
+            ScanbusError::Failed(format!("scanner {id} no longer has an object"))
+        }
+        ListenError::Backend(error @ BackendError::Busy(_)) => {
+            ScanbusError::Busy(error.to_string())
+        }
+        ListenError::Backend(
+            error @ (BackendError::NotReachable { .. } | BackendError::UnknownScanner(_)),
+        ) => ScanbusError::NotReachable(error.to_string()),
+        ListenError::Backend(error) => ScanbusError::Failed(error.to_string()),
+    }
+}
+
+/// Sets `Connected` on an exported object, emitting `PropertiesChanged` if it moved.
+///
+/// The registry's writer for that property, and the only one: `Connected` means "there is
+/// a listener task", the registry is what owns those tasks, and a second writer is how a
+/// property ends up disagreeing with the thing it describes.
+///
+/// # Errors
+///
+/// Whatever zbus failed to emit. A failure leaves the in-memory value updated and the
+/// client's copy stale, which is why the caller logs it rather than swallowing it.
+pub async fn set_connected(iface: &InterfaceRef<Scanner1>, connected: bool) -> zbus::Result<()> {
+    // `get`, never `get_mut`: see the module documentation on why this interface is only
+    // ever read-locked.
+    let scanner = iface.get().await;
+
+    {
+        let mut current = scanner.connected.lock().expect("connected lock poisoned");
+        if *current == connected {
+            return Ok(());
+        }
+        *current = connected;
+    }
+
+    debug!(id = %scanner.info().id, connected, "Connected changed");
+    scanner.connected_changed(iface.signal_emitter()).await
 }
 
 /// Applies a fresh [`ScannerInfo`] to an exported object, emitting `PropertiesChanged`
@@ -504,12 +814,12 @@ pub async fn supervise(
             continue;
         }
 
+        let now_paired = state == PairingState::Done;
+
         // Before the signal, not after: a client that reacts to `PairingState="done"` by
         // calling `StopDiscovery` must not be able to take the object away between the
         // two, and only the promotion stops that.
-        if state == PairingState::Done
-            && let Some(scanners) = scanners.upgrade()
-        {
+        if now_paired && let Some(scanners) = scanners.upgrade() {
             scanners.promote(&id).await;
         }
 
@@ -520,6 +830,21 @@ pub async fn supervise(
 
         if let Err(error) = emit(&iface, &previous, &state, &mut paired).await {
             warn!(%path, %error, "could not announce a pairing transition");
+        }
+
+        // *After* the signal, unlike the promotion: this emits `Connected=true`, and a
+        // client should learn that a scanner paired before it learns the daemon is
+        // already listening to it.
+        //
+        // 1.4 opens a stream as its last step and drops it again precisely so that this
+        // is the only owner ([`crate::listeners`]). A failure is logged and not fatal —
+        // the scanner is paired, `Connected` stays `false`, and a `Connect()` gets the
+        // client a real error to act on.
+        if now_paired
+            && let Some(scanners) = scanners.upgrade()
+            && let Err(error) = scanners.ensure_listening(&id).await
+        {
+            warn!(%path, %error, "paired, but the button listener could not be started");
         }
 
         previous = state;

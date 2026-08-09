@@ -21,6 +21,16 @@
 //! whatever a discovery session just published (§7), not only on scanners the daemon
 //! decided in advance were pairable.
 //!
+//! # And, once it is paired, a listener
+//!
+//! A paired scanner also gets a **listener task**, at most one, keyed by its
+//! [`ScannerId`] and stored in its [`Entry`]. `Connect()`, the end of a pairing and the
+//! restore path at startup (4.2) all reach it through
+//! [`ScannerRegistry::ensure_listening`] rather than starting one of their own, which is
+//! what makes `Connect()` idempotent and stops a `Disconnect()` after a re-pair from
+//! dropping a stream a second task is still consuming. [`crate::listeners`] argues that
+//! decision and owns the task's body; what is here is its lifetime.
+//!
 //! # Deduplication
 //!
 //! [`Backends`](crate::backends) fixes which backend outranks which. This module
@@ -43,12 +53,14 @@ use std::sync::{Arc, Weak};
 
 use scanbus_core::{PairingMachine, PairingStore, ScannerBackend, ScannerId, ScannerInfo, Status};
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 use tracing::{debug, info, instrument, warn};
 
 use crate::backends::RankedBackend;
 use crate::dbus::scanner::{self, Scanner1};
 use crate::dbus::{ObjectRegistry, path};
 use crate::error::Error;
+use crate::listeners::{self, ButtonEventSink, ListenError, LogSink, RestartPolicy};
 
 mod address;
 
@@ -82,6 +94,19 @@ pub enum Retired {
 struct Entry {
     info: ScannerInfo,
     origin: Origin,
+    /// The backend this sighting came from.
+    ///
+    /// Kept as the object rather than only as its id, because the listener has to be
+    /// started against the same backend that found the device — not against whatever the
+    /// daemon's list happens to rank first when `Connect()` arrives.
+    backend: Arc<dyn ScannerBackend>,
+    /// The listener task, while one is running. `Connected` is exactly `Some`.
+    ///
+    /// Held here rather than in a map of its own so that it cannot outlive the object it
+    /// belongs to: every path that drops an [`Entry`] drops this with it, and the ones
+    /// that mean to keep the object ([`ScannerRegistry::stop_listening`]) take it out
+    /// deliberately.
+    listener: Option<JoinHandle<()>>,
     /// Precedence of the backend that owns this sighting; see [`crate::backends`].
     rank: usize,
     /// Id of that backend, as [`ScannerBackend::id`] reports it.
@@ -113,6 +138,10 @@ struct Entry {
 pub struct ScannerRegistry {
     objects: Arc<ObjectRegistry>,
     store: Arc<dyn PairingStore>,
+    /// What a button press is turned into — [`LogSink`] until 2.6 creates `Job1` objects.
+    sink: Arc<dyn ButtonEventSink>,
+    /// How hard a listener tries to come back before the scanner is declared in error.
+    restart: RestartPolicy,
     state: Mutex<State>,
     /// A handle to ourselves, for the pieces that have to call back in: `Scanner1` for
     /// `Unpair()`, the supervisor task for the promotion that follows a pairing.
@@ -136,9 +165,26 @@ impl ScannerRegistry {
     /// Returns an [`Arc`] rather than a bare `Self` because every object it publishes
     /// gets a weak handle back to it; see [`ScannerRegistry::self_ref`].
     pub fn new(objects: Arc<ObjectRegistry>, store: Arc<dyn PairingStore>) -> Arc<Self> {
+        Self::with_listeners(objects, store, Arc::new(LogSink), RestartPolicy::DEFAULT)
+    }
+
+    /// The same registry, with the listener half configured.
+    ///
+    /// The two parameters exist for the two things a test needs and a daemon does not: a
+    /// [`ButtonEventSink`] it can assert on, standing in for the `Job1` creation 2.6 will
+    /// put there, and a [`RestartPolicy`] short enough that the exhausted case is
+    /// observable without putting the daemon's real budget into the suite.
+    pub fn with_listeners(
+        objects: Arc<ObjectRegistry>,
+        store: Arc<dyn PairingStore>,
+        sink: Arc<dyn ButtonEventSink>,
+        restart: RestartPolicy,
+    ) -> Arc<Self> {
         Arc::new_cyclic(|self_ref| Self {
             objects,
             store,
+            sink,
+            restart,
             state: Mutex::new(State::default()),
             self_ref: self_ref.clone(),
         })
@@ -191,6 +237,8 @@ impl ScannerRegistry {
             Entry {
                 info,
                 origin: Origin::Discovered,
+                backend: Arc::clone(&backend.backend),
+                listener: None,
                 rank: backend.rank,
                 backend_id: backend.backend.id(),
                 address,
@@ -255,6 +303,8 @@ impl ScannerRegistry {
                 // Rank 0: nothing outranks a paired scanner.
                 rank: 0,
                 backend_id: backend.id(),
+                backend: Arc::clone(&backend),
+                listener: None,
                 origin: Origin::Persistent,
                 address,
                 discovered: false,
@@ -283,6 +333,197 @@ impl ScannerRegistry {
         info!("scanner is now paired");
     }
 
+    /// Makes sure a listener task is running for this scanner, starting one if not.
+    ///
+    /// The single entry point of §3's `Connect()`, of the end of a pairing and of the
+    /// restore path at startup (4.2) — see the module documentation on why there is only
+    /// one. Calling it on a scanner that is already listening is the whole point: it
+    /// returns `Ok` and starts nothing, which is what makes `Connect()` idempotent.
+    ///
+    /// The *first* stream is opened here, awaited, so that a `Connect()` which cannot
+    /// listen at all comes back as an error reply rather than as a log line in a task the
+    /// client is not watching. Everything after that — the restarts — belongs to the task
+    /// ([`crate::listeners::run`]).
+    ///
+    /// # Errors
+    ///
+    /// [`ListenError::Unknown`] for a scanner with no object, [`ListenError::Backend`]
+    /// for a backend that refused to arm the device. Nothing is recorded in either case,
+    /// so a retry is a plain second call.
+    #[instrument(level = "info", skip_all, fields(id = %id))]
+    pub async fn ensure_listening(&self, id: &ScannerId) -> Result<(), ListenError> {
+        // Held across `start_listening`, which is the point: two `Connect()` calls racing
+        // must not both get past the "is one already running" check and open two streams
+        // for one device. The cost is that a backend which is slow to arm delays the
+        // other registry operations, which is the right trade for a call that is
+        // supposed to be a fast handshake.
+        let mut state = self.state.lock().await;
+
+        let Some(entry) = state.entries.get(id) else {
+            return Err(ListenError::Unknown(id.clone()));
+        };
+        if entry
+            .listener
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
+        {
+            debug!("a listener is already running; leaving it alone");
+            return Ok(());
+        }
+
+        let backend = Arc::clone(&entry.backend);
+        let info = entry.info.clone();
+        let stream = backend.start_listening(&info).await?;
+
+        let task = tokio::spawn(listeners::run(
+            self.self_ref.clone(),
+            Arc::clone(&self.objects),
+            Arc::clone(&backend),
+            info,
+            Arc::clone(&self.sink),
+            self.restart,
+            stream,
+        ));
+
+        state
+            .entries
+            .get_mut(id)
+            .expect("the entry was there a moment ago, under this lock")
+            .listener = Some(task);
+
+        // Under the lock, like every other property this registry writes: the interface
+        // is only ever read-locked, so this waits for nothing (see [`scanner`]).
+        self.announce_connected(id, true).await;
+        info!("listening for button presses");
+
+        Ok(())
+    }
+
+    /// Stops the listener task, if there is one, and tells the backend to stand down.
+    ///
+    /// `Disconnect()`, and the first thing `Unpair()` does. Returns whether a task was
+    /// actually running, which is what lets a failed `Unpair()` put back the listener it
+    /// took away.
+    ///
+    /// The task is aborted **and awaited** before the backend is asked to stop: the task
+    /// holds the stream, and a backend tearing its listener down under a live consumer
+    /// looks to that consumer exactly like the device going away — which would have it
+    /// start reconnecting to a scanner the user has just disconnected.
+    ///
+    /// Succeeds silently on a scanner that is not listening, and on one the registry does
+    /// not know: §3 gives `Disconnect()` no error, and a client racing a listener that had
+    /// already given up should not have to tell that apart from a real failure.
+    #[instrument(level = "info", skip_all, fields(id = %id))]
+    pub async fn stop_listening(&self, id: &ScannerId) -> bool {
+        let mut state = self.state.lock().await;
+
+        let Some(entry) = state.entries.get_mut(id) else {
+            debug!("nothing to stop: no such scanner");
+            return false;
+        };
+
+        let was_listening = match entry.listener.take() {
+            Some(task) => {
+                let running = !task.is_finished();
+                task.abort();
+                // Awaited so that the stream is provably dropped before the backend is
+                // asked to stop. An aborted task resolves at once, and one parked on this
+                // very lock is cancelled at that await rather than deadlocking on it.
+                let _ = task.await;
+                running
+            }
+            None => false,
+        };
+
+        if let Err(error) = entry.backend.stop_listening(id).await {
+            // Logged, not raised: `Disconnect()` cannot fail, and a vendor daemon that
+            // will not shut down must not leave a client believing it is still connected.
+            warn!(%error, "the backend could not stop listening");
+        }
+
+        self.announce_connected(id, false).await;
+        if was_listening {
+            info!("no longer listening");
+        }
+
+        was_listening
+    }
+
+    /// Whether a listener task is running for this scanner.
+    pub async fn is_listening(&self, id: &ScannerId) -> bool {
+        self.state
+            .lock()
+            .await
+            .entries
+            .get(id)
+            .is_some_and(|entry| {
+                entry
+                    .listener
+                    .as_ref()
+                    .is_some_and(|task| !task.is_finished())
+            })
+    }
+
+    /// Records that a listener task gave up: `Status="error"`, `Connected=false`.
+    ///
+    /// Called by the task itself, from [`crate::listeners::run`], once its restart budget
+    /// is exhausted — and by nothing else. It is the other half of the reason the budget
+    /// is bounded: a scanner that will never deliver another press has to say so where a
+    /// client can see it, or the only symptom is a key that silently does nothing.
+    ///
+    /// The pairing is untouched. §9's "reachable ≠ paired" applies here as much as it
+    /// does to a probe that stopped finding a device: the association, the mappings and
+    /// the object all survive, and a `Connect()` retries from a clean start.
+    pub(crate) async fn listener_failed(&self, id: &ScannerId) {
+        let mut state = self.state.lock().await;
+
+        let Some(entry) = state.entries.get_mut(id) else {
+            return;
+        };
+        // Dropping our own `JoinHandle`, which detaches rather than aborts — the task is
+        // returning as soon as this call comes back.
+        entry.listener = None;
+        let moved = set_status(&self.objects, entry, Status::Error).await;
+
+        drop(state);
+        self.announce_connected(id, false).await;
+
+        if moved {
+            warn!(%id, "scanner is in error: its button stream could not be restored");
+        }
+    }
+
+    /// Stops every listener, so nothing is consuming a backend stream while the object
+    /// tree comes down.
+    ///
+    /// The shutdown counterpart of [`ObjectRegistry::shutdown`], and run before it:
+    /// unexporting an object a listener task is about to look up is how the last seconds
+    /// of a daemon's life fill with warnings about objects that are gone. No
+    /// `PropertiesChanged` for `Connected` — the objects themselves are about to go, and a
+    /// client learns from `InterfacesRemoved`.
+    #[instrument(level = "info", skip_all)]
+    pub async fn shutdown(&self) {
+        let mut state = self.state.lock().await;
+        let mut stopped = 0;
+
+        for (id, entry) in &mut state.entries {
+            let Some(task) = entry.listener.take() else {
+                continue;
+            };
+            task.abort();
+            let _ = task.await;
+
+            if let Err(error) = entry.backend.stop_listening(id).await {
+                warn!(%id, %error, "the backend could not stop listening on shutdown");
+            }
+            stopped += 1;
+        }
+
+        if stopped > 0 {
+            info!(listeners = stopped, "listeners stopped");
+        }
+    }
+
     /// Retires a scanner that has just been unpaired.
     ///
     /// §1 decides this, not `Paired`: an object exists either because a probe saw it or
@@ -296,6 +537,13 @@ impl ScannerRegistry {
         let Some(entry) = state.entries.get_mut(id) else {
             return Retired::Unknown;
         };
+
+        // Belt and braces: `Unpair()` stops the listener before it gets here, but an
+        // object that stays as a discovered one must not keep a task that a `Pair()` from
+        // the same path would then find "already running".
+        if let Some(task) = entry.listener.take() {
+            task.abort();
+        }
 
         if entry.discovered {
             entry.origin = Origin::Discovered;
@@ -347,7 +595,13 @@ impl ScannerRegistry {
                 Err(error) => warn!(%id, %error, "could not remove a discovered scanner"),
             }
 
-            if let Some(entry) = state.entries.remove(&id) {
+            if let Some(mut entry) = state.entries.remove(&id) {
+                // A discovered scanner is by definition unpaired and so has no listener;
+                // taking it anyway means no path can drop an `Entry` and leave a task
+                // reading a stream for an object that no longer exists.
+                if let Some(task) = entry.listener.take() {
+                    task.abort();
+                }
                 state.owners.remove(&entry.address);
             }
         }
@@ -383,31 +637,13 @@ impl ScannerRegistry {
         let mut state = self.state.lock().await;
 
         for (id, entry) in &mut state.entries {
-            if !probed.contains(&entry.backend_id)
-                || seen.contains(id)
-                || entry.info.status == Status::Offline
-            {
+            if !probed.contains(&entry.backend_id) || seen.contains(id) {
                 continue;
             }
 
-            let mut info = entry.info.clone();
-            info.status = Status::Offline;
-
-            let path = path::scanner(id);
-            match self.objects.interface::<Scanner1>(&path).await {
-                Ok(iface) => {
-                    if let Err(error) = scanner::update(&iface, &info).await {
-                        warn!(%id, %error, "could not announce that a scanner went offline");
-                    }
-                }
-                Err(error) => {
-                    warn!(%id, %error, "a tracked scanner has no object");
-                    continue;
-                }
+            if set_status(&self.objects, entry, Status::Offline).await {
+                info!(%id, backend = entry.backend_id, "scanner is no longer reachable");
             }
-
-            info!(%id, backend = entry.backend_id, "scanner is no longer reachable");
-            entry.info = info;
         }
     }
 
@@ -419,6 +655,23 @@ impl ScannerRegistry {
     /// The scanners with an object right now, in path order.
     pub async fn ids(&self) -> Vec<ScannerId> {
         self.state.lock().await.entries.keys().cloned().collect()
+    }
+
+    /// Writes `Connected` on a scanner's object, if it still has one.
+    ///
+    /// Best effort by design: the listener task is the truth, and an object that has gone
+    /// away between the task starting and this call has no client left to tell.
+    async fn announce_connected(&self, id: &ScannerId, connected: bool) {
+        let path = path::scanner(id);
+
+        match self.objects.interface::<Scanner1>(&path).await {
+            Ok(iface) => {
+                if let Err(error) = scanner::set_connected(&iface, connected).await {
+                    warn!(%id, %error, "could not announce a change of Connected");
+                }
+            }
+            Err(error) => debug!(%id, %error, "no object to announce Connected on"),
+        }
     }
 
     /// Exports a new scanner object, its pairing machine and its supervisor task.
@@ -530,4 +783,41 @@ impl ScannerRegistry {
 
         Ok(())
     }
+}
+
+/// Moves one scanner's `Status`, announcing it, and says whether anything moved.
+///
+/// The two things that have an opinion on reachability write it through here: a probe
+/// round that stopped finding a device ([`ScannerRegistry::mark_unseen_offline`]) and a
+/// listener that could not be restored ([`ScannerRegistry::listener_failed`]). Both end
+/// in the same place — the entry and the object agreeing — and neither should have to
+/// spell out the `PropertiesChanged`.
+///
+/// A free function rather than a method because both callers hold a `&mut Entry` borrowed
+/// out of the state map, and a `&self` method would want the map back.
+async fn set_status(objects: &ObjectRegistry, entry: &mut Entry, status: Status) -> bool {
+    if entry.info.status == status {
+        return false;
+    }
+
+    let mut info = entry.info.clone();
+    info.status = status;
+
+    let path = path::scanner(&info.id);
+    match objects.interface::<Scanner1>(&path).await {
+        Ok(iface) => {
+            if let Err(error) = scanner::update(&iface, &info).await {
+                // Announced or not, the daemon's own view has to move: a status it keeps
+                // retrying to publish is a scanner that never comes back online either.
+                warn!(id = %info.id, %error, "could not announce a status change");
+            }
+        }
+        Err(error) => {
+            warn!(id = %info.id, %error, "a tracked scanner has no object");
+            return false;
+        }
+    }
+
+    entry.info = info;
+    true
 }

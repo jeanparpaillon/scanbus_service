@@ -80,7 +80,7 @@ async fn run() -> Result<&'static str, Error> {
     // restart, which is worth saying out loud rather than leaving a user to discover.
     warn!("pairings are kept in memory only; a restart forgets them (4.1)");
     let scanners = ScannerRegistry::new(Arc::clone(&registry), Arc::new(MemoryPairingStore::new()));
-    let discovery = Arc::new(Discovery::new(backends(), scanners));
+    let discovery = Arc::new(Discovery::new(backends(), Arc::clone(&scanners)));
 
     registry
         .add(path::manager(), Manager1::new(Arc::clone(&discovery)))
@@ -93,6 +93,10 @@ async fn run() -> Result<&'static str, Error> {
     // Before the tree goes: the session task publishes objects, and one still running
     // during the unexports would be racing them.
     discovery.stop().await;
+    // Likewise for the listener tasks, which look their object up on every press: one
+    // still running during the unexports would spend the daemon's last seconds warning
+    // about objects that are on their way out.
+    scanners.shutdown().await;
 
     // Explicitly, rather than leaving it to `Drop`: this is the one place that can
     // await the unexports, so clients see `InterfacesRemoved` for every object instead

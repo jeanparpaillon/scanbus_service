@@ -14,11 +14,13 @@ pub mod backends;
 pub mod dbus;
 pub mod discovery;
 pub mod error;
+pub mod listeners;
 pub mod scanners;
 pub mod store;
 
 pub use backends::Backends;
 pub use discovery::Discovery;
 pub use error::Error;
+pub use listeners::{ButtonEvent, ButtonEventSink, LogSink, RestartPolicy};
 pub use scanners::ScannerRegistry;
 pub use store::MemoryPairingStore;
