@@ -60,8 +60,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
 
 use scanbus_core::{
-    BackendError, PairOutcome, PairingMachine, PairingState, ProfileKind, ScannerId, ScannerInfo,
-    Status, UnpairError,
+    PairOutcome, PairingMachine, PairingState, ProfileKind, ScannerId, ScannerInfo, Status,
+    UnpairError,
 };
 use tokio::sync::broadcast;
 use tracing::{debug, info, instrument, warn};
@@ -661,29 +661,19 @@ fn session_profile(
     Ok(profile)
 }
 
-/// The subset of §8's names a `Connect()` can come back with.
+/// The D-Bus error a `Connect()` refusal comes back with.
 ///
-/// Not the general mapping — that is [2.7]'s, and it maps every
-/// [`BackendError`] variant in one place. What is here is only what
-/// [`ScannerRegistry::ensure_listening`] can produce, mapped so that the two conditions a
-/// client can act on are distinguishable: a device that is not answering, and one whose
-/// event channel something else is holding.
+/// Backend failures go through [2.7]'s total `BackendError` mapping in
+/// [`crate::dbus::error`]. The extra case is `ListenError::Unknown`, where the scanner
+/// object has gone between lookup and call.
 ///
 /// [2.7]: https://github.com/jeanparpaillon/scanbus_service/issues/11
 fn connect_error(error: ListenError) -> ScanbusError {
     match error {
-        // The object went away between the client reading its path and calling — a
-        // discovery session that ended, or an `Unpair()` that raced this.
         ListenError::Unknown(id) => {
-            ScanbusError::Failed(format!("scanner {id} no longer has an object"))
+            ScanbusError::UnknownObject(format!("scanner {id} no longer has an object"))
         }
-        ListenError::Backend(error @ BackendError::Busy(_)) => {
-            ScanbusError::Busy(error.to_string())
-        }
-        ListenError::Backend(
-            error @ (BackendError::NotReachable { .. } | BackendError::UnknownScanner(_)),
-        ) => ScanbusError::NotReachable(error.to_string()),
-        ListenError::Backend(error) => ScanbusError::Failed(error.to_string()),
+        ListenError::Backend(error) => error.into(),
     }
 }
 

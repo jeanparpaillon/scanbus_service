@@ -33,7 +33,8 @@
 //! [`scanbus-cli.md`]: https://github.com/jeanparpaillon/scanbus_service/blob/master/docs/scanbus-cli.md
 //! [`2.7`]: https://github.com/jeanparpaillon/scanbus_service/issues/11
 
-use zbus::DBusError;
+use scanbus_core::BackendError;
+use zbus::{DBusError, fdo};
 
 /// A failure of an `org.scanbus` method, named the way §8 names it.
 ///
@@ -83,6 +84,14 @@ pub enum ScanbusError {
     #[zbus(name = "scanbus.Error.Busy")]
     Busy(String),
 
+    /// The object does not exist — `org.freedesktop.DBus.Error.UnknownObject`.
+    #[zbus(name = "freedesktop.DBus.Error.UnknownObject")]
+    UnknownObject(String),
+
+    /// The operation is not supported — `org.freedesktop.DBus.Error.NotSupported`.
+    #[zbus(name = "freedesktop.DBus.Error.NotSupported")]
+    NotSupported(String),
+
     /// Anything §8 has no name for — `org.freedesktop.DBus.Error.Failed`.
     ///
     /// The standard name rather than an eighth `org.scanbus.Error.*`: inventing a name
@@ -97,11 +106,51 @@ pub enum ScanbusError {
     InvalidArgs(String),
 }
 
+impl From<BackendError> for ScanbusError {
+    fn from(error: BackendError) -> Self {
+        let detail = error.to_string();
+
+        match error {
+            BackendError::UnknownScanner(_) | BackendError::UnknownJob { .. } => {
+                ScanbusError::UnknownObject(detail)
+            }
+            BackendError::NotReachable { .. } => ScanbusError::NotReachable(detail),
+            BackendError::Busy(_) => ScanbusError::Busy(detail),
+            BackendError::InstallFailed { .. } => ScanbusError::BackendInstallFailed(detail),
+            BackendError::UnsupportedProfile(_) => ScanbusError::UnsupportedProfile(detail),
+            BackendError::Unsupported { .. } => ScanbusError::NotSupported(detail),
+            BackendError::Other(_) => ScanbusError::Failed(detail),
+        }
+    }
+}
+
+/// Maps a backend refusal to what a property setter can put on the wire.
+///
+/// Property setters answer through `org.freedesktop.DBus.Properties.Set`, whose error type
+/// is [`fdo::Error`]. That interface cannot carry `org.scanbus.Error.*`, so this is the
+/// standard-error projection for backend failures in setters.
+pub fn backend_refused(error: BackendError) -> fdo::Error {
+    let detail = error.to_string();
+
+    match error {
+        BackendError::UnknownScanner(_) | BackendError::UnknownJob { .. } => {
+            fdo::Error::UnknownObject(detail)
+        }
+        BackendError::UnsupportedProfile(_) | BackendError::Unsupported { .. } => {
+            fdo::Error::NotSupported(detail)
+        }
+        BackendError::NotReachable { .. }
+        | BackendError::Busy(_)
+        | BackendError::InstallFailed { .. }
+        | BackendError::Other(_) => fdo::Error::Failed(detail),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The strings are the contract: §8's seven, plus the two standard ones.
+    /// The strings are the contract: §8's seven, plus the four standard ones.
     #[test]
     fn every_variant_spells_its_documented_name() {
         let cases = [
@@ -131,6 +180,14 @@ mod tests {
             ),
             (ScanbusError::Busy(String::new()), "org.scanbus.Error.Busy"),
             (
+                ScanbusError::UnknownObject(String::new()),
+                "org.freedesktop.DBus.Error.UnknownObject",
+            ),
+            (
+                ScanbusError::NotSupported(String::new()),
+                "org.freedesktop.DBus.Error.NotSupported",
+            ),
+            (
                 ScanbusError::Failed(String::new()),
                 "org.freedesktop.DBus.Error.Failed",
             ),
@@ -152,5 +209,61 @@ mod tests {
             zbus::DBusError::description(&error),
             Some("scanner mock_usb is already paired")
         );
+    }
+
+    #[test]
+    fn backend_errors_have_a_total_mapping() {
+        let scanner = scanbus_core::ScannerId::from_backend("mock", "usb:001:002").unwrap();
+        let errors = [
+            (
+                BackendError::UnknownScanner(scanner.clone()),
+                "org.freedesktop.DBus.Error.UnknownObject",
+            ),
+            (
+                BackendError::UnknownJob {
+                    scanner: scanner.clone(),
+                    job: "job-1".to_owned(),
+                },
+                "org.freedesktop.DBus.Error.UnknownObject",
+            ),
+            (
+                BackendError::NotReachable {
+                    scanner: scanner.clone(),
+                    detail: "offline".to_owned(),
+                },
+                "org.scanbus.Error.NotReachable",
+            ),
+            (
+                BackendError::Busy(scanner.clone()),
+                "org.scanbus.Error.Busy",
+            ),
+            (
+                BackendError::InstallFailed {
+                    package: "brscan5".to_owned(),
+                    detail: "checksum mismatch".to_owned(),
+                },
+                "org.scanbus.Error.BackendInstallFailed",
+            ),
+            (
+                BackendError::UnsupportedProfile(scanbus_core::ProfileKind::Document),
+                "org.scanbus.Error.UnsupportedProfile",
+            ),
+            (
+                BackendError::Unsupported {
+                    backend: "mock",
+                    operation: "start_listening",
+                },
+                "org.freedesktop.DBus.Error.NotSupported",
+            ),
+            (
+                BackendError::Other("boom".to_owned()),
+                "org.freedesktop.DBus.Error.Failed",
+            ),
+        ];
+
+        for (error, expected_name) in errors {
+            let dbus_error: ScanbusError = error.into();
+            assert_eq!(zbus::DBusError::name(&dbus_error).as_str(), expected_name);
+        }
     }
 }

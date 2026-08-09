@@ -73,12 +73,13 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use scanbus_core::{BackendError, ButtonInfo, ProfileKind, ScannerBackend, ScannerId, Value};
+use scanbus_core::{ButtonInfo, ProfileKind, ScannerBackend, ScannerId, Value};
 use tokio::sync::Mutex;
 use tracing::{debug, info, instrument};
 use zbus::fdo;
 
 use crate::dbus::convert::{self, Dict};
+use crate::dbus::error::backend_refused;
 
 /// The `org.scanbus.Button1` object of §5, at
 /// `/org/scanbus/scanner/{id}/button/{n}`.
@@ -339,31 +340,9 @@ fn parse_profile(value: &str) -> fdo::Result<Option<ProfileKind>> {
     }
 }
 
-/// Turns a backend's refusal into the reply a property setter can carry.
-///
-/// Not the general mapping — that is [2.7]'s, and it maps every [`BackendError`] onto the
-/// named errors of §8. A `Set` reply cannot carry those names at all (see the module
-/// documentation), so what is left is the choice between the standard names, and it is
-/// worth making: `UnknownObject` says the scanner went away, `NotSupported` says the
-/// device has nothing this profile maps onto, and `Failed` carries everything else with
-/// the backend's own message — which for Brother is the path of the file it could not
-/// write.
-///
-/// [2.7]: https://github.com/jeanparpaillon/scanbus_service/issues/11
-fn backend_refused(error: BackendError) -> fdo::Error {
-    let detail = error.to_string();
-
-    match error {
-        BackendError::UnknownScanner(_) => fdo::Error::UnknownObject(detail),
-        BackendError::UnsupportedProfile(_) | BackendError::Unsupported { .. } => {
-            fdo::Error::NotSupported(detail)
-        }
-        _ => fdo::Error::Failed(detail),
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use scanbus_core::BackendError;
     use scanbus_core::backend::mock::{ButtonMapping, MockBackend, MockCall};
 
     use super::*;
