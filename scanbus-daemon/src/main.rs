@@ -6,9 +6,10 @@
 //! lands.
 
 use std::process::ExitCode;
+use std::sync::Arc;
 
-use scanbus_daemon::Error;
-use scanbus_daemon::dbus::{self, ObjectRegistry};
+use scanbus_daemon::dbus::{self, Manager1, ObjectRegistry, path};
+use scanbus_daemon::{Backends, Discovery, Error, ScannerRegistry};
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -16,12 +17,27 @@ use tracing_subscriber::{EnvFilter, fmt};
 ///
 /// Empty on a default build: both backends are behind cargo features because they
 /// shell out to hardware-specific tooling.
+///
+/// The order is the deduplication precedence — see [`scanbus_daemon::backends`] — which
+/// is why the vendor backends come first: they are the ones that can deliver a button
+/// press for the device they claim.
 const BACKENDS: &[&str] = &[
     #[cfg(feature = "brother")]
     scanbus_backend_brother::ID,
     #[cfg(feature = "hplip")]
     scanbus_backend_hplip::ID,
 ];
+
+/// The backend instances, in the same order as [`BACKENDS`].
+///
+/// Empty even with a feature enabled, because neither vendor crate implements
+/// `ScannerBackend` yet — that is workstreams 5 and 6. `Manager1` is fully functional in
+/// the meantime and simply finds nothing, which is why the startup log reports the two
+/// lists separately: `compiled_in` says what this binary was built with, `probing` says
+/// what `StartDiscovery` will actually ask.
+fn backends() -> Backends {
+    Backends::new([])
+}
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> ExitCode {
@@ -32,7 +48,8 @@ async fn main() -> ExitCode {
 
     info!(
         version = env!("CARGO_PKG_VERSION"),
-        backends = ?BACKENDS,
+        compiled_in = ?BACKENDS,
+        probing = ?backends().ids(),
         "scanbus-daemon started"
     );
 
@@ -58,11 +75,21 @@ async fn run() -> Result<&'static str, Error> {
 
     // Objects first, name second: see the ordering in `dbus`. Everything later
     // workstreams restore or discover gets exported between these two lines.
-    let registry = ObjectRegistry::new(connection.clone()).await?;
+    let registry = Arc::new(ObjectRegistry::new(connection.clone()).await?);
+    let scanners = Arc::new(ScannerRegistry::new(Arc::clone(&registry)));
+    let discovery = Arc::new(Discovery::new(backends(), scanners));
+
+    registry
+        .add(path::manager(), Manager1::new(Arc::clone(&discovery)))
+        .await?;
     dbus::request_name(&connection).await?;
 
     let signal = shutdown_signal().await.map_err(Error::Signal)?;
     info!(signal, "shutting down");
+
+    // Before the tree goes: the session task publishes objects, and one still running
+    // during the unexports would be racing them.
+    discovery.stop().await;
 
     // Explicitly, rather than leaving it to `Drop`: this is the one place that can
     // await the unexports, so clients see `InterfacesRemoved` for every object instead

@@ -80,6 +80,7 @@ pub fn sample_scanner() -> ScannerInfo {
 /// [`MockBackend::handle`] drives.
 #[derive(Clone)]
 pub struct MockBackend {
+    id: &'static str,
     state: Arc<Mutex<MockState>>,
 }
 
@@ -196,8 +197,23 @@ impl MockBackend {
     /// A backend whose [`discover`](ScannerBackend::discover) yields `scanners`.
     pub fn with_scanners(scanners: impl IntoIterator<Item = ScannerInfo>) -> Self {
         Self {
+            id: Self::ID,
             state: Arc::new(Mutex::new(MockState::new(scanners.into_iter().collect()))),
         }
+    }
+
+    /// The same backend, reporting `id` from [`ScannerBackend::id`].
+    ///
+    /// Backend ids have to be unique within the daemon's backend list — it is how a
+    /// `StartDiscovery` filter names one — so anything testing *several* backends at
+    /// once needs more than one name. The deduplication case of
+    /// [`scanbus-dbus-api.md`] §9 is exactly that: the same device found twice, by two
+    /// backends, and the test has to be able to say which one won.
+    ///
+    /// [`scanbus-dbus-api.md`]: https://github.com/jeanparpaillon/scanbus_service/blob/master/docs/scanbus-dbus-api.md
+    pub fn with_id(mut self, id: &'static str) -> Self {
+        self.id = id;
+        self
     }
 
     /// The control side. Cheap, and any number of them may exist.
@@ -343,7 +359,7 @@ impl MockHandle {
 #[async_trait]
 impl ScannerBackend for MockBackend {
     fn id(&self) -> &'static str {
-        Self::ID
+        self.id
     }
 
     async fn discover(&self) -> Result<Vec<ScannerInfo>, BackendError> {
@@ -885,5 +901,14 @@ mod tests {
         assert!(!scanner.capabilities.buttons.label_configurable);
         assert!(scanner.capabilities.supports_adf());
         assert_eq!(MockBackend::new().id(), "mock");
+    }
+
+    /// Two backends in one daemon need two names; the state is still per instance.
+    #[tokio::test]
+    async fn a_renamed_mock_keeps_its_own_scanners() {
+        let escl = MockBackend::with_scanners([sample_scanner()]).with_id("escl");
+        assert_eq!(escl.id(), "escl");
+        assert_eq!(escl.discover().await.unwrap().len(), 1);
+        assert_eq!(MockBackend::new().discover().await.unwrap().len(), 0);
     }
 }

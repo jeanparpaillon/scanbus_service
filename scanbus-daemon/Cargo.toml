@@ -29,14 +29,18 @@ scanbus-core.workspace = true
 scanbus-backend-brother = { workspace = true, optional = true }
 scanbus-backend-hplip = { workspace = true, optional = true }
 # The runtime lives here, not in the workspace defaults: `signal` is what the shutdown
-# path needs and `rt-multi-thread` what `#[tokio::main]` starts.
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync"] }
+# path needs, `rt-multi-thread` what `#[tokio::main]` starts, and `time` what bounds a
+# backend probe (2.2) — a hung `discover()` must not hold up the round.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 thiserror.workspace = true
 zbus.workspace = true
 
 [dev-dependencies]
+# `mock` for the tests only: every acceptance test of workstream 2 drives the D-Bus
+# surface through `MockBackend`, and the daemon itself must not be able to reach for it.
+scanbus-core = { workspace = true, features = ["mock"] }
 # The private-bus harness in tests/ drives the registry against a real `dbus-daemon`,
 # and reads its address off a pipe — hence `io-util`, `process` and the timeouts that
 # stop a missing signal from hanging the suite. The daemon itself needs none of them.

@@ -102,6 +102,20 @@ pub enum Error {
         descendants: usize,
     },
 
+    /// A `PropertiesChanged` signal could not be emitted.
+    ///
+    /// Not fatal, and not silent either: the in-memory value has already moved, so every
+    /// client watching that object now has a stale copy of a property and no way to
+    /// learn otherwise until it polls. Whoever gets this logs it.
+    #[error("emitting PropertiesChanged for {path} failed")]
+    PropertiesChanged {
+        /// The object whose property changed.
+        path: OwnedObjectPath,
+        /// The underlying zbus failure.
+        #[source]
+        source: zbus::Error,
+    },
+
     /// The signal handlers could not be installed.
     ///
     /// Fatal on purpose: without them systemd's `SIGTERM` reaches the default

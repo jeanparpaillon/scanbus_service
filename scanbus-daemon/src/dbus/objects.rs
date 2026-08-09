@@ -44,7 +44,7 @@ use tracing::{info, instrument, warn};
 use zbus::Connection;
 use zbus::fdo::ObjectManager;
 use zbus::names::InterfaceName;
-use zbus::object_server::Interface;
+use zbus::object_server::{Interface, InterfaceRef};
 use zbus::zvariant::{ObjectPath, OwnedObjectPath};
 
 use crate::dbus::path;
@@ -130,6 +130,41 @@ impl ObjectRegistry {
         info!("exported");
 
         Ok(())
+    }
+
+    /// A handle on an interface already exported at `path`.
+    ///
+    /// The way a property changes after the object was published: mutate through
+    /// [`InterfaceRef::get_mut`] and emit `PropertiesChanged` with the returned
+    /// [`InterfaceRef`]'s signal emitter — the two together are what `Scanner1`'s
+    /// [`update`](crate::dbus::scanner::update) does. It lives here for the same reason
+    /// [`ObjectRegistry::add`] does: `object_server()` is called in one place, so what
+    /// the registry believes and what the bus serves cannot drift.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotExported`] when that interface is not at that path — including when
+    /// the object went away between a caller looking it up and using it, which a
+    /// discovery session racing `StopDiscovery` can genuinely do.
+    pub async fn interface<I>(&self, path: &ObjectPath<'_>) -> Result<InterfaceRef<I>, Error>
+    where
+        I: Interface,
+    {
+        self.connection
+            .object_server()
+            .interface::<_, I>(path)
+            .await
+            .map_err(|source| match source {
+                zbus::Error::InterfaceNotFound => Error::NotExported {
+                    path: path.clone().into_owned().into(),
+                },
+                source => Error::ObjectServer {
+                    operation: "looking up",
+                    path: path.clone().into_owned().into(),
+                    interface: I::name(),
+                    source,
+                },
+            })
     }
 
     /// Unexports every interface at `path`, and nothing below it.

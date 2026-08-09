@@ -15,14 +15,19 @@
 //! Session bus rather than system bus, per implementation plan §7: this is per-user and
 //! per-graphical-session, which matches how `brscan-skey` already runs.
 
+pub mod convert;
+pub mod manager;
 pub mod objects;
 pub mod path;
+pub mod scanner;
 
 use tracing::{info, instrument};
 use zbus::fdo::{RequestNameFlags, RequestNameReply};
 use zbus::{Connection, connection::Builder};
 
+pub use manager::Manager1;
 pub use objects::ObjectRegistry;
+pub use scanner::Scanner1;
 
 /// The well-known name this daemon owns on the session bus.
 pub const BUS_NAME: &str = "org.scanbus";

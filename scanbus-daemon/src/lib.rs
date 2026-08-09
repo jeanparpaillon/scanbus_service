@@ -10,7 +10,13 @@
 //! it), while everything in this crate is allowed to — and this is the only crate that
 //! renders the model onto the bus.
 
+pub mod backends;
 pub mod dbus;
+pub mod discovery;
 pub mod error;
+pub mod scanners;
 
+pub use backends::Backends;
+pub use discovery::Discovery;
 pub use error::Error;
+pub use scanners::ScannerRegistry;
