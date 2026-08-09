@@ -1,0 +1,40 @@
+[package]
+name = "scanbus-cli"
+description = "scanbus command-line client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+# The crate is `scanbus-cli`, the binary is `scanbus`: the package name says which of
+# the two client crates this is (scanbus-cli.md §2), the binary name is what a user
+# types. A `[[bin]]` section rather than renaming the package, so `cargo test -p
+# scanbus-cli` keeps working on the name the workspace uses everywhere else.
+[[bin]]
+name = "scanbus"
+path = "src/main.rs"
+
+[dependencies]
+# The whole D-Bus surface, and never zbus directly: a proxy or an error name spelled
+# here would be a second copy of the contract, which is the thing scanbus-client exists
+# to prevent. The one exception is the test harness below, which needs a bus of its own.
+scanbus-client.workspace = true
+clap = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+# `rt` and not `rt-multi-thread`: this process makes a handful of D-Bus calls and exits,
+# so a thread pool would be startup cost with nothing to run on it (8.2). `time` is what
+# `--timeout` is made of.
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+# The integration tests stand a `dbus-daemon` up and, for the "running" case, own
+# `org.scanbus` from the test itself — a stand-in daemon, so that the CLI's tests do not
+# depend on `scanbus-daemon` and the direction of scanbus-cli.md §2 holds for the tests
+# too. The full-daemon end of it is 8.11.
+zbus.workspace = true
+# `rt-multi-thread` for the tests that own `org.scanbus` while the CLI runs as a
+# subprocess: the stand-in has to keep answering the bus while the test thread blocks on
+# the child, which a current-thread runtime cannot do.
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
