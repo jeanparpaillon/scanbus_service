@@ -1,12 +1,15 @@
 //! scanbus daemon.
 //!
-//! Skeleton: it brings up the runtime, the log subscriber and the shutdown path, and
-//! nothing else. The D-Bus interfaces (`Manager1`, `Scanner1`, `Button1`, `Job1`) land
-//! in workstream 2 and hang off this `main`.
+//! Wiring only: it brings up the runtime and the log subscriber, then hands over to
+//! [`scanbus_daemon`]. The D-Bus interfaces themselves (`Manager1`, `Scanner1`,
+//! `Button1`, `Job1`) hang off the registry built here as the rest of workstream 2
+//! lands.
 
 use std::process::ExitCode;
 
-use tracing::info;
+use scanbus_daemon::Error;
+use scanbus_daemon::dbus::{self, ObjectRegistry};
+use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, fmt};
 
 /// Backends compiled into this binary, in the order they will be probed.
@@ -33,19 +36,40 @@ async fn main() -> ExitCode {
         "scanbus-daemon started"
     );
 
-    match shutdown_signal().await {
+    match run().await {
         Ok(signal) => {
-            info!(signal, "shutting down");
+            info!(signal, "stopped");
             ExitCode::SUCCESS
         }
         Err(error) => {
-            // Losing the signal handlers would mean systemd's SIGTERM goes to the
-            // default disposition and the daemon dies without running its shutdown
-            // path. Refuse to run half-supervised.
-            tracing::error!(%error, "cannot install signal handlers");
+            // Every variant here means the daemon is not serving: no bus, no name, or
+            // an object tree it could not export. Exiting non-zero is what tells
+            // systemd — and a developer starting a second instance by hand — that this
+            // process is not the one answering on `org.scanbus`.
+            error!(%error, "scanbus-daemon cannot run");
             ExitCode::FAILURE
         }
     }
+}
+
+/// Serves until a termination signal arrives, then takes the object tree down.
+async fn run() -> Result<&'static str, Error> {
+    let connection = dbus::connect().await?;
+
+    // Objects first, name second: see the ordering in `dbus`. Everything later
+    // workstreams restore or discover gets exported between these two lines.
+    let registry = ObjectRegistry::new(connection.clone()).await?;
+    dbus::request_name(&connection).await?;
+
+    let signal = shutdown_signal().await.map_err(Error::Signal)?;
+    info!(signal, "shutting down");
+
+    // Explicitly, rather than leaving it to `Drop`: this is the one place that can
+    // await the unexports, so clients see `InterfacesRemoved` for every object instead
+    // of just watching the name vanish.
+    registry.shutdown().await;
+
+    Ok(signal)
 }
 
 /// Resolves with the name of the first termination signal received.

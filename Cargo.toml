@@ -44,3 +44,9 @@ thiserror = "2"
 tokio = { version = "1", features = ["sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Daemon-only, and deliberately not in scanbus-core's tree — scripts/check-core-deps.sh
+# fails the build if it ever gets there. `default-features = false` drops the async-io
+# executor: the daemon already runs on tokio, and pulling in a second reactor to serve
+# the same connection is how zbus deadlocks. `blocking-api` goes with it, since every
+# call site here is async.
+zbus = { version = "5.18", default-features = false, features = ["tokio"] }
