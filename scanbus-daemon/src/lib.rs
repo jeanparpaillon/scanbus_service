@@ -15,8 +15,10 @@ pub mod dbus;
 pub mod discovery;
 pub mod error;
 pub mod scanners;
+pub mod store;
 
 pub use backends::Backends;
 pub use discovery::Discovery;
 pub use error::Error;
 pub use scanners::ScannerRegistry;
+pub use store::MemoryPairingStore;

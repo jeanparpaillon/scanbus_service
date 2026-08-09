@@ -167,6 +167,7 @@ async fn run_session(
     mut stopped: watch::Receiver<bool>,
 ) {
     let deadline = Instant::now() + SESSION_LIMIT;
+    let probed: Vec<&'static str> = backends.iter().map(|entry| entry.backend.id()).collect();
 
     loop {
         let found = probe(&backends).await;
@@ -178,11 +179,18 @@ async fn run_session(
             break;
         }
 
-        for (rank, info) in found {
-            if let Err(error) = scanners.observe(rank, info).await {
+        let mut seen = Vec::with_capacity(found.len());
+        for (backend, info) in found {
+            seen.push(info.id.clone());
+            if let Err(error) = scanners.observe(&backend, info).await {
                 warn!(%error, "could not publish a discovered scanner");
             }
         }
+
+        // The other half of a round: what the backends stopped finding. A paired scanner
+        // that has been switched off is not removed — §9 keeps it paired — it goes
+        // `Status="offline"`, which is the only reachability signal this iteration has.
+        scanners.mark_unseen_offline(&probed, &seen).await;
 
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -208,11 +216,11 @@ async fn run_session(
 /// The results are ordered by rank so that the better-ranked sighting of a device is
 /// the one [`ScannerRegistry::observe`](crate::scanners::ScannerRegistry::observe)
 /// sees first, which is what makes the precedence order decide a tie.
-async fn probe(backends: &[RankedBackend]) -> Vec<(usize, scanbus_core::ScannerInfo)> {
+async fn probe(backends: &[RankedBackend]) -> Vec<(RankedBackend, scanbus_core::ScannerInfo)> {
     let mut tasks = JoinSet::new();
 
     for entry in backends {
-        let rank = entry.rank;
+        let entry = entry.clone();
         let backend: Arc<dyn ScannerBackend> = Arc::clone(&entry.backend);
 
         tasks.spawn(async move {
@@ -222,7 +230,10 @@ async fn probe(backends: &[RankedBackend]) -> Vec<(usize, scanbus_core::ScannerI
             match outcome {
                 Ok(Ok(scanners)) => {
                     debug!(backend = id, found = scanners.len(), "backend probed");
-                    scanners.into_iter().map(|info| (rank, info)).collect()
+                    scanners
+                        .into_iter()
+                        .map(|info| (entry.clone(), info))
+                        .collect()
                 }
                 Ok(Err(error)) => {
                     // Logged and skipped: a backend that cannot probe is an environment
@@ -251,6 +262,6 @@ async fn probe(backends: &[RankedBackend]) -> Vec<(usize, scanbus_core::ScannerI
         }
     }
 
-    found.sort_by_key(|(rank, _)| *rank);
+    found.sort_by_key(|(entry, _)| entry.rank);
     found
 }

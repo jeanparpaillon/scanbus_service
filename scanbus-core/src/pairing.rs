@@ -20,11 +20,12 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use async_trait::async_trait;
 use thiserror::Error;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{broadcast, mpsc};
 use tokio::task::AbortHandle;
 
 use crate::backend::{PairingProgress, ScannerBackend};
-use crate::model::{PairingState, ScannerInfo};
+use crate::error::BackendError;
+use crate::model::{PairingState, ScannerId, ScannerInfo};
 
 /// How many [`PairingProgress`] steps [`ScannerBackend::ensure_installed`] may have
 /// in flight before the relay that turns them into transitions has to catch up.
@@ -33,6 +34,17 @@ use crate::model::{PairingState, ScannerInfo};
 /// blocks, since that `.send` failing silently (receiver dropped) is already part of
 /// the trait's contract, but *blocking* it is not.
 const PROGRESS_BUFFER: usize = 16;
+
+/// How many transitions a subscriber may fall behind before it starts missing them.
+///
+/// One run of §5's sequence produces four at most, so this is several pairings' worth of
+/// slack for a consumer that has stalled — and the consumer that matters, the daemon's
+/// `PropertiesChanged` emitter, does one D-Bus signal per value. A [`broadcast`] channel
+/// rather than a `watch` precisely because the intermediate values are the point:
+/// `watch` keeps only the newest, and a scanner whose install starts a millisecond after
+/// `Pair()` returns would reach a client as `pairing → done` with the
+/// `"installing_backend"` the API promises never sent.
+const TRANSITION_BUFFER: usize = 32;
 
 /// Where a successfully paired scanner is made durable, before `Done` is announced.
 ///
@@ -54,6 +66,23 @@ pub trait PairingStore: Send + Sync {
     /// Whatever the concrete store failed to do — write a file, commit a transaction —
     /// rendered as a message fit for [`PairingState::Failed`].
     async fn save_paired(&self, scanner: &ScannerInfo) -> Result<(), PairingStoreError>;
+
+    /// Removes what [`PairingStore::save_paired`] recorded — `Unpair()` (§3).
+    ///
+    /// **Idempotent**: a scanner the store has never heard of is `Ok(())`, not an error.
+    /// `Unpair()` is reachable on a scanner paired in an earlier run and already forgotten
+    /// by hand, and a client retrying a call whose reply it lost must not get a failure
+    /// the second time.
+    ///
+    /// Awaited *before* [`PairingMachine::unpair`] clears `Paired`, for the mirror image
+    /// of the reason [`PairingStore::save_paired`] runs before `Done`: a failure here has
+    /// to leave the scanner paired, or a restart would bring back a pairing the daemon
+    /// has already told its clients is gone.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the concrete store failed to do.
+    async fn forget(&self, scanner_id: &ScannerId) -> Result<(), PairingStoreError>;
 }
 
 /// A [`PairingStore::save_paired`] failure.
@@ -83,9 +112,38 @@ pub enum PairOutcome {
     AlreadyPaired,
 }
 
+/// What [`PairingMachine::unpair`] could not do.
+///
+/// Deliberately not "everything that can go wrong while unpairing": a backend that
+/// cannot stop its listener is *not* in here, because [`PairingMachine::unpair`] does
+/// not fail on it — see that method. What is left are the two conditions that must stop
+/// the pairing from being forgotten.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum UnpairError {
+    /// The scanner is not paired, so there is no association to remove.
+    #[error("scanner {0} is not paired")]
+    NotPaired(ScannerId),
+
+    /// The store refused to forget the pairing.
+    ///
+    /// The scanner stays paired: a `Paired=false` that a restart would undo is worse
+    /// than a failed `Unpair()` the user can retry.
+    #[error("the pairing of {scanner} could not be forgotten: {source}")]
+    Store {
+        /// The scanner that stays paired.
+        scanner: ScannerId,
+        /// What the store reported.
+        #[source]
+        source: PairingStoreError,
+    },
+}
+
 /// Shared, lockable state — everything [`PairingMachine::pair`] and
 /// [`PairingMachine::cancel`] have to agree on atomically.
 struct Inner {
+    /// The backend's last word on this scanner, as
+    /// [`PairingMachine::set_scanner`] left it.
+    scanner: ScannerInfo,
     state: PairingState,
     paired: bool,
     task: Option<AbortHandle>,
@@ -95,12 +153,17 @@ struct Inner {
 ///
 /// Owns no bus, no timer: just the current [`PairingState`], a handle to the task
 /// running the sequence, and what it takes to run one — a backend and a store.
+///
+/// The [`ScannerInfo`] is in here rather than beside it because there is exactly one
+/// thing a stale copy of it can do: send `ensure_installed` at an address the device
+/// moved off. [`PairingMachine::set_scanner`] is what a rediscovery calls, and the
+/// daemon's `Scanner1` object reads its properties back out of here rather than keeping
+/// a second copy that could disagree.
 pub struct PairingMachine {
-    scanner: ScannerInfo,
     backend: Arc<dyn ScannerBackend>,
     store: Arc<dyn PairingStore>,
     inner: Arc<Mutex<Inner>>,
-    transitions: watch::Sender<PairingState>,
+    transitions: broadcast::Sender<PairingState>,
 }
 
 impl PairingMachine {
@@ -110,12 +173,12 @@ impl PairingMachine {
         backend: Arc<dyn ScannerBackend>,
         store: Arc<dyn PairingStore>,
     ) -> Self {
-        let (transitions, _) = watch::channel(PairingState::None);
+        let (transitions, _) = broadcast::channel(TRANSITION_BUFFER);
         Self {
-            scanner,
             backend,
             store,
             inner: Arc::new(Mutex::new(Inner {
+                scanner,
                 state: PairingState::None,
                 paired: false,
                 task: None,
@@ -125,8 +188,19 @@ impl PairingMachine {
     }
 
     /// The scanner this machine is pairing.
-    pub const fn scanner(&self) -> &ScannerInfo {
-        &self.scanner
+    pub fn scanner(&self) -> ScannerInfo {
+        self.lock().scanner.clone()
+    }
+
+    /// Replaces what the backend last reported, returning the previous value.
+    ///
+    /// Called on every rediscovery. It does not touch the pairing state: a scanner that
+    /// was renamed or moved to another address mid-pairing is still the same scanner
+    /// (§1 keys on [`ScannerInfo::id`]), and a pairing already in flight keeps the
+    /// snapshot [`PairingMachine::pair`] took — restarting it under a running install is
+    /// exactly what §9's idempotency rule forbids.
+    pub fn set_scanner(&self, scanner: ScannerInfo) -> ScannerInfo {
+        std::mem::replace(&mut self.lock().scanner, scanner)
     }
 
     /// The current `PairingState`.
@@ -142,11 +216,15 @@ impl PairingMachine {
         self.lock().paired
     }
 
-    /// A receiver of every `PairingState` this machine moves to, current value first.
+    /// A receiver of every `PairingState` this machine moves to from now on.
     ///
     /// This is the "channel" the module doc promises: the daemon (2.3) turns each
     /// value out of it into a `PropertiesChanged` for `PairingState`/`PairingError`.
-    pub fn subscribe(&self) -> watch::Receiver<PairingState> {
+    ///
+    /// It carries no starting value — subscribe first, then read
+    /// [`PairingMachine::state`], which is the same "subscribe before you call" order a
+    /// D-Bus client uses for the properties this feeds.
+    pub fn subscribe(&self) -> broadcast::Receiver<PairingState> {
         self.transitions.subscribe()
     }
 
@@ -167,9 +245,9 @@ impl PairingMachine {
         }
 
         inner.state = PairingState::Pairing;
-        self.transitions.send_replace(PairingState::Pairing);
+        let _ = self.transitions.send(PairingState::Pairing);
 
-        let scanner = self.scanner.clone();
+        let scanner = inner.scanner.clone();
         let backend = Arc::clone(&self.backend);
         let store = Arc::clone(&self.store);
         let task_inner = Arc::clone(&self.inner);
@@ -198,8 +276,88 @@ impl PairingMachine {
 
         if inner.state.is_in_progress() {
             inner.state = PairingState::None;
-            self.transitions.send_replace(PairingState::None);
+            let _ = self.transitions.send(PairingState::None);
         }
+    }
+
+    /// Undoes a pairing: stops the listener, forgets the persisted entry, and lands on
+    /// [`PairingState::None`] with `Paired=false`.
+    ///
+    /// The order is the contract. The store is written *before* the state moves, so a
+    /// daemon that dies in the middle comes back unpaired-in-memory and unpaired-on-disk
+    /// rather than announcing an `Unpair()` a restart would undo — the mirror image of
+    /// [`PairingStore::save_paired`] running before `Done`.
+    ///
+    /// **A backend that cannot stop listening does not fail this.** `Unpair()` destroys
+    /// state the user asked to be rid of; refusing it because a vendor daemon would not
+    /// shut down leaves them with a scanner they cannot unpair *and* a listener still
+    /// running. Such a failure comes back as `Ok(Some(error))` — the association is gone,
+    /// and the caller has something to log — rather than as an `Err` that would undo
+    /// nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`UnpairError::NotPaired`] when there is nothing to undo, which is what makes a
+    /// second `Unpair()` distinguishable from the first; [`UnpairError::Store`] when the
+    /// pairing could not be forgotten, in which case the scanner stays paired.
+    pub async fn unpair(&self) -> Result<Option<BackendError>, UnpairError> {
+        let scanner = {
+            let mut inner = self.lock();
+            if !inner.paired {
+                return Err(UnpairError::NotPaired(inner.scanner.id.clone()));
+            }
+            // A pairing cannot be in flight while `paired` is set — `pair()` refuses —
+            // so this only ever takes the finished run's handle.
+            inner.task = None;
+            inner.scanner.clone()
+        };
+
+        let stopped = self.backend.stop_listening(&scanner.id).await;
+
+        self.store
+            .forget(&scanner.id)
+            .await
+            .map_err(|source| UnpairError::Store {
+                scanner: scanner.id.clone(),
+                source,
+            })?;
+
+        {
+            let mut inner = self.lock();
+            inner.paired = false;
+            inner.state = PairingState::None;
+        }
+        let _ = self.transitions.send(PairingState::None);
+
+        // Reported, not raised: see the note above on why a listener that would not
+        // stop is not a reason to keep the pairing.
+        Ok(stopped.err())
+    }
+
+    /// Marks the scanner paired without running the sequence — the restore path ([`4.2`]).
+    ///
+    /// A pairing that happened in an earlier run of the daemon is already durable, so
+    /// there is nothing to install and nothing to save; what the object needs is the two
+    /// properties a client reads, `Paired=true` and `PairingState="done"`. Announced
+    /// through the transition stream like any other move, so the one place that emits
+    /// `PropertiesChanged` stays the only place.
+    ///
+    /// A no-op on an already-paired machine.
+    ///
+    /// [`4.2`]: https://github.com/jeanparpaillon/scanbus_service/issues/17
+    pub fn restore_paired(&self) {
+        {
+            let mut inner = self.lock();
+            if inner.paired {
+                return;
+            }
+            if let Some(task) = inner.task.take() {
+                task.abort();
+            }
+            inner.paired = true;
+            inner.state = PairingState::Done;
+        }
+        let _ = self.transitions.send(PairingState::Done);
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -228,7 +386,7 @@ async fn run(
     backend: Arc<dyn ScannerBackend>,
     store: Arc<dyn PairingStore>,
     inner: Arc<Mutex<Inner>>,
-    transitions: watch::Sender<PairingState>,
+    transitions: broadcast::Sender<PairingState>,
 ) {
     let (progress_tx, mut progress_rx) = mpsc::channel::<PairingProgress>(PROGRESS_BUFFER);
 
@@ -244,7 +402,7 @@ async fn run(
                     .lock()
                     .expect("pairing machine lock poisoned")
                     .state = state.clone();
-                relay_transitions.send_replace(state);
+                let _ = relay_transitions.send(state);
             }
         }
     });
@@ -293,13 +451,13 @@ async fn run(
         guard.paired = true;
         guard.task = None;
     }
-    transitions.send_replace(PairingState::Done);
+    let _ = transitions.send(PairingState::Done);
 }
 
 /// Lands the machine on a terminal state and forgets the (now finished) task handle.
 fn finish(
     inner: &Arc<Mutex<Inner>>,
-    transitions: &watch::Sender<PairingState>,
+    transitions: &broadcast::Sender<PairingState>,
     state: PairingState,
 ) {
     {
@@ -307,7 +465,7 @@ fn finish(
         guard.state = state.clone();
         guard.task = None;
     }
-    transitions.send_replace(state);
+    let _ = transitions.send(state);
 }
 
 #[cfg(test)]
@@ -326,10 +484,12 @@ mod tests {
     use crate::model::{ProfileKind, ScannerId, Value};
     use std::collections::BTreeMap;
 
-    /// A [`PairingStore`] that records every scanner it was asked to save.
+    /// A [`PairingStore`] that records every scanner it was asked to save, and every one
+    /// it was asked to forget.
     #[derive(Default)]
     struct RecordingStore {
         saved: AsyncMutex<Vec<ScannerId>>,
+        forgotten: AsyncMutex<Vec<ScannerId>>,
     }
 
     #[async_trait]
@@ -338,11 +498,20 @@ mod tests {
             self.saved.lock().await.push(scanner.id.clone());
             Ok(())
         }
+
+        async fn forget(&self, scanner_id: &ScannerId) -> Result<(), PairingStoreError> {
+            self.forgotten.lock().await.push(scanner_id.clone());
+            Ok(())
+        }
     }
 
     impl RecordingStore {
         async fn saved(&self) -> Vec<ScannerId> {
             self.saved.lock().await.clone()
+        }
+
+        async fn forgotten(&self) -> Vec<ScannerId> {
+            self.forgotten.lock().await.clone()
         }
     }
 
@@ -352,6 +521,10 @@ mod tests {
     #[async_trait]
     impl PairingStore for FailingStore {
         async fn save_paired(&self, _scanner: &ScannerInfo) -> Result<(), PairingStoreError> {
+            Err(PairingStoreError::new(self.0))
+        }
+
+        async fn forget(&self, _scanner_id: &ScannerId) -> Result<(), PairingStoreError> {
             Err(PairingStoreError::new(self.0))
         }
     }
@@ -428,14 +601,22 @@ mod tests {
 
     /// Waits (bounded, so a bug here fails the test instead of hanging CI) until
     /// `machine` reports `state`.
+    ///
+    /// Subscribes *before* reading the current state, which is the order the channel's
+    /// lack of a starting value forces and the one that cannot miss a transition.
     async fn wait_for(machine: &PairingMachine, state: &PairingState) {
         let mut rx = machine.subscribe();
+        if machine.state() == *state {
+            return;
+        }
+
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                if &*rx.borrow() == state {
-                    return;
+                match rx.recv().await {
+                    Ok(seen) if seen == *state => return,
+                    Ok(_) => {}
+                    Err(error) => panic!("no more transitions: {error}"),
                 }
-                rx.changed().await.expect("machine dropped its sender");
             }
         })
         .await
@@ -533,8 +714,7 @@ mod tests {
         assert_eq!(machine.pair(), PairOutcome::Started);
 
         loop {
-            rx.changed().await.expect("machine dropped its sender");
-            let state = rx.borrow().clone();
+            let state = rx.recv().await.expect("machine dropped its sender");
             if state == PairingState::Done {
                 // By the time Done is observable, the write has already happened —
                 // there is no `.await` between the store write and this send.
@@ -556,6 +736,210 @@ mod tests {
         assert_eq!(machine.pair(), PairOutcome::Started);
         wait_for(&machine, &PairingState::Failed("disk full".to_owned())).await;
         assert!(!machine.is_paired());
+    }
+
+    /// `Unpair()` from the machine's side: the listener stops, the store forgets, and the
+    /// two properties a client watches go back to where a fresh scanner starts.
+    #[tokio::test]
+    async fn unpairing_stops_the_listener_forgets_the_store_and_lands_on_none() {
+        let backend = MockBackend::with_scanners([sample_scanner()]);
+        let handle = backend.handle();
+        let store = Arc::new(RecordingStore::default());
+        let machine = PairingMachine::new(sample_scanner(), Arc::new(backend), store.clone());
+
+        assert_eq!(machine.pair(), PairOutcome::Started);
+        wait_for(&machine, &PairingState::Done).await;
+        handle.clear_calls();
+
+        assert_eq!(machine.unpair().await, Ok(None));
+        assert!(!machine.is_paired());
+        assert_eq!(machine.state(), PairingState::None);
+        assert_eq!(store.forgotten().await, vec![sample_scanner().id]);
+        assert_eq!(
+            handle.calls(),
+            vec![crate::backend::mock::MockCall::StopListening {
+                scanner: sample_scanner().id,
+                // The machine dropped the stream at `Done` (see `run`), so there is
+                // nothing live to stop until 2.4 owns the listener task.
+                was_listening: false,
+            }]
+        );
+
+        // And it is pairable again, from scratch.
+        assert_eq!(machine.pair(), PairOutcome::Started);
+        wait_for(&machine, &PairingState::Done).await;
+        assert!(machine.is_paired());
+    }
+
+    /// The second `Unpair()` has nothing to undo and says so — the distinction the daemon
+    /// turns into `org.scanbus.Error.NotPaired`.
+    #[tokio::test]
+    async fn unpairing_something_that_is_not_paired_is_not_paired() {
+        let backend = MockBackend::with_scanners([sample_scanner()]);
+        let store = Arc::new(RecordingStore::default());
+        let machine = PairingMachine::new(sample_scanner(), Arc::new(backend), store.clone());
+
+        assert_eq!(
+            machine.unpair().await,
+            Err(UnpairError::NotPaired(sample_scanner().id))
+        );
+        assert!(store.forgotten().await.is_empty());
+
+        machine.pair();
+        wait_for(&machine, &PairingState::Done).await;
+        machine.unpair().await.expect("the first unpair succeeds");
+        assert_eq!(
+            machine.unpair().await,
+            Err(UnpairError::NotPaired(sample_scanner().id))
+        );
+    }
+
+    /// A pairing the store would not forget must not be announced as gone: a restart
+    /// would bring it back.
+    #[tokio::test]
+    async fn a_store_that_cannot_forget_leaves_the_scanner_paired() {
+        struct SaveButNeverForget;
+
+        #[async_trait]
+        impl PairingStore for SaveButNeverForget {
+            async fn save_paired(&self, _scanner: &ScannerInfo) -> Result<(), PairingStoreError> {
+                Ok(())
+            }
+
+            async fn forget(&self, _scanner_id: &ScannerId) -> Result<(), PairingStoreError> {
+                Err(PairingStoreError::new("read-only file system"))
+            }
+        }
+
+        let backend = MockBackend::with_scanners([sample_scanner()]);
+        let machine = PairingMachine::new(
+            sample_scanner(),
+            Arc::new(backend),
+            Arc::new(SaveButNeverForget),
+        );
+
+        machine.pair();
+        wait_for(&machine, &PairingState::Done).await;
+
+        assert_eq!(
+            machine.unpair().await,
+            Err(UnpairError::Store {
+                scanner: sample_scanner().id,
+                source: PairingStoreError::new("read-only file system"),
+            })
+        );
+        assert!(machine.is_paired());
+        assert_eq!(machine.state(), PairingState::Done);
+    }
+
+    /// A listener that refuses to stop is reported, not raised: the pairing still goes.
+    #[tokio::test]
+    async fn a_listener_that_will_not_stop_does_not_block_the_unpairing() {
+        struct StubbornListener(MockBackend);
+
+        #[async_trait]
+        impl ScannerBackend for StubbornListener {
+            fn id(&self) -> &'static str {
+                self.0.id()
+            }
+
+            async fn discover(&self) -> Result<Vec<ScannerInfo>, BackendError> {
+                self.0.discover().await
+            }
+
+            async fn ensure_installed(
+                &self,
+                scanner: &ScannerInfo,
+                progress: mpsc::Sender<PairingProgress>,
+            ) -> Result<(), BackendError> {
+                self.0.ensure_installed(scanner, progress).await
+            }
+
+            async fn start_listening(
+                &self,
+                scanner: &ScannerInfo,
+            ) -> Result<BoxStream<'static, ButtonPressedEvent>, BackendError> {
+                self.0.start_listening(scanner).await
+            }
+
+            async fn stop_listening(&self, _scanner_id: &ScannerId) -> Result<(), BackendError> {
+                Err(BackendError::Other("brscan-skey will not die".to_owned()))
+            }
+
+            async fn set_button_mapping(
+                &self,
+                scanner_id: &ScannerId,
+                button_index: u32,
+                profile: Option<ProfileKind>,
+                options: &BTreeMap<String, Value>,
+            ) -> Result<(), BackendError> {
+                self.0
+                    .set_button_mapping(scanner_id, button_index, profile, options)
+                    .await
+            }
+
+            async fn fetch_pages(
+                &self,
+                scanner_id: &ScannerId,
+                job_id: &str,
+            ) -> Result<BoxStream<'static, crate::model::RawPage>, BackendError> {
+                self.0.fetch_pages(scanner_id, job_id).await
+            }
+        }
+
+        let backend = StubbornListener(MockBackend::with_scanners([sample_scanner()]));
+        let store = Arc::new(RecordingStore::default());
+        let machine = PairingMachine::new(sample_scanner(), Arc::new(backend), store.clone());
+
+        machine.pair();
+        wait_for(&machine, &PairingState::Done).await;
+
+        assert_eq!(
+            machine.unpair().await,
+            Ok(Some(BackendError::Other(
+                "brscan-skey will not die".to_owned()
+            )))
+        );
+        assert!(!machine.is_paired());
+        assert_eq!(store.forgotten().await, vec![sample_scanner().id]);
+    }
+
+    /// The restore path (4.2): paired without a sequence, announced like any transition.
+    #[tokio::test]
+    async fn restoring_a_pairing_announces_done_without_touching_the_backend() {
+        let backend = MockBackend::with_scanners([sample_scanner()]);
+        let handle = backend.handle();
+        let store = Arc::new(RecordingStore::default());
+        let machine = PairingMachine::new(sample_scanner(), Arc::new(backend), store.clone());
+        let mut transitions = machine.subscribe();
+
+        machine.restore_paired();
+
+        assert!(machine.is_paired());
+        assert_eq!(machine.state(), PairingState::Done);
+        assert_eq!(transitions.try_recv().unwrap(), PairingState::Done);
+        assert!(handle.calls().is_empty(), "{:?}", handle.calls());
+        assert!(store.saved().await.is_empty());
+
+        // Idempotent, and `Pair()` on it is §9's AlreadyPaired.
+        machine.restore_paired();
+        assert_eq!(machine.pair(), PairOutcome::AlreadyPaired);
+    }
+
+    /// A rediscovery moves the address the next `pair()` will use, and nothing else.
+    #[tokio::test]
+    async fn set_scanner_updates_what_a_later_pair_is_run_against() {
+        let backend = MockBackend::with_scanners([sample_scanner()]);
+        let store = Arc::new(RecordingStore::default());
+        let machine = PairingMachine::new(sample_scanner(), Arc::new(backend), store.clone());
+
+        let mut moved = sample_scanner();
+        moved.address = "usb:001:003".to_owned();
+        let previous = machine.set_scanner(moved.clone());
+
+        assert_eq!(previous.address, "usb:001:002");
+        assert_eq!(machine.scanner(), moved);
+        assert_eq!(machine.state(), PairingState::None);
     }
 
     #[tokio::test]

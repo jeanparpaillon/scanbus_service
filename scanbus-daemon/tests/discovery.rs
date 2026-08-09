@@ -19,7 +19,7 @@ use scanbus_core::{
     BackendError, Capabilities, ScannerBackend, ScannerId, ScannerInfo, Status, Value,
 };
 use scanbus_daemon::dbus::{self, BUS_NAME, Manager1, ObjectRegistry, path};
-use scanbus_daemon::{Backends, Discovery, ScannerRegistry};
+use scanbus_daemon::{Backends, Discovery, MemoryPairingStore, ScannerRegistry};
 use zbus::fdo::{ManagedObjects, ObjectManagerProxy};
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value as ZValue};
 
@@ -79,7 +79,8 @@ impl Daemon {
     async fn start(bus: &PrivateBus, backends: Backends) -> Self {
         let connection = bus.connect().await;
         let objects = Arc::new(ObjectRegistry::new(connection.clone()).await.unwrap());
-        let scanners = Arc::new(ScannerRegistry::new(Arc::clone(&objects)));
+        let scanners =
+            ScannerRegistry::new(Arc::clone(&objects), Arc::new(MemoryPairingStore::new()));
         let discovery = Arc::new(Discovery::new(backends, Arc::clone(&scanners)));
 
         objects
@@ -110,6 +111,12 @@ fn scanner_info(backend: &str, address: &str, name: &str) -> ScannerInfo {
 
 fn backend(id: &'static str, scanners: impl IntoIterator<Item = ScannerInfo>) -> Arc<MockBackend> {
     Arc::new(MockBackend::with_scanners(scanners).with_id(id))
+}
+
+/// A backend for a scanner no probe reports — what `register_persistent` needs to hand
+/// the scanner's pairing machine, since 4.2 restores a pairing before any round runs.
+fn absent_backend(id: &'static str) -> Arc<dyn ScannerBackend> {
+    Arc::new(MockBackend::new().with_id(id))
 }
 
 fn backends(entries: impl IntoIterator<Item = Arc<MockBackend>>) -> Backends {
@@ -288,7 +295,7 @@ async fn stopping_discovery_removes_the_unpaired_and_keeps_the_paired() {
     let paired = scanner_info("escl", "usb:001:002", "a paired scanner");
     daemon
         .scanners
-        .register_persistent(paired.clone())
+        .register_persistent(absent_backend("escl"), paired.clone())
         .await
         .unwrap();
 
@@ -508,7 +515,7 @@ async fn a_rediscovered_paired_scanner_updates_its_object() {
     let daemon = Daemon::start(&bus, backends([backend("escl", [rediscovered.clone()])])).await;
     daemon
         .scanners
-        .register_persistent(paired.clone())
+        .register_persistent(absent_backend("escl"), paired.clone())
         .await
         .unwrap();
 

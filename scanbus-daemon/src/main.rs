@@ -9,8 +9,8 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use scanbus_daemon::dbus::{self, Manager1, ObjectRegistry, path};
-use scanbus_daemon::{Backends, Discovery, Error, ScannerRegistry};
-use tracing::{error, info};
+use scanbus_daemon::{Backends, Discovery, Error, MemoryPairingStore, ScannerRegistry};
+use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
 
 /// Backends compiled into this binary, in the order they will be probed.
@@ -76,7 +76,10 @@ async fn run() -> Result<&'static str, Error> {
     // Objects first, name second: see the ordering in `dbus`. Everything later
     // workstreams restore or discover gets exported between these two lines.
     let registry = Arc::new(ObjectRegistry::new(connection.clone()).await?);
-    let scanners = Arc::new(ScannerRegistry::new(Arc::clone(&registry)));
+    // In memory until 4.1 gives it a file: a pairing made now does not survive a
+    // restart, which is worth saying out loud rather than leaving a user to discover.
+    warn!("pairings are kept in memory only; a restart forgets them (4.1)");
+    let scanners = ScannerRegistry::new(Arc::clone(&registry), Arc::new(MemoryPairingStore::new()));
     let discovery = Arc::new(Discovery::new(backends(), scanners));
 
     registry

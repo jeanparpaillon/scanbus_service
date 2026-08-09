@@ -445,6 +445,7 @@ dependencies = [
 name = "scanbus-daemon"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "futures-util",
  "scanbus-backend-brother",
  "scanbus-backend-hplip",

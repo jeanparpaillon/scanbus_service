@@ -26,6 +26,8 @@ hplip = ["dep:scanbus-backend-hplip"]
 
 [dependencies]
 scanbus-core.workspace = true
+# `PairingStore` is `#[async_trait]`, so implementing it here needs the same macro.
+async-trait.workspace = true
 scanbus-backend-brother = { workspace = true, optional = true }
 scanbus-backend-hplip = { workspace = true, optional = true }
 # The runtime lives here, not in the workspace defaults: `signal` is what the shutdown

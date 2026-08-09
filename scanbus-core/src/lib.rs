@@ -16,4 +16,4 @@ pub use model::{
     ButtonInfo, ButtonsCapability, Capabilities, ColorMode, PageFormat, PairingState, ProfileKind,
     RawPage, ScannerId, ScannerInfo, Source, Status, Value,
 };
-pub use pairing::{PairOutcome, PairingMachine, PairingStore, PairingStoreError};
+pub use pairing::{PairOutcome, PairingMachine, PairingStore, PairingStoreError, UnpairError};
