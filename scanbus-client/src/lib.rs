@@ -52,8 +52,17 @@ pub mod proxy;
 pub mod scanner;
 pub mod watch;
 
-pub use connect::{BUS_NAME, Bus, Presence, connect, presence};
+pub use connect::{BUS_NAME, Bus, Presence, connect, owner, presence};
 pub use convert::DecodeError;
 pub use error::{Error, Result, ScanbusError};
 pub use scanner::ScannerState;
 pub use watch::{PropertyChanges, PropertyWatch, ScannerStates, ScannerWatch};
+/// The bus connection every proxy here is built on.
+///
+/// Re-exported because a consumer has to name it — a `Connection` is what
+/// [`connect`] returns and what every `for_scanner`-style constructor takes — and
+/// naming it through `zbus` would mean a `zbus` dependency in the CLI's manifest, which
+/// is the first step towards a proxy declared outside this crate ([`scanbus-cli.md`] §2).
+///
+/// [`scanbus-cli.md`]: https://github.com/jeanparpaillon/scanbus_service/blob/master/docs/scanbus-cli.md
+pub use zbus::Connection;

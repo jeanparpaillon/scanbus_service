@@ -147,6 +147,32 @@ pub async fn presence(connection: &Connection) -> Result<Presence> {
     )
 }
 
+/// The unique name currently owning [`BUS_NAME`], or `None` when nobody does.
+///
+/// The companion to [`presence`] for a health check that has to name the process it
+/// found: `:1.42` is what a developer needs to go from "the daemon is running" to
+/// `busctl --user status :1.42`, and it is the one fact that distinguishes the daemon
+/// that answered from the one that was restarted since. Like [`presence`], this is a
+/// call to the bus daemon and activates nothing.
+///
+/// # Errors
+///
+/// [`Error::Call`] if the bus refuses for any reason other than the name being
+/// unowned — which is the `None` here, not a failure.
+pub async fn owner(connection: &Connection) -> Result<Option<String>> {
+    let bus = DBusProxy::new(connection).await?;
+    let name = BusName::try_from(BUS_NAME).expect("BUS_NAME is a well-known name");
+
+    match bus.get_name_owner(name).await {
+        Ok(owner) => Ok(Some(owner.as_str().to_owned())),
+        // The bus's way of saying "nobody", and the reason this returns an `Option`: a
+        // caller that had to match on an error name to read an ordinary answer would be
+        // one more place where a typo compiles.
+        Err(zbus::fdo::Error::NameHasNoOwner(_)) => Ok(None),
+        Err(error) => Err(Error::from(error)),
+    }
+}
+
 /// Connects, and — when `activate` is false — refuses to go on if that would start the
 /// daemon.
 ///
