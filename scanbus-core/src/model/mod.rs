@@ -9,7 +9,7 @@
 //!
 //! So the model is typed here and rendered at the boundary. The `zvariant` conversions
 //! deliberately live in `scanbus-daemon`: this crate must stay buildable and testable
-//! without a bus, which `scripts/check-core-deps.sh` enforces.
+//! without a bus, which `scripts/check-deps.sh` enforces.
 //!
 //! The one open door is [`Value`], used for the genuinely unstructured corners —
 //! per-button profile options, and capability keys a backend knows about and we do not.

@@ -1,4 +1,4 @@
-//! A `dbus-daemon` of our own, for tests that need a real bus.
+//! A `dbus-daemon` of our own, and a daemon on it, for tests that need a real bus.
 //!
 //! A submodule rather than a `tests/*.rs` of its own, so cargo does not compile it as
 //! an integration test in its own right. The alternative — asserting about the object
@@ -11,10 +11,20 @@
 //! else: no service directories, no per-distro policy, no chance of talking to the
 //! developer's real session bus by accident.
 
+// Cargo compiles this module once per test binary, so whatever only one of them needs is
+// dead code in the others — `Daemon` in `object_tree`, which brings the object server up
+// by hand to assert about a name that is *not* taken. Splitting it up to silence that
+// would put the daemon's startup order back into three files, which is the thing the
+// module exists to stop.
+#![allow(dead_code)]
+
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use scanbus_daemon::dbus::{self, Manager1, ObjectRegistry, path};
+use scanbus_daemon::{Backends, Discovery, MemoryPairingStore, ScannerRegistry};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 
@@ -106,6 +116,16 @@ impl PrivateBus {
         })
     }
 
+    /// The address this bus is listening on.
+    ///
+    /// What `--bus ADDRESS` is for ([`scanbus-cli.md`] §3): a test that drives the
+    /// client's own connection helper has to be able to point it here.
+    ///
+    /// [`scanbus-cli.md`]: https://github.com/jeanparpaillon/scanbus_service/blob/master/docs/scanbus-cli.md
+    pub fn address(&self) -> &str {
+        &self.address
+    }
+
     /// A fresh connection to this bus, owning no name.
     pub async fn connect(&self) -> zbus::Connection {
         zbus::connection::Builder::address(self.address.as_str())
@@ -119,6 +139,55 @@ impl PrivateBus {
 impl Drop for PrivateBus {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// The service side: what `main.rs` wires up, with backends a test chose.
+///
+/// Shared rather than repeated per test file because the *order* is the contract 2.1
+/// pins down — objects exported, then the name requested — and a copy that got it wrong
+/// would pass its own tests while testing a daemon nobody ships.
+pub struct Daemon {
+    /// The daemon's own connection, for a test that needs to act as the service.
+    pub connection: zbus::Connection,
+    /// The registry that decides which scanners have objects, and why.
+    pub scanners: Arc<ScannerRegistry>,
+    /// The discovery session `StartDiscovery` drives.
+    pub discovery: Arc<Discovery>,
+    /// The object tree.
+    pub objects: Arc<ObjectRegistry>,
+    /// Where pairings are persisted — in memory, so nothing outlives the test.
+    pub store: Arc<MemoryPairingStore>,
+}
+
+impl Daemon {
+    /// Brings the daemon up on `bus`, in the order `main.rs` uses.
+    pub async fn start(bus: &PrivateBus, backends: Backends) -> Self {
+        let connection = bus.connect().await;
+        let objects = Arc::new(ObjectRegistry::new(connection.clone()).await.unwrap());
+        let store = Arc::new(MemoryPairingStore::new());
+        let scanners = ScannerRegistry::new(Arc::clone(&objects), Arc::clone(&store) as _);
+        let discovery = Arc::new(Discovery::new(backends, Arc::clone(&scanners)));
+
+        objects
+            .add(path::manager(), Manager1::new(Arc::clone(&discovery)))
+            .await
+            .unwrap();
+        dbus::request_name(&connection).await.unwrap();
+
+        Self {
+            connection,
+            scanners,
+            discovery,
+            objects,
+            store,
+        }
+    }
+
+    /// Stops the discovery session and unexports the tree.
+    pub async fn shutdown(&self) {
+        self.discovery.stop().await;
+        self.objects.shutdown().await;
     }
 }
 

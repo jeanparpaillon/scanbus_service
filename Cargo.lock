@@ -429,6 +429,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "scanbus-client"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "scanbus-core",
+ "thiserror",
+ "tokio",
+ "zbus",
+]
+
+[[package]]
 name = "scanbus-core"
 version = "0.1.0"
 dependencies = [
@@ -449,6 +460,7 @@ dependencies = [
  "futures-util",
  "scanbus-backend-brother",
  "scanbus-backend-hplip",
+ "scanbus-client",
  "scanbus-core",
  "thiserror",
  "tokio",

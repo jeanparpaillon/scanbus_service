@@ -8,18 +8,23 @@ This application implements scanbus D-Bus API, as described in
 
 | Crate | Role |
 |---|---|
-| `scanbus-core` | Domain model, `ScannerBackend` trait, state machines. **No `zbus`, no `dbus`.** |
+| `scanbus-core` | Domain model, `ScannerBackend` trait, state machines, object paths. **No `zbus`, no `dbus`.** |
+| `scanbus-client` | The consumer side: `zbus` proxies, named-error decoding, property watching |
 | `scanbus-daemon` | The binary: D-Bus service, registry, persistence, profile pipeline |
 | `scanbus-backend-brother` | Brother backend (`brscan4`/`brscan5` + `brscan-skey`) |
 | `scanbus-backend-hplip` | HP backend (HPLIP walk-up, `hpssd`) |
 
-The dependency direction is one-way: backends depend on `scanbus-core`, the daemon
-depends on all three, and nothing depends on the daemon.
+The dependency direction is one-way: backends and `scanbus-client` depend on
+`scanbus-core`, the daemon depends on the backends, and nothing depends on the daemon.
+`scanbus-client` is the daemon's *dev*-dependency, so the tests drive the D-Bus surface
+through the same proxies the CLI will — an interface changed on one side and not the
+other is a compile error rather than a stale client found by a user. When both sides
+need a helper it moves *down* into `scanbus-core`, never upward.
 
 `scanbus-core` staying free of D-Bus is what makes the pairing state machine, the
 profile pipeline and the button→profile mapping testable without a bus connection or a
-physical scanner — neither of which CI has. `scripts/check-core-deps.sh` enforces it and
-runs as its own CI job.
+physical scanner — neither of which CI has. `scripts/check-deps.sh` enforces that and
+the client-never-depends-on-the-daemon rule, and runs as its own CI job.
 
 ## Building
 
@@ -30,14 +35,14 @@ be a request rustup is not there to honour. Ubuntu's `rustfmt` and `rust-clippy`
 packages match that compiler.
 
 ```sh
-cargo build                                     # core + daemon, no backend
+cargo build                                     # core + client + daemon, no backend
 cargo build --workspace                         # everything, including the backend crates
 cargo build -p scanbus-daemon --features brother,hplip   # daemon with the backends linked
 ```
 
 Both backends are behind cargo features and off by default, because both shell out to
 hardware-specific tooling. `cargo build` with no arguments builds only
-`default-members` — `scanbus-core` and `scanbus-daemon`.
+`default-members` — `scanbus-core`, `scanbus-client` and `scanbus-daemon`.
 
 ## Checks
 
@@ -47,7 +52,7 @@ The same three things CI runs (`.github/workflows/ci.yml`):
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-./scripts/check-core-deps.sh
+./scripts/check-deps.sh
 ```
 
 ## Running

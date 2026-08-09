@@ -14,89 +14,22 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::StreamExt as _;
+use scanbus_client::proxy::{Manager1Proxy, Scanner1Proxy, object_manager};
 use scanbus_core::backend::mock::MockBackend;
 use scanbus_core::{
     BackendError, Capabilities, ScannerBackend, ScannerId, ScannerInfo, Status, Value,
 };
-use scanbus_daemon::dbus::{self, BUS_NAME, Manager1, ObjectRegistry, path};
-use scanbus_daemon::{Backends, Discovery, MemoryPairingStore, ScannerRegistry};
+use scanbus_daemon::Backends;
+use scanbus_daemon::dbus::path;
 use zbus::fdo::{ManagedObjects, ObjectManagerProxy};
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value as ZValue};
 
 mod common;
 
-use common::{PrivateBus, skipped};
+use common::{Daemon, PrivateBus, skipped};
 
 /// How long a signal that should already be on its way is waited for.
 const SIGNAL_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// The `Manager1` methods of §2, from the client side.
-///
-/// Written out here rather than reused from a client crate because there is none yet —
-/// 8.1 is what turns these into `scanbus-client` proxies.
-#[zbus::proxy(
-    interface = "org.scanbus.Manager1",
-    default_service = "org.scanbus",
-    default_path = "/org/scanbus"
-)]
-trait Manager {
-    fn start_discovery(&self, filters: HashMap<String, OwnedValue>) -> zbus::Result<()>;
-    fn stop_discovery(&self) -> zbus::Result<()>;
-    fn get_profile_types(&self) -> zbus::Result<Vec<String>>;
-}
-
-/// The `Scanner1` properties 2.2 publishes; the rest are 2.3's.
-#[zbus::proxy(interface = "org.scanbus.Scanner1", default_service = "org.scanbus")]
-trait Scanner {
-    #[zbus(property)]
-    fn id(&self) -> zbus::Result<String>;
-    #[zbus(property)]
-    fn name(&self) -> zbus::Result<String>;
-    #[zbus(property)]
-    fn backend(&self) -> zbus::Result<String>;
-    #[zbus(property)]
-    fn address(&self) -> zbus::Result<String>;
-    #[zbus(property)]
-    fn paired(&self) -> zbus::Result<bool>;
-    #[zbus(property)]
-    fn status(&self) -> zbus::Result<String>;
-    #[zbus(property)]
-    fn capabilities(&self) -> zbus::Result<HashMap<String, OwnedValue>>;
-    #[zbus(property)]
-    fn supported_profiles(&self) -> zbus::Result<Vec<String>>;
-}
-
-/// The service side: what `main.rs` wires up, with backends a test chose.
-struct Daemon {
-    connection: zbus::Connection,
-    scanners: Arc<ScannerRegistry>,
-    discovery: Arc<Discovery>,
-    objects: Arc<ObjectRegistry>,
-}
-
-impl Daemon {
-    /// Brings the daemon up on `bus`, in the order `main.rs` uses: objects, then name.
-    async fn start(bus: &PrivateBus, backends: Backends) -> Self {
-        let connection = bus.connect().await;
-        let objects = Arc::new(ObjectRegistry::new(connection.clone()).await.unwrap());
-        let scanners =
-            ScannerRegistry::new(Arc::clone(&objects), Arc::new(MemoryPairingStore::new()));
-        let discovery = Arc::new(Discovery::new(backends, Arc::clone(&scanners)));
-
-        objects
-            .add(path::manager(), Manager1::new(Arc::clone(&discovery)))
-            .await
-            .unwrap();
-        dbus::request_name(&connection).await.unwrap();
-
-        Self {
-            connection,
-            scanners,
-            discovery,
-            objects,
-        }
-    }
-}
 
 fn scanner_info(backend: &str, address: &str, name: &str) -> ScannerInfo {
     ScannerInfo {
@@ -128,23 +61,11 @@ fn backends(entries: impl IntoIterator<Item = Arc<MockBackend>>) -> Backends {
 }
 
 async fn manager_proxy(connection: &zbus::Connection) -> ObjectManagerProxy<'static> {
-    ObjectManagerProxy::builder(connection)
-        .destination(BUS_NAME)
-        .unwrap()
-        .path(path::ROOT)
-        .unwrap()
-        .build()
-        .await
-        .unwrap()
+    object_manager(connection).await.unwrap()
 }
 
-async fn scanner_proxy(connection: &zbus::Connection, id: &ScannerId) -> ScannerProxy<'static> {
-    ScannerProxy::builder(connection)
-        .path(path::scanner(id))
-        .unwrap()
-        .build()
-        .await
-        .unwrap()
+async fn scanner_proxy(connection: &zbus::Connection, id: &ScannerId) -> Scanner1Proxy<'static> {
+    Scanner1Proxy::for_scanner(connection, id).await.unwrap()
 }
 
 /// The scanner objects `GetManagedObjects` reports, in path order.
@@ -249,7 +170,7 @@ async fn two_backends_finding_one_device_publish_one_scanner() {
         let manager = manager_proxy(&client).await;
         let mut added = manager.receive_interfaces_added().await.unwrap();
 
-        ManagerProxy::new(&client)
+        Manager1Proxy::new(&client)
             .await
             .unwrap()
             .start_discovery(HashMap::new())
@@ -303,7 +224,7 @@ async fn stopping_discovery_removes_the_unpaired_and_keeps_the_paired() {
     let manager = manager_proxy(&client).await;
     let mut added = manager.receive_interfaces_added().await.unwrap();
     let mut removed = manager.receive_interfaces_removed().await.unwrap();
-    let proxy = ManagerProxy::new(&client).await.unwrap();
+    let proxy = Manager1Proxy::new(&client).await.unwrap();
 
     proxy.start_discovery(HashMap::new()).await.unwrap();
 
@@ -365,7 +286,7 @@ async fn a_failing_backend_does_not_hide_the_others() {
     let manager = manager_proxy(&client).await;
     let mut added = manager.receive_interfaces_added().await.unwrap();
 
-    ManagerProxy::new(&client)
+    Manager1Proxy::new(&client)
         .await
         .unwrap()
         .start_discovery(HashMap::new())
@@ -390,7 +311,7 @@ async fn get_profile_types_advertises_only_the_implemented_profiles() {
     let client = bus.connect().await;
 
     assert_eq!(
-        ManagerProxy::new(&client)
+        Manager1Proxy::new(&client)
             .await
             .unwrap()
             .get_profile_types()
@@ -410,7 +331,7 @@ async fn an_unknown_backend_filter_is_invalid_args() {
 
     let daemon = Daemon::start(&bus, backends([backend("escl", [])])).await;
     let client = bus.connect().await;
-    let proxy = ManagerProxy::new(&client).await.unwrap();
+    let proxy = Manager1Proxy::new(&client).await.unwrap();
 
     let filters = HashMap::from([(
         "backends".to_owned(),
@@ -458,7 +379,7 @@ async fn a_second_start_discovery_restarts_nothing() {
     let manager = manager_proxy(&client).await;
     let mut added = manager.receive_interfaces_added().await.unwrap();
     let mut removed = manager.receive_interfaces_removed().await.unwrap();
-    let proxy = ManagerProxy::new(&client).await.unwrap();
+    let proxy = Manager1Proxy::new(&client).await.unwrap();
 
     proxy.start_discovery(HashMap::new()).await.unwrap();
     assert_eq!(
@@ -525,7 +446,7 @@ async fn a_rediscovered_paired_scanner_updates_its_object() {
     let scanner = scanner_proxy(&client, &paired.id).await;
     let mut names = scanner.receive_name_changed().await;
 
-    ManagerProxy::new(&client)
+    Manager1Proxy::new(&client)
         .await
         .unwrap()
         .start_discovery(HashMap::new())
@@ -555,7 +476,7 @@ async fn a_rediscovered_paired_scanner_updates_its_object() {
     assert_eq!(daemon.scanners.ids().await, vec![paired.id.clone()]);
 
     // Stopping the session leaves the paired object alone, however it got there.
-    ManagerProxy::new(&client)
+    Manager1Proxy::new(&client)
         .await
         .unwrap()
         .stop_discovery()
@@ -581,7 +502,7 @@ async fn shutdown_stops_the_session_before_the_tree_goes() {
     let client = bus.connect().await;
     let manager = manager_proxy(&client).await;
     let mut added = manager.receive_interfaces_added().await.unwrap();
-    ManagerProxy::new(&client)
+    Manager1Proxy::new(&client)
         .await
         .unwrap()
         .start_discovery(HashMap::new())

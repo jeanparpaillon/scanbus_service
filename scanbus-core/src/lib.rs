@@ -9,6 +9,7 @@ pub mod backend;
 pub mod error;
 pub mod model;
 pub mod pairing;
+pub mod path;
 
 pub use backend::{ButtonPressedEvent, PairingProgress, ScannerBackend};
 pub use error::{BackendError, InvalidScannerId, ParseError};

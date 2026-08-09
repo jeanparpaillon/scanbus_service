@@ -47,6 +47,11 @@ zbus.workspace = true
 # `mock` for the tests only: every acceptance test of workstream 2 drives the D-Bus
 # surface through `MockBackend`, and the daemon itself must not be able to reach for it.
 scanbus-core = { workspace = true, features = ["mock"] }
+# The proxies the tests drive the daemon through are the CLI's, not copies of them: an
+# interface changed on one side and not the other is then a compile error here rather
+# than a stale client discovered by a user (scanbus-cli.md §2). A dev-dependency and
+# never a dependency — the daemon must be buildable without its own client.
+scanbus-client.workspace = true
 # The private-bus harness in tests/ drives the registry against a real `dbus-daemon`,
 # and reads its address off a pipe — hence `io-util`, `process` and the timeouts that
 # stop a missing signal from hanging the suite. The daemon itself needs none of them.

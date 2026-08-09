@@ -6,7 +6,7 @@
 //! exercised against a real `dbus-daemon` rather than asserted about in prose.
 //!
 //! The split from `scanbus-core` runs the other way round: core holds the domain model
-//! and the backend seam and must never see zbus (`scripts/check-core-deps.sh` enforces
+//! and the backend seam and must never see zbus (`scripts/check-deps.sh` enforces
 //! it), while everything in this crate is allowed to — and this is the only crate that
 //! renders the model onto the bus.
 

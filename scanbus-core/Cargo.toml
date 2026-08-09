@@ -14,7 +14,7 @@ mock = []
 
 # Nothing here may pull in zbus or dbus, directly or transitively: everything worth
 # testing (the pairing state machine, the profile pipeline, the button -> profile
-# mapping) has to be reachable without a bus connection. scripts/check-core-deps.sh
+# mapping) has to be reachable without a bus connection. scripts/check-deps.sh
 # enforces it, and CI runs that script.
 [dependencies]
 async-trait.workspace = true

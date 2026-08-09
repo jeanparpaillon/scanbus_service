@@ -34,6 +34,10 @@ Two new crates, both outside `scanbus-core` — which stays free of `zbus` per
 scanbus-client/          # zbus proxies + selector resolution. Depends on scanbus-core, zbus.
 └── src/
     ├── proxy/           # #[proxy] traits: Manager1, Scanner1, Button1, Job1, Profile1
+    ├── connect.rs       # bus selection, and --no-activate as a question about the name
+    ├── convert.rs       # a{sv} -> model, and back for what a client sends
+    ├── scanner.rs       # ScannerState: every Scanner1 property of API §3, typed
+    ├── watch.rs         # subscribe -> call -> snapshot -> stream (§7)
     ├── select.rs        # selector -> object path resolution (§5)
     └── error.rs         # named D-Bus errors (API §8) as a Rust enum
 scanbus-cli/             # binary `scanbus`. Depends on scanbus-client, clap, tokio, serde_json.
@@ -42,6 +46,11 @@ scanbus-cli/             # binary `scanbus`. Depends on scanbus-client, clap, to
     ├── cmd/             # one module per subcommand group
     └── output/          # human tables and the JSON renderer
 ```
+
+Object paths are built and parsed by `scanbus_core::path`, not here: the daemon exports at
+them and the client resolves them, so the one place both can reach is core. That is the
+shape every future shared helper takes — down into `scanbus-core`, never up into
+`scanbus-daemon`.
 
 The split exists because the daemon's own conformance suite ([2.8](todo/2_8.md)) needs exactly
 these proxies. Writing them once in `scanbus-client` and consuming them as a dev-dependency from

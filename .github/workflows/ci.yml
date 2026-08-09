@@ -74,8 +74,8 @@ jobs:
       # it, and therefore the shape that has to keep compiling.
       - run: cargo clippy -p scanbus-core --features mock --all-targets --locked -- -D warnings
 
-  core-isolation:
-    name: scanbus-core has no D-Bus dependency
+  crate-isolation:
+    name: core has no D-Bus, client has no daemon
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -86,4 +86,4 @@ jobs:
           rustup default "$RUST_VERSION"
 
       # Reads Cargo.lock and the manifests only; no compilation, so no cache needed.
-      - run: ./scripts/check-core-deps.sh
+      - run: ./scripts/check-deps.sh

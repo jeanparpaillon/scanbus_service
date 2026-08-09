@@ -16,20 +16,21 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures_util::StreamExt as _;
 use futures_util::stream::BoxStream;
+use scanbus_client::proxy::{Manager1Proxy, Scanner1Proxy, object_manager, properties};
 use scanbus_core::backend::mock::MockBackend;
 use scanbus_core::{
     BackendError, ButtonPressedEvent, Capabilities, PairingProgress, ProfileKind, RawPage,
     ScannerBackend, ScannerId, ScannerInfo, Status, Value,
 };
-use scanbus_daemon::dbus::{self, BUS_NAME, Manager1, ObjectRegistry, path};
+use scanbus_daemon::Backends;
+use scanbus_daemon::dbus::path;
 use scanbus_daemon::scanners::Origin;
-use scanbus_daemon::{Backends, Discovery, MemoryPairingStore, ScannerRegistry};
 use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
-use zbus::fdo::{ManagedObjects, ObjectManagerProxy, PropertiesChangedStream, PropertiesProxy};
+use zbus::fdo::{ManagedObjects, PropertiesChangedStream};
 
 mod common;
 
-use common::{PrivateBus, skipped};
+use common::{Daemon, PrivateBus, skipped};
 
 /// How long a signal that should already be on its way is waited for.
 const SIGNAL_TIMEOUT: Duration = Duration::from_secs(5);
@@ -43,42 +44,6 @@ const ROUND_TIMEOUT: Duration = Duration::from_secs(20);
 /// What §9 calls "well under a second": how long `Pair()` may take to return while an
 /// install is in flight.
 const PAIR_REPLY_BUDGET: Duration = Duration::from_secs(1);
-
-#[zbus::proxy(
-    interface = "org.scanbus.Manager1",
-    default_service = "org.scanbus",
-    default_path = "/org/scanbus"
-)]
-trait Manager {
-    fn start_discovery(
-        &self,
-        filters: HashMap<String, zbus::zvariant::OwnedValue>,
-    ) -> zbus::Result<()>;
-    fn stop_discovery(&self) -> zbus::Result<()>;
-}
-
-/// `org.scanbus.Scanner1` as §3 defines it, from the client side.
-#[zbus::proxy(interface = "org.scanbus.Scanner1", default_service = "org.scanbus")]
-trait Scanner {
-    fn pair(&self, options: HashMap<String, zbus::zvariant::OwnedValue>) -> zbus::Result<()>;
-    fn cancel_pairing(&self) -> zbus::Result<()>;
-    fn unpair(&self) -> zbus::Result<()>;
-
-    #[zbus(property)]
-    fn paired(&self) -> zbus::Result<bool>;
-    #[zbus(property)]
-    fn status(&self) -> zbus::Result<String>;
-    #[zbus(property)]
-    fn pairing_state(&self) -> zbus::Result<String>;
-    #[zbus(property)]
-    fn pairing_error(&self) -> zbus::Result<String>;
-    #[zbus(property)]
-    fn default_profile(&self) -> zbus::Result<String>;
-    #[zbus(property)]
-    fn set_default_profile(&self, value: &str) -> zbus::Result<()>;
-    #[zbus(property)]
-    fn supported_profiles(&self) -> zbus::Result<Vec<String>>;
-}
 
 /// A backend whose `ensure_installed` stops in the middle of an install and waits.
 ///
@@ -208,42 +173,6 @@ impl ScannerBackend for GatedBackend {
     }
 }
 
-/// The service side: what `main.rs` wires up, with backends a test chose.
-struct Daemon {
-    scanners: Arc<ScannerRegistry>,
-    discovery: Arc<Discovery>,
-    objects: Arc<ObjectRegistry>,
-    store: Arc<MemoryPairingStore>,
-}
-
-impl Daemon {
-    async fn start(bus: &PrivateBus, backends: Backends) -> Self {
-        let connection = bus.connect().await;
-        let objects = Arc::new(ObjectRegistry::new(connection.clone()).await.unwrap());
-        let store = Arc::new(MemoryPairingStore::new());
-        let scanners = ScannerRegistry::new(Arc::clone(&objects), Arc::clone(&store) as _);
-        let discovery = Arc::new(Discovery::new(backends, Arc::clone(&scanners)));
-
-        objects
-            .add(path::manager(), Manager1::new(Arc::clone(&discovery)))
-            .await
-            .unwrap();
-        dbus::request_name(&connection).await.unwrap();
-
-        Self {
-            scanners,
-            discovery,
-            objects,
-            store,
-        }
-    }
-
-    async fn shutdown(&self) {
-        self.discovery.stop().await;
-        self.objects.shutdown().await;
-    }
-}
-
 fn scanner_info(address: &str, name: &str) -> ScannerInfo {
     ScannerInfo {
         id: ScannerId::from_backend("mock", address).unwrap(),
@@ -259,24 +188,12 @@ fn backends(backend: Arc<dyn ScannerBackend>) -> Backends {
     Backends::new([backend])
 }
 
-async fn manager_proxy(connection: &zbus::Connection) -> ObjectManagerProxy<'static> {
-    ObjectManagerProxy::builder(connection)
-        .destination(BUS_NAME)
-        .unwrap()
-        .path(path::ROOT)
-        .unwrap()
-        .build()
-        .await
-        .unwrap()
+async fn manager_proxy(connection: &zbus::Connection) -> zbus::fdo::ObjectManagerProxy<'static> {
+    object_manager(connection).await.unwrap()
 }
 
-async fn scanner_proxy(connection: &zbus::Connection, id: &ScannerId) -> ScannerProxy<'static> {
-    ScannerProxy::builder(connection)
-        .path(path::scanner(id))
-        .unwrap()
-        .build()
-        .await
-        .unwrap()
+async fn scanner_proxy(connection: &zbus::Connection, id: &ScannerId) -> Scanner1Proxy<'static> {
+    Scanner1Proxy::for_scanner(connection, id).await.unwrap()
 }
 
 fn scanner_paths(managed: &ManagedObjects) -> Vec<String> {
@@ -294,7 +211,7 @@ async fn discover(client: &zbus::Connection, id: &ScannerId) {
     let manager = manager_proxy(client).await;
     let mut added = manager.receive_interfaces_added().await.unwrap();
 
-    ManagerProxy::new(client)
+    Manager1Proxy::new(client)
         .await
         .unwrap()
         .start_discovery(HashMap::new())
@@ -322,12 +239,7 @@ async fn discover(client: &zbus::Connection, id: &ScannerId) {
 /// two changes that arrive before it is read and also fires once when the cache is first
 /// filled — neither of which is a statement about what the daemon sent.
 async fn changes(connection: &zbus::Connection, id: &ScannerId) -> PropertiesChangedStream {
-    PropertiesProxy::builder(connection)
-        .destination(BUS_NAME)
-        .unwrap()
-        .path(path::scanner(id))
-        .unwrap()
-        .build()
+    properties(connection, path::scanner(id))
         .await
         .unwrap()
         .receive_properties_changed()
@@ -642,7 +554,7 @@ async fn a_paired_scanner_that_goes_away_is_offline_and_still_paired() {
     assert!(daemon.store.contains(&found.id));
 
     // And it is still on the bus after the session ends, because it is paired.
-    ManagerProxy::new(&client)
+    Manager1Proxy::new(&client)
         .await
         .unwrap()
         .stop_discovery()
@@ -818,7 +730,7 @@ async fn unpairing_a_scanner_no_probe_sees_removes_its_object() {
     // The session ends and the backend stops reporting it: the object now exists only
     // because of the pairing, which is the case where `Unpair()` takes it away.
     handle.set_discovery([]);
-    ManagerProxy::new(&client)
+    Manager1Proxy::new(&client)
         .await
         .unwrap()
         .stop_discovery()

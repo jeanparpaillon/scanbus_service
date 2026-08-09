@@ -1,0 +1,28 @@
+[package]
+name = "scanbus-client"
+description = "zbus proxies, error decoding and property watching for the scanbus D-Bus API"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+# The consumer side of the API, and the only crate allowed to hold it: the CLI takes it
+# as a dependency and `scanbus-daemon` as a dev-dependency, so an interface change is a
+# compile error in the tests and in the binary at the same time rather than a runtime
+# surprise in whichever of the two was not updated (scanbus-cli.md §2).
+#
+# Nothing here may depend on `scanbus-daemon`. When a helper is needed on both sides it
+# moves *down* into `scanbus-core` — `scanbus_core::path` is the first one that did.
+[dependencies]
+scanbus-core.workspace = true
+# `StreamExt` for the property streams, and `FutureExt::now_or_never` for the buffered
+# drain in `watch` — which is what makes the snapshot the first event rather than a
+# state the stream then contradicts.
+futures-util.workspace = true
+thiserror.workspace = true
+zbus.workspace = true
+
+[dev-dependencies]
+# The unit tests here need no bus: the round-trips against a real daemon live in
+# `scanbus-daemon/tests/client.rs`, which is where a daemon exists to answer them.
+tokio = { workspace = true, features = ["macros", "rt"] }
