@@ -96,10 +96,11 @@ async fn discover(client: &zbus::Connection, id: &ScannerId) {
 
 /// Acceptance: each proxy round-trips one method and one property against the daemon.
 ///
-/// `Button1`, `Job1` and `Profile1` have no server side yet (2.5, 2.6, 3.1), so what is
-/// asserted for them is the honest half: their proxies build against the paths of §1 and
-/// their calls come back as an `UnknownInterface` refusal the client decodes by name —
-/// not as a transport failure, which is what a client that guessed would report.
+/// `Profile1` still has no server side (3.1), and a `Job1` object only exists while a
+/// scan is in flight (§4), so what is asserted for those two is the honest half: their
+/// proxies build against the paths of §1 and their calls come back as a refusal the
+/// client decodes *by name* — not as a transport failure, which is what a client that
+/// guessed would report.
 #[tokio::test]
 async fn every_proxy_round_trips_against_the_daemon() {
     let Some(bus) = PrivateBus::start().await else {
@@ -145,13 +146,24 @@ async fn every_proxy_round_trips_against_the_daemon() {
         "a capability key this version does not model must survive the round trip"
     );
 
-    // The three interfaces with no server side: the proxies build against the paths of
-    // §1, and a call comes back as a *named refusal* the client classifies as one —
-    // `Error::Call`, not `Error::Bus`. That distinction is what lets the CLI say "this
-    // daemon does not implement it" instead of "the bus is broken".
+    // Button1: published with its scanner (2.5), so this is a plain round trip. Four
+    // keys, no host-settable labels — the Brother of §5.
     let button = scanbus_client::proxy::Button1Proxy::for_button(&client, &found.id, 0)
         .await
         .unwrap();
+    assert_eq!(button.index().await.unwrap(), 0);
+    assert!(!button.label_configurable().await.unwrap());
+    assert_eq!(button.profile().await.unwrap(), "");
+
+    // Job1 and Profile1, which have no object at these paths — and for two different
+    // reasons worth keeping apart. A job is *transient* (§4): its object exists only
+    // while a scan is in flight, so a proxy built for an id nothing is running is
+    // `UnknownObject` by design, and `tests/jobs.rs` is where one is driven for real.
+    // `Profile1` has no server side at all yet (3.1).
+    //
+    // Either way what a client gets is a *named refusal* it classifies as one —
+    // `Error::Call`, not `Error::Bus`. That distinction is what lets the CLI say "there
+    // is no such object" instead of "the bus is broken".
     let job = scanbus_client::proxy::Job1Proxy::for_job(&client, &found.id, 1)
         .await
         .unwrap();
@@ -160,17 +172,15 @@ async fn every_proxy_round_trips_against_the_daemon() {
         .unwrap();
 
     let refusals = [
-        button.device_label().await.map(|_| ()),
         job.state().await.map(|_| ()),
         profile.options().await.map(|_| ()),
     ];
     for refusal in refusals {
-        let error = Error::from(refusal.expect_err("the interface has no server side yet"));
+        let error = Error::from(refusal.expect_err("there is no object at that path"));
         match &error {
             Error::Call(ScanbusError::Other { name, .. }) => assert_eq!(
                 name, "org.freedesktop.DBus.Error.UnknownObject",
-                "an object that does not exist is what an unimplemented interface looks \
-                 like from the bus"
+                "an object that is not there is what the bus reports, by name"
             ),
             other => panic!("expected a named refusal, got {other:?}"),
         }

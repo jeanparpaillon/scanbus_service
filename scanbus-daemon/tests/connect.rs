@@ -151,17 +151,22 @@ impl ScannerBackend for TestBackend {
         &self,
         scanner_id: &ScannerId,
         job_id: &str,
-    ) -> Result<BoxStream<'static, RawPage>, BackendError> {
+    ) -> Result<BoxStream<'static, Result<RawPage, BackendError>>, BackendError> {
         self.inner.fetch_pages(scanner_id, job_id).await
     }
 }
 
-/// The sink 2.6 replaces: every press, in order, on a channel a test can read.
+/// Every press, in order, on a channel a test can read.
+///
+/// Deliberately *not* [`JobRegistry`](scanbus_daemon::JobRegistry), which is what a daemon
+/// runs with: these tests are about the listener — a stream that ends, a restart budget
+/// that runs out — and standing a whole scan up behind every press would make them
+/// assertions about `Job1` instead. 2.6's own acceptance criteria live in `tests/jobs.rs`.
 struct ChannelSink(mpsc::UnboundedSender<ButtonEvent>);
 
 #[async_trait]
 impl ButtonEventSink for ChannelSink {
-    async fn button_pressed(&self, event: ButtonEvent) {
+    async fn button_pressed(&self, _backend: Arc<dyn ScannerBackend>, event: ButtonEvent) {
         // A closed receiver means the test has finished; the listener carries on.
         let _ = self.0.send(event);
     }

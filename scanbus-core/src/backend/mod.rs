@@ -166,17 +166,31 @@ pub trait ScannerBackend: Send + Sync {
     /// that needs the pages twice keeps them itself — which is what the document
     /// profile does when it buffers an ADF batch for PDF assembly (§6).
     ///
+    /// `job_id` is the *daemon's*, minted when the trigger arrived: the backend only has
+    /// to answer for it, not invent it. Its string form is what a vendor tool ends up
+    /// keying its spool directory on (5.3).
+    ///
     /// The stream ends when the device reports no further page; for a flatbed that is
     /// after one, for an ADF batch after the last sheet. That end is what moves `Job1`
     /// from `"receiving"` to `"processing"` (§9).
     ///
+    /// # A stream that fails is not a stream that ended
+    ///
+    /// The items are `Result`s, and that is load-bearing: "the ADF ran out of sheets" and
+    /// "the device stopped answering after page 3" are the same event to a consumer of a
+    /// bare `Stream<Item = RawPage>`, and `Job1` has to tell them apart — one lands the
+    /// job in `"done"` and the other in `"error"` with a message (§4). A backend reports
+    /// the second by yielding one `Err` and then ending; nothing is expected after it.
+    ///
     /// # Errors
     ///
-    /// [`BackendError::UnknownJob`] for an unknown or already-fetched job,
-    /// [`BackendError::NotReachable`] if the device dropped off mid-transfer.
+    /// [`BackendError::UnknownJob`] for an unknown or already-fetched job, and
+    /// [`BackendError::NotReachable`] if the device was already gone when the transfer
+    /// was asked for. A device that goes away *during* the transfer is the `Err` item
+    /// above, not this.
     async fn fetch_pages(
         &self,
         scanner_id: &ScannerId,
         job_id: &str,
-    ) -> Result<BoxStream<'static, RawPage>, BackendError>;
+    ) -> Result<BoxStream<'static, Result<RawPage, BackendError>>, BackendError>;
 }

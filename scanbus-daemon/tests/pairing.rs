@@ -168,7 +168,7 @@ impl ScannerBackend for GatedBackend {
         &self,
         scanner_id: &ScannerId,
         job_id: &str,
-    ) -> Result<BoxStream<'static, RawPage>, BackendError> {
+    ) -> Result<BoxStream<'static, Result<RawPage, BackendError>>, BackendError> {
         self.inner.fetch_pages(scanner_id, job_id).await
     }
 }

@@ -17,6 +17,7 @@
 mod button;
 mod capabilities;
 mod id;
+mod job;
 mod page;
 mod profile;
 mod state;
@@ -25,6 +26,7 @@ mod value;
 pub use button::ButtonInfo;
 pub use capabilities::{ButtonsCapability, Capabilities, ColorMode, Source};
 pub use id::{ScannerId, escape_component, unescape_component};
+pub use job::JobState;
 pub use page::{PageFormat, RawPage};
 pub use profile::ProfileKind;
 pub use state::{PairingState, Status};

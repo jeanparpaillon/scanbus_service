@@ -25,6 +25,14 @@
 //!
 //! # A stream that ends is a lost scan, so it is retried
 //!
+//! # A press is a whole scan, and the listener waits for it
+//!
+//! [`ButtonEventSink::button_pressed`] is awaited, and the sink a daemon runs with
+//! ([`JobRegistry`](crate::jobs::JobRegistry)) does not return from it until the scan has
+//! finished. That is deliberate: a device scans one thing at a time, so the second press
+//! of a double-tap has to wait for the first job rather than race it onto the same
+//! hardware. What it must not do is die with this task — see the trait's own note.
+//!
 //! The listener is the only thing between a physical key and a `Job1`. A stream that
 //! ends because the vendor daemon died — the likely case for `brscan-skey`, see [5.3] —
 //! must not leave a scanner sitting at `Connected=true` that will never produce a job
@@ -128,42 +136,26 @@ impl ButtonEvent {
 
 /// What a button press is turned into.
 ///
-/// The seam [2.6] replaces: creating a `Job1` needs an object path, a job id and the
-/// whole profile pipeline, none of which exist yet, and every one of them would have to
-/// be threaded through this module if the listener created jobs itself. Until then
-/// [`LogSink`] is what a daemon runs with, and a test substitutes its own to assert that
-/// a press reached the pipeline at all.
+/// A seam rather than a direct call into [`crate::jobs`], for two reasons that survived
+/// 2.6: the job side needs an object registry, a job id and a profile pipeline, none of
+/// which this module should have to thread through its restart logic — and a test that is
+/// about *the listener* (a stream that ends, a budget that runs out) wants to assert that
+/// a press arrived without standing a whole scan up behind it.
+///
+/// `backend` is a parameter rather than a field of [`ButtonEvent`] because it is context
+/// and not part of the press: the sink needs it to fetch the pages, and it must be the
+/// same instance the listener was started against — not whatever the daemon's backend
+/// list happens to rank first by the time the key is hit.
 ///
 /// Implementors must not block: the task awaits this call before reading the next press,
 /// which is what makes presses queue rather than interleave (see the module
-/// documentation).
-///
-/// [2.6]: https://github.com/jeanparpaillon/scanbus_service/issues/10
+/// documentation). [`JobRegistry`](crate::jobs::JobRegistry) awaits the whole scan here on
+/// purpose — one device scans one thing at a time — and runs it in a task of its own so
+/// that aborting the listener detaches the job instead of killing it.
 #[async_trait]
 pub trait ButtonEventSink: Send + Sync {
     /// One key was pressed on a connected scanner.
-    async fn button_pressed(&self, event: ButtonEvent);
-}
-
-/// The sink a daemon runs with until [2.6] creates `Job1` objects.
-///
-/// It logs at `info` rather than `debug`: a press that produces no scan is exactly the
-/// situation a user will be trying to diagnose, and "the daemon saw the press" is the
-/// first thing that has to be answerable.
-///
-/// [2.6]: https://github.com/jeanparpaillon/scanbus_service/issues/10
-pub struct LogSink;
-
-#[async_trait]
-impl ButtonEventSink for LogSink {
-    async fn button_pressed(&self, event: ButtonEvent) {
-        info!(
-            scanner = %event.scanner(),
-            button = event.button_index(),
-            profile = ProfileKind::optional_as_str(event.profile(None)),
-            "button pressed; no job created yet (2.6)"
-        );
-    }
+    async fn button_pressed(&self, backend: Arc<dyn ScannerBackend>, event: ButtonEvent);
 }
 
 /// How hard a listener tries to come back before the scanner is declared broken.
@@ -273,11 +265,14 @@ pub(crate) async fn run(
                 profile = ProfileKind::optional_as_str(session_profile.or(default_profile)),
                 "button press received"
             );
-            sink.button_pressed(ButtonEvent {
-                press,
-                session_profile,
-                default_profile,
-            })
+            sink.button_pressed(
+                Arc::clone(&backend),
+                ButtonEvent {
+                    press,
+                    session_profile,
+                    default_profile,
+                },
+            )
             .await;
         }
 

@@ -46,6 +46,12 @@ use crate::model::{
 /// [`MockError::ListenerFull`] in a test instead of unbounded growth in the daemon.
 const EVENT_BUFFER: usize = 16;
 
+/// How many pages a [`PageFeed`] buffers before [`PageFeed::page`] refuses.
+///
+/// Same reasoning as [`EVENT_BUFFER`], and the same size: a job that has stopped reading
+/// its pages should be a failed assertion, not a growing queue.
+const PAGE_BUFFER: usize = 16;
+
 /// A scanner shaped like the Brother MFC of [`scanbus-dbus-api.md`] §5: four fixed
 /// keys, no host-settable labels, flatbed plus duplex ADF.
 ///
@@ -154,6 +160,75 @@ pub enum MockError {
     /// The consumer is not reading: [`EVENT_BUFFER`] presses are already queued.
     #[error("the listener queue for {0} is full")]
     ListenerFull(ScannerId),
+    /// Nobody is reading the pages: the job was never fetched, or it has finished.
+    #[error("nothing is reading the pages of job {0:?}")]
+    PagesDropped(String),
+    /// The consumer is not reading: [`PAGE_BUFFER`] pages are already queued.
+    #[error("the page queue for job {0:?} is full")]
+    PagesFull(String),
+}
+
+/// Where [`ScannerBackend::fetch_pages`] gets one job's pages from.
+///
+/// Two shapes, because tests want two different things. A batch is the whole scan decided
+/// up front, which is what an assertion about the *outcome* needs; a channel is a scan a
+/// test delivers one page at a time, which is the only way to observe a `Job1` while it
+/// is still `"receiving"` — the mock's streams are otherwise ready on every poll, so a
+/// three-page batch is over before a client can read `PageCount`.
+enum PageSource {
+    /// Every item, decided before the fetch.
+    Batch(Vec<Result<RawPage, BackendError>>),
+    /// Items as a [`PageFeed`] sends them; the stream ends when the feed is dropped.
+    Feed(mpsc::Receiver<Result<RawPage, BackendError>>),
+}
+
+/// The writing end of a page stream a test drives page by page.
+///
+/// Obtained from [`MockHandle::open_pages`], and **synchronous on purpose**, like
+/// [`MockHandle::press_button`]: "page 2 arrives now" is a statement a test makes between
+/// two `await`s. Dropping it ends the stream, which is what an ADF running out of sheets
+/// looks like to the consumer.
+pub struct PageFeed {
+    job_id: String,
+    sender: mpsc::Sender<Result<RawPage, BackendError>>,
+}
+
+impl PageFeed {
+    /// Delivers one page.
+    ///
+    /// # Errors
+    ///
+    /// [`MockError::PagesDropped`] if nothing is reading the stream any more,
+    /// [`MockError::PagesFull`] if the consumer stopped reading.
+    pub fn page(&self, page: RawPage) -> Result<(), MockError> {
+        self.send(Ok(page))
+    }
+
+    /// Fails the transfer, as a device that stops answering mid-scan does.
+    ///
+    /// The stream yields this and then ends when the feed is dropped; nothing is expected
+    /// after an `Err`, which is the contract
+    /// [`fetch_pages`](ScannerBackend::fetch_pages) states.
+    ///
+    /// # Errors
+    ///
+    /// As [`PageFeed::page`].
+    pub fn fail(&self, error: BackendError) -> Result<(), MockError> {
+        self.send(Err(error))
+    }
+
+    /// Ends the stream, as the last sheet of an ADF batch does.
+    ///
+    /// The same thing dropping the feed does, spelled out where a test wants the end of
+    /// capture to be a step rather than a scope ending.
+    pub fn end(self) {}
+
+    fn send(&self, item: Result<RawPage, BackendError>) -> Result<(), MockError> {
+        self.sender.try_send(item).map_err(|error| match error {
+            mpsc::error::TrySendError::Closed(_) => MockError::PagesDropped(self.job_id.clone()),
+            mpsc::error::TrySendError::Full(_) => MockError::PagesFull(self.job_id.clone()),
+        })
+    }
 }
 
 /// Everything both halves share.
@@ -164,7 +239,7 @@ struct MockState {
     installed: BTreeSet<ScannerId>,
     install_attempts: u32,
     listeners: BTreeMap<ScannerId, mpsc::Sender<ButtonPressedEvent>>,
-    pages: BTreeMap<String, Vec<RawPage>>,
+    pages: BTreeMap<String, PageSource>,
     mappings: BTreeMap<(ScannerId, u32), ButtonMapping>,
     mapping_failure: Option<BackendError>,
     calls: Vec<MockCall>,
@@ -325,10 +400,56 @@ impl MockHandle {
 
     /// Queues the pages [`fetch_pages`](ScannerBackend::fetch_pages) will hand over for
     /// `job_id`, replacing any already queued for it.
+    ///
+    /// The whole scan at once: the stream yields them and ends. Use
+    /// [`MockHandle::open_pages`] where the test has to observe the job *between* pages.
     pub fn feed_pages(&self, job_id: impl Into<String>, pages: impl IntoIterator<Item = RawPage>) {
+        self.feed_page_results(job_id, pages.into_iter().map(Ok));
+    }
+
+    /// The same, for a transfer that ends in a failure rather than in a last page.
+    ///
+    /// `pages` arrive, then `error`, then the stream ends — the "device dropped off
+    /// mid-transfer" case, without a device to unplug.
+    pub fn feed_pages_then_fail(
+        &self,
+        job_id: impl Into<String>,
+        pages: impl IntoIterator<Item = RawPage>,
+        error: BackendError,
+    ) {
+        self.feed_page_results(job_id, pages.into_iter().map(Ok).chain([Err(error)]));
+    }
+
+    /// Queues an arbitrary sequence of page results for `job_id`.
+    pub fn feed_page_results(
+        &self,
+        job_id: impl Into<String>,
+        items: impl IntoIterator<Item = Result<RawPage, BackendError>>,
+    ) {
+        self.state().pages.insert(
+            job_id.into(),
+            PageSource::Batch(items.into_iter().collect()),
+        );
+    }
+
+    /// Opens a page stream for `job_id` that the test feeds page by page.
+    ///
+    /// The returned [`PageFeed`] is what makes a scan observable while it is running: the
+    /// job stays in `"receiving"` for exactly as long as the feed is alive, so a test can
+    /// read `PageCount`, write a `Button1.Profile` or call `GetManagedObjects` in the
+    /// middle of one. Dropping the feed — or calling [`PageFeed::end`] — is the last
+    /// sheet of the batch.
+    ///
+    /// Replaces anything already queued for that id.
+    pub fn open_pages(&self, job_id: impl Into<String>) -> PageFeed {
+        let job_id = job_id.into();
+        let (sender, receiver) = mpsc::channel(PAGE_BUFFER);
+
         self.state()
             .pages
-            .insert(job_id.into(), pages.into_iter().collect());
+            .insert(job_id.clone(), PageSource::Feed(receiver));
+
+        PageFeed { job_id, sender }
     }
 
     /// Makes [`set_button_mapping`](ScannerBackend::set_button_mapping) fail with
@@ -520,7 +641,7 @@ impl ScannerBackend for MockBackend {
         &self,
         scanner_id: &ScannerId,
         job_id: &str,
-    ) -> Result<BoxStream<'static, RawPage>, BackendError> {
+    ) -> Result<BoxStream<'static, Result<RawPage, BackendError>>, BackendError> {
         let mut state = self.state();
         state.calls.push(MockCall::FetchPages {
             scanner: scanner_id.clone(),
@@ -529,7 +650,7 @@ impl ScannerBackend for MockBackend {
 
         // Removing rather than reading is the trait's once-per-job rule: a second call
         // for the same id is indistinguishable from one that never existed.
-        let pages = state
+        let source = state
             .pages
             .remove(job_id)
             .ok_or_else(|| BackendError::UnknownJob {
@@ -537,7 +658,10 @@ impl ScannerBackend for MockBackend {
                 job: job_id.to_owned(),
             })?;
 
-        Ok(Box::pin(PageStream(pages.into_iter())))
+        Ok(match source {
+            PageSource::Batch(items) => Box::pin(PageStream(items.into_iter())),
+            PageSource::Feed(receiver) => Box::pin(PageFeedStream(receiver)),
+        })
     }
 }
 
@@ -552,15 +676,27 @@ impl Stream for EventStream {
     }
 }
 
-/// The page stream: fed pages, then done. Ready every poll — a scan that a test has to
-/// wait for is a test with a timer in it.
-struct PageStream(std::vec::IntoIter<RawPage>);
+/// The batch page stream: fed pages, then done. Ready every poll — a scan that a test has
+/// to wait for is a test with a timer in it.
+struct PageStream(std::vec::IntoIter<Result<RawPage, BackendError>>);
 
 impl Stream for PageStream {
-    type Item = RawPage;
+    type Item = Result<RawPage, BackendError>;
 
     fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Poll::Ready(self.get_mut().0.next())
+    }
+}
+
+/// The driven page stream: a channel a [`PageFeed`] writes into, ending when it is
+/// dropped.
+struct PageFeedStream(mpsc::Receiver<Result<RawPage, BackendError>>);
+
+impl Stream for PageFeedStream {
+    type Item = Result<RawPage, BackendError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.get_mut().0.poll_recv(cx)
     }
 }
 
@@ -640,6 +776,7 @@ mod tests {
             .fetch_pages(&scanner.id, "job-1")
             .await
             .unwrap()
+            .map(|page| page.expect("a batch of Ok pages yields no failure"))
             .collect()
             .await;
         assert_eq!(
@@ -837,7 +974,7 @@ mod tests {
         let handle = backend.handle();
         handle.feed_pages("job-1", [page(0)]);
 
-        let pages: Vec<RawPage> = backend
+        let pages: Vec<Result<RawPage, BackendError>> = backend
             .fetch_pages(&scanner.id, "job-1")
             .await
             .unwrap()
@@ -855,6 +992,71 @@ mod tests {
         );
         // A job that never existed is the same error, deliberately.
         assert!(backend.fetch_pages(&scanner.id, "job-2").await.is_err());
+    }
+
+    /// A transfer that dies half way through says so, rather than ending like a batch
+    /// that ran out of sheets — the distinction `Job1.State` is built on.
+    #[tokio::test]
+    async fn a_transfer_that_fails_yields_an_error_item_and_then_ends() {
+        let scanner = sample_scanner();
+        let backend = MockBackend::with_scanners([scanner.clone()]);
+        let handle = backend.handle();
+        let lost = BackendError::NotReachable {
+            scanner: scanner.id.clone(),
+            detail: "the device stopped answering".to_owned(),
+        };
+        handle.feed_pages_then_fail("job-1", [page(0), page(1)], lost.clone());
+
+        let items: Vec<Result<RawPage, BackendError>> = backend
+            .fetch_pages(&scanner.id, "job-1")
+            .await
+            .unwrap()
+            .collect()
+            .await;
+
+        assert_eq!(items.len(), 3);
+        assert!(items[0].is_ok() && items[1].is_ok());
+        assert_eq!(items[2].as_ref().err(), Some(&lost));
+    }
+
+    /// The stream a test drives: pages arrive when it says so, and the end of the batch
+    /// is the feed going away. This is what makes a job observable while it is running.
+    #[tokio::test]
+    async fn a_driven_feed_delivers_pages_one_at_a_time() {
+        let scanner = sample_scanner();
+        let backend = MockBackend::with_scanners([scanner.clone()]);
+        let feed = backend.handle().open_pages("job-1");
+
+        let mut pages = backend.fetch_pages(&scanner.id, "job-1").await.unwrap();
+
+        feed.page(page(0)).unwrap();
+        assert_eq!(pages.next().await.unwrap().unwrap().index, 0);
+
+        // Nothing has been sent, so the stream is pending rather than finished — the
+        // property a `PageCount` assertion between two pages depends on.
+        assert!(poll!(pages.next()).is_pending());
+
+        feed.page(page(1)).unwrap();
+        assert_eq!(pages.next().await.unwrap().unwrap().index, 1);
+
+        feed.end();
+        assert!(pages.next().await.is_none());
+    }
+
+    /// A feed nobody reads any more complains about the test rather than doing nothing.
+    #[tokio::test]
+    async fn a_feed_whose_stream_is_gone_says_so() {
+        let scanner = sample_scanner();
+        let backend = MockBackend::with_scanners([scanner.clone()]);
+        let feed = backend.handle().open_pages("job-1");
+
+        let pages = backend.fetch_pages(&scanner.id, "job-1").await.unwrap();
+        drop(pages);
+
+        assert_eq!(
+            feed.page(page(0)),
+            Err(MockError::PagesDropped("job-1".to_owned()))
+        );
     }
 
     /// Writing `Button1.Profile = ""` has to reach the vendor config as a removal.

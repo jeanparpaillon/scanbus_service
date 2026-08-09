@@ -14,7 +14,7 @@ Namespace used in this example: `org.scanbus` (adapt it to your organisation, e.
 
 - `{id}`: stable identifier derived from the backend (e.g. `sane_epson2_net_192_168_1_50`, `escl_avahi_HP-OfficeJet`).
 - Scanners that are *discovered but not paired* also show up as temporary objects (lifetime = discovery session), with `Paired=false`. This avoids having two different representations (struct vs object) for the same scanner.
-- `Job1` objects are created when data is received and destroyed (or kept in a short history) once the post-processing pipeline is finished.
+- `Job1` objects are created when the **first page is received** and destroyed once the post-processing pipeline is finished — after a **60-second retention window**, so that a client reacting to `PropertiesChanged` can still read `Result` before the object goes (see §4). A trigger that delivers no data at all publishes no object: "created when data is received" is meant literally.
 ## 2. `org.scanbus.Manager1` interface
 
 Object: `/org/scanbus`
@@ -87,6 +87,20 @@ Transient object: `/org/scanbus/scanner/{id}/job/{jobid}`, created when data is 
 ### Signals
 - `PropertiesChanged` (standard) to follow progress, notably `State` and `PageCount`.
 The Job appears/disappears through `InterfacesAdded`/`InterfacesRemoved` on the Manager — a client subscribed to the Manager naturally sees every job in progress without polling.
+
+A transition to a terminal state carries `State` **and** whatever moved with it (`Result` on `done`, `Error` on `error`) in a *single* `PropertiesChanged`: a client that had to follow up with a `Get` would be racing the retention window.
+
+### Lifetime
+
+| Event | Effect |
+|---|---|
+| First page received | Object exported, `State="receiving"`, `PageCount=1`, `InterfacesAdded` |
+| Each further page | `PageCount` incremented, `PropertiesChanged` |
+| Page stream ends | `State="processing"` — end of capture, start of the profile pipeline (§9) |
+| Pipeline finished | `State="done"` with `Result`, or `State="error"` with `Error` |
+| 60 s later | Object unexported, `InterfacesRemoved` |
+
+The page transfer reports its own failures: a device that stops answering after page 3 lands the job in `"error"` and is *not* the same event as an ADF that ran out of sheets, which ends the capture normally. A trigger whose transfer fails before the first page publishes no object at all.
 
 ## 5. `org.scanbus.Button1` interface
 

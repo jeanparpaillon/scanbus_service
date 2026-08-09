@@ -18,6 +18,7 @@
 pub mod button;
 pub mod convert;
 pub mod error;
+pub mod job;
 pub mod manager;
 pub mod objects;
 pub mod path;
@@ -29,6 +30,7 @@ use zbus::{Connection, connection::Builder};
 
 pub use button::Button1;
 pub use error::ScanbusError;
+pub use job::Job1;
 pub use manager::Manager1;
 pub use objects::ObjectRegistry;
 pub use scanner::Scanner1;

@@ -80,7 +80,8 @@ use crate::dbus::button::Button1;
 use crate::dbus::scanner::{self, Scanner1};
 use crate::dbus::{ObjectRegistry, path};
 use crate::error::Error;
-use crate::listeners::{self, ButtonEventSink, ListenError, LogSink, RestartPolicy};
+use crate::jobs::JobRegistry;
+use crate::listeners::{self, ButtonEventSink, ListenError, RestartPolicy};
 
 mod address;
 
@@ -158,7 +159,7 @@ struct Entry {
 pub struct ScannerRegistry {
     objects: Arc<ObjectRegistry>,
     store: Arc<dyn PairingStore>,
-    /// What a button press is turned into — [`LogSink`] until 2.6 creates `Job1` objects.
+    /// What a button press is turned into — [`JobRegistry`], which publishes the `Job1`.
     sink: Arc<dyn ButtonEventSink>,
     /// How hard a listener tries to come back before the scanner is declared in error.
     restart: RestartPolicy,
@@ -185,15 +186,17 @@ impl ScannerRegistry {
     /// Returns an [`Arc`] rather than a bare `Self` because every object it publishes
     /// gets a weak handle back to it; see [`ScannerRegistry::self_ref`].
     pub fn new(objects: Arc<ObjectRegistry>, store: Arc<dyn PairingStore>) -> Arc<Self> {
-        Self::with_listeners(objects, store, Arc::new(LogSink), RestartPolicy::DEFAULT)
+        let jobs = Arc::new(JobRegistry::new(Arc::clone(&objects)));
+        Self::with_listeners(objects, store, jobs, RestartPolicy::DEFAULT)
     }
 
     /// The same registry, with the listener half configured.
     ///
     /// The two parameters exist for the two things a test needs and a daemon does not: a
-    /// [`ButtonEventSink`] it can assert on, standing in for the `Job1` creation 2.6 will
-    /// put there, and a [`RestartPolicy`] short enough that the exhausted case is
-    /// observable without putting the daemon's real budget into the suite.
+    /// [`ButtonEventSink`] it can assert on — its own, or a
+    /// [`JobRegistry`](crate::jobs::JobRegistry) with a retention window short enough to
+    /// watch — and a [`RestartPolicy`] short enough that the exhausted case is observable
+    /// without putting the daemon's real budget into the suite.
     pub fn with_listeners(
         objects: Arc<ObjectRegistry>,
         store: Arc<dyn PairingStore>,

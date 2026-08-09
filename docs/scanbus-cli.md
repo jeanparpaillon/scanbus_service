@@ -42,7 +42,11 @@ scanbus-client/          # zbus proxies + selector resolution. Depends on scanbu
     └── error.rs         # named D-Bus errors (API §8) as a Rust enum
 scanbus-cli/             # binary `scanbus`. Depends on scanbus-client, clap, tokio, serde_json.
 └── src/
-    ├── main.rs
+    ├── main.rs          # runtime, tracing, and the exit code
+    ├── cli.rs           # the whole clap surface of §3, in one place
+    ├── context.rs       # the global options resolved once, and --timeout applied
+    ├── duration.rs      # the `30s` of --timeout and --for
+    ├── error.rs         # command failures, and the §8 exit code of each
     ├── cmd/             # one module per subcommand group
     └── output/          # human tables and the JSON renderer
 ```
@@ -284,7 +288,7 @@ what keeps the table from rotting.
 
 ## 11. Deltas to the D-Bus API this design exposes
 
-Three things the CLI needs that the contract does not currently guarantee:
+Four things the CLI needs that the contract does not currently guarantee:
 
 1. **Discovery has no owner** (§7). Needs [2.9](todo/2_9.md) in the daemon; the CLI is
    best-effort until then.
@@ -293,9 +297,20 @@ Three things the CLI needs that the contract does not currently guarantee:
    the daemon commits to it in [2.4](todo/2_4.md) or the CLI must detect the missing method by
    introspection and say so; this design assumes the former and degrades to a clear
    `org.freedesktop.DBus.Error.UnknownMethod` message with exit 1 if not.
-3. **Finished jobs may vanish immediately.** API §4 says jobs are destroyed "or kept in a short
-   history" once processing ends. `job list` is useless in the first case and `job watch
-   --until-done` can miss the terminal state of a job that completes between two events. A
-   defined retention window — even 60 seconds — makes both commands honest; without one, `job
-   watch` is the only reliable way to observe a job and that should be documented rather than
-   discovered.
+3. ~~**Finished jobs may vanish immediately.**~~ **Settled by [2.6]:** the daemon keeps a
+   finished job's object for **60 seconds** after `State` reaches `done`/`error`, then
+   unexports it (API §1, §4). `job list` therefore shows recently finished jobs and `job watch
+   --until-done` cannot miss a terminal state it was subscribed for. What the CLI must still
+   not do is assume a job it saw in one command is there in the next.
+4. **`Manager1` reports neither a version nor its backends.** §2 gives the manager three methods
+   and no properties, so `scanbus status` — the command §3 makes a health check — can print the
+   name owner and `GetProfileTypes` and nothing else. Those two rows come out as `-`, and they
+   are the first two questions asked when a scanner does not appear: *which build is answering*,
+   and *was it compiled with the Brother backend at all*. Neither is derivable from the bus: the
+   `Backend` property of the exported scanners answers a different question (which backends
+   found something), and reading the binary or the unit file would be this client going around
+   the API it exists to speak. Two read-only properties on `Manager1` — `Version` (`s`) and
+   `Backends` (`as`, the ids that will actually be probed, i.e. what the daemon logs as
+   `probing` at startup) — close it, and `status` fills the rows in the moment they exist.
+
+[2.6]: https://github.com/jeanparpaillon/scanbus_service/issues/10

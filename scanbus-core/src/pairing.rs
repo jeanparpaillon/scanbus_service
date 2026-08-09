@@ -594,7 +594,8 @@ mod tests {
             &self,
             scanner_id: &ScannerId,
             job_id: &str,
-        ) -> Result<BoxStream<'static, crate::model::RawPage>, BackendError> {
+        ) -> Result<BoxStream<'static, Result<crate::model::RawPage, BackendError>>, BackendError>
+        {
             self.inner.fetch_pages(scanner_id, job_id).await
         }
     }
@@ -882,7 +883,8 @@ mod tests {
                 &self,
                 scanner_id: &ScannerId,
                 job_id: &str,
-            ) -> Result<BoxStream<'static, crate::model::RawPage>, BackendError> {
+            ) -> Result<BoxStream<'static, Result<crate::model::RawPage, BackendError>>, BackendError>
+            {
                 self.0.fetch_pages(scanner_id, job_id).await
             }
         }
@@ -995,7 +997,8 @@ mod tests {
                 &self,
                 _scanner_id: &ScannerId,
                 _job_id: &str,
-            ) -> Result<BoxStream<'static, crate::model::RawPage>, BackendError> {
+            ) -> Result<BoxStream<'static, Result<crate::model::RawPage, BackendError>>, BackendError>
+            {
                 unreachable!("not exercised by this test")
             }
         }
