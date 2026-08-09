@@ -65,10 +65,7 @@ impl ScannerInfo {
     /// (2.7). Narrowing this per device is a backend concern and lands with the first
     /// backend that has an opinion.
     pub fn supported_profiles(&self) -> Vec<ProfileKind> {
-        ProfileKind::ALL
-            .into_iter()
-            .filter(ProfileKind::is_supported)
-            .collect()
+        ProfileKind::supported()
     }
 }
 

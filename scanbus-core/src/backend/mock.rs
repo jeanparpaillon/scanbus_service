@@ -166,6 +166,7 @@ struct MockState {
     listeners: BTreeMap<ScannerId, mpsc::Sender<ButtonPressedEvent>>,
     pages: BTreeMap<String, Vec<RawPage>>,
     mappings: BTreeMap<(ScannerId, u32), ButtonMapping>,
+    mapping_failure: Option<BackendError>,
     calls: Vec<MockCall>,
 }
 
@@ -180,6 +181,7 @@ impl MockState {
             listeners: BTreeMap::new(),
             pages: BTreeMap::new(),
             mappings: BTreeMap::new(),
+            mapping_failure: None,
             calls: Vec::new(),
         }
     }
@@ -327,6 +329,21 @@ impl MockHandle {
         self.state()
             .pages
             .insert(job_id.into(), pages.into_iter().collect());
+    }
+
+    /// Makes [`set_button_mapping`](ScannerBackend::set_button_mapping) fail with
+    /// `error`, every time, leaving the recorded mapping untouched.
+    ///
+    /// The condition 2.5 is written against: writing `Button1.Profile` rewrites a vendor
+    /// config file, and on Brother that file lives under `/opt` and may not be writable
+    /// (5.4). A test needs the failing write to be reachable without a read-only `/opt`.
+    pub fn fail_button_mapping(&self, error: BackendError) {
+        self.state().mapping_failure = Some(error);
+    }
+
+    /// Undoes [`MockHandle::fail_button_mapping`], so the next write lands.
+    pub fn succeed_button_mapping(&self) {
+        self.state().mapping_failure = None;
     }
 
     /// What key `button_index` is mapped to, or `None` when it is unassigned.
@@ -477,6 +494,12 @@ impl ScannerBackend for MockBackend {
             button_index,
             profile,
         });
+
+        // Recorded first, then refused: a write that reached the backend and failed there
+        // is exactly what 2.5 has to tell apart from one the daemon rejected on its own.
+        if let Some(error) = state.mapping_failure.clone() {
+            return Err(error);
+        }
 
         let key = (scanner_id.clone(), button_index);
         match profile {
@@ -869,6 +892,54 @@ mod tests {
                 button_index: 2,
                 profile: None,
             })
+        );
+    }
+
+    /// A refused write leaves the config exactly as it was — the property that 2.5's
+    /// `Button1.Profile` setter relies on to keep its old value.
+    #[tokio::test]
+    async fn a_refused_mapping_changes_nothing() {
+        let scanner = sample_scanner();
+        let backend = MockBackend::with_scanners([scanner.clone()]);
+        let handle = backend.handle();
+
+        backend
+            .set_button_mapping(&scanner.id, 2, Some(ProfileKind::Image), &BTreeMap::new())
+            .await
+            .unwrap();
+
+        handle.fail_button_mapping(BackendError::Other(
+            "/opt/brother/scanner/brscan5/brsanenetdevice4.cfg is read-only".to_owned(),
+        ));
+        assert!(
+            backend
+                .set_button_mapping(
+                    &scanner.id,
+                    2,
+                    Some(ProfileKind::Document),
+                    &BTreeMap::new()
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            handle.button_mapping(&scanner.id, 2).map(|m| m.profile),
+            Some(ProfileKind::Image)
+        );
+
+        handle.succeed_button_mapping();
+        backend
+            .set_button_mapping(
+                &scanner.id,
+                2,
+                Some(ProfileKind::Document),
+                &BTreeMap::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            handle.button_mapping(&scanner.id, 2).map(|m| m.profile),
+            Some(ProfileKind::Document)
         );
     }
 

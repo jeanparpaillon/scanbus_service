@@ -21,6 +21,23 @@
 //! whatever a discovery session just published (§7), not only on scanners the daemon
 //! decided in advance were pairable.
 //!
+//! # Buttons appear with the object, not with the pairing
+//!
+//! §5 says the `Button1` objects are "created automatically at pairing time". They are
+//! created **with the scanner object** here instead, from `Capabilities.buttons.count`,
+//! and that is a deliberate reading of the same sentence: 2.5 asks for them "created and
+//! removed with the scanner", and they are children of its path, so anything else would
+//! mean a second lifetime to get wrong. zbus destroys a node with its last interface,
+//! children included ([`ObjectRegistry`]), so buttons that outlived their scanner would
+//! vanish without an `InterfacesRemoved` — and buttons created later would have to be
+//! added on the pairing path, removed on the `Unpair()` path that *keeps* the object
+//! ([`ScannerRegistry::retire`]), and reconciled on the restore path.
+//!
+//! What a client loses is nothing it can act on: an unpaired scanner's keys are visible
+//! and configurable, which is what a configuration UI wants anyway, and a `Profile` write
+//! reaches the same backend either way. A scanner reporting `buttons.count=0` gets no
+//! button objects at all, which is not an error — a plain flatbed has no walk-up keys.
+//!
 //! # And, once it is paired, a listener
 //!
 //! A paired scanner also gets a **listener task**, at most one, keyed by its
@@ -51,12 +68,15 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Weak};
 
-use scanbus_core::{PairingMachine, PairingStore, ScannerBackend, ScannerId, ScannerInfo, Status};
+use scanbus_core::{
+    ButtonInfo, PairingMachine, PairingStore, ScannerBackend, ScannerId, ScannerInfo, Status,
+};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, instrument, warn};
 
 use crate::backends::RankedBackend;
+use crate::dbus::button::Button1;
 use crate::dbus::scanner::{self, Scanner1};
 use crate::dbus::{ObjectRegistry, path};
 use crate::error::Error;
@@ -276,6 +296,8 @@ impl ScannerRegistry {
         let path = path::scanner(&info.id);
 
         if let Some(entry) = state.entries.get_mut(&info.id) {
+            let previous_buttons = entry.info.capabilities.button_count();
+            let published_by = Arc::clone(&entry.backend);
             entry.origin = Origin::Persistent;
             entry.info = info.clone();
             entry.rank = 0;
@@ -284,6 +306,11 @@ impl ScannerRegistry {
             scanner::update(&iface, &info)
                 .await
                 .map_err(|source| Error::PropertiesChanged { path, source })?;
+            // The backend that published the object, not the one restoring it: the keys
+            // already exported were built against the first, and a `Profile` write has to
+            // keep reaching the config the listener is running from.
+            self.sync_buttons(&published_by, previous_buttons, &info)
+                .await;
             // The supervisor turns this into the `Paired`/`PairingState` signals; doing
             // it here as well would be the second writer this design does not have.
             iface.get().await.machine().restore_paired();
@@ -679,6 +706,9 @@ impl ScannerRegistry {
     /// `paired` is the restore path's (4.2): the machine is put in `Done` *before* the
     /// export, so the `InterfacesAdded` a client receives already says `Paired=true`
     /// rather than being corrected a moment later by a `PropertiesChanged`.
+    ///
+    /// The `Button1` children go up with it, in index order, so a client watching
+    /// `InterfacesAdded` sees the scanner before the keys that hang off it.
     async fn publish(
         &self,
         state: &mut State,
@@ -690,7 +720,7 @@ impl ScannerRegistry {
         let path = path::scanner(&info.id);
         let machine = Arc::new(PairingMachine::new(
             info.clone(),
-            backend,
+            Arc::clone(&backend),
             Arc::clone(&self.store),
         ));
         if paired {
@@ -708,7 +738,24 @@ impl ScannerRegistry {
                 Scanner1::new(Arc::clone(&machine), self.self_ref.clone()),
             )
             .await?;
-        info!(name = %info.name, address = %info.address, paired, "scanner published");
+
+        // Rolled back rather than left half-published: an object the bus serves and this
+        // registry does not track is exactly the drift [`ObjectRegistry`] exists to
+        // prevent, and the caller retries the whole sighting on the next probe round.
+        if let Err(error) = self.add_buttons(&backend, &info, 0).await {
+            if let Err(cleanup) = self.objects.remove_subtree(&path).await {
+                warn!(id = %info.id, %cleanup, "could not roll back a half-published scanner");
+            }
+            return Err(error);
+        }
+
+        info!(
+            name = %info.name,
+            address = %info.address,
+            buttons = info.capabilities.button_count(),
+            paired,
+            "scanner published"
+        );
 
         tokio::spawn(scanner::supervise(
             Arc::clone(&self.objects),
@@ -725,6 +772,81 @@ impl ScannerRegistry {
         Ok(())
     }
 
+    /// Exports the `Button1` objects of `info` from index `exported` upward.
+    ///
+    /// `exported` is how many this scanner already has, so a fresh publication passes `0`
+    /// and a device that grew a key passes the count it had. The ones already up are left
+    /// alone on purpose: they carry the host's assignments, and re-exporting them would
+    /// throw away a mapping because a probe round re-read the same capabilities.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ObjectServer`] for the first export zbus refused.
+    async fn add_buttons(
+        &self,
+        backend: &Arc<dyn ScannerBackend>,
+        info: &ScannerInfo,
+        exported: u32,
+    ) -> Result<(), Error> {
+        for button in ButtonInfo::from_capabilities(&info.capabilities)
+            .into_iter()
+            .skip(exported as usize)
+        {
+            let path = path::button(&info.id, button.index);
+            self.objects
+                .add(
+                    path,
+                    Button1::new(info.id.clone(), Arc::clone(backend), button),
+                )
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Unexports the `Button1` objects of `id` in `from..to`, highest index first.
+    ///
+    /// A failure is logged and the rest still removed: leaving four keys on the bus
+    /// because the third refused to go is worse than a device that reports three.
+    async fn remove_buttons(&self, id: &ScannerId, from: u32, to: u32) {
+        for index in (from..to).rev() {
+            let path = path::button(id, index);
+            if let Err(error) = self.objects.remove_object(&path).await {
+                warn!(%id, index, %error, "could not remove a button object");
+            }
+        }
+    }
+
+    /// Brings the `Button1` objects in line with a freshly reported `buttons.count`.
+    ///
+    /// A device does not usually grow keys, but a backend can revise what it reports —
+    /// a first probe that could not reach the device, a vendor tool that learnt the model
+    /// on the second look. The object tree has to follow, or a client reads
+    /// `Capabilities.buttons.count=4` and finds three objects under `…/button`.
+    ///
+    /// Keys that survive keep their assignments: only the tail moves.
+    async fn sync_buttons(
+        &self,
+        backend: &Arc<dyn ScannerBackend>,
+        previous: u32,
+        info: &ScannerInfo,
+    ) {
+        let desired = info.capabilities.button_count();
+        if desired == previous {
+            return;
+        }
+
+        if desired > previous {
+            if let Err(error) = self.add_buttons(backend, info, previous).await {
+                warn!(id = %info.id, %error, "could not publish the new button objects");
+            }
+        } else {
+            self.remove_buttons(&info.id, desired, previous).await;
+        }
+
+        info!(id = %info.id, from = previous, to = desired, "the physical menu changed size");
+    }
+
     /// Updates the object of a scanner already known by id.
     ///
     /// The rank is *not* revised: a device that a better-ranked backend also found
@@ -737,14 +859,20 @@ impl ScannerRegistry {
         info: ScannerInfo,
         address: String,
     ) -> Result<(), Error> {
-        let (previous_rank, previous_address, unchanged) = {
+        let (previous_rank, previous_address, previous_buttons, backend, unchanged) = {
             let entry = state
                 .entries
                 .get_mut(&info.id)
                 .expect("checked by the caller");
             // Whatever else this round decides, the session has now seen this scanner.
             entry.discovered = true;
-            (entry.rank, entry.address.clone(), entry.info == info)
+            (
+                entry.rank,
+                entry.address.clone(),
+                entry.info.capabilities.button_count(),
+                Arc::clone(&entry.backend),
+                entry.info == info,
+            )
         };
 
         if previous_rank != rank {
@@ -767,6 +895,10 @@ impl ScannerRegistry {
                 path: path.clone(),
                 source,
             })?;
+
+        // After the property change, so a client that reacts to `Capabilities` by walking
+        // `…/button` finds the tree the new count describes.
+        self.sync_buttons(&backend, previous_buttons, &info).await;
 
         if previous_address != address {
             debug!(from = %previous_address, to = %address, "physical address moved");

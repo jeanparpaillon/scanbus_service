@@ -6,15 +6,26 @@
 //! without a bus. This module is the one place the two meet, so that the D-Bus
 //! signatures of the model are decided once instead of at each property getter.
 //!
-//! The direction is out only, for now. Reading an `a{sv}` back — `ProfileOptions` writes
-//! (2.5), `Pair()` options (2.3) — needs the inverse, and lands with the first interface
-//! that accepts one.
+//! # Both directions, and why the inbound one is lossy on purpose
+//!
+//! `Button1.ProfileOptions` (2.5) is the first property a client may *write*, so the
+//! inverse of [`value`] lands here as [`from_value`]. It is deliberately not a bijection:
+//! D-Bus has eight integer types and [`Value`] has two, so `y`, `n`, `q`, `i` and `u` all
+//! widen into [`Value::U64`] or [`Value::I64`]. Widening rather than refusing is the
+//! right call for a map whose keys this daemon does not define — a client that sends
+//! `{"quality": <uint16 80>}` means 80 — and the round trip is still *semantically*
+//! stable, which is what the pairing store (4.1) needs of it.
+//!
+//! What is refused is what has no home in the model at all: `h` (a file descriptor,
+//! which [`Value`] cannot express and which must not be silently dropped from a config
+//! file), structs, and dictionaries keyed by anything but a string.
 //!
 //! [`scanbus-dbus-api.md`]: https://github.com/jeanparpaillon/scanbus_service/blob/master/docs/scanbus-dbus-api.md
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use scanbus_core::{Capabilities, Value};
+use thiserror::Error;
 use zbus::zvariant::{OwnedValue, Value as ZValue};
 
 /// A `a{sv}` map, the shape every open-ended property in §3 has.
@@ -56,6 +67,96 @@ pub fn dict<'values>(entries: impl IntoIterator<Item = (String, &'values Value)>
     entries
         .into_iter()
         .map(|(key, item)| (key, value(item)))
+        .collect()
+}
+
+/// Why an `a{sv}` a client sent could not be read into the model.
+///
+/// Both variants name the signature that caused it, because the client that sent it is
+/// looking at its own source and not at ours: "`ProfileOptions` cannot carry a value of
+/// signature `(ss)`" is actionable, "invalid arguments" is not.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum FromValueError {
+    /// A type the model has no variant for: a struct, a file descriptor, a `maybe`.
+    #[error("a value of signature {0} has no equivalent in this daemon's model")]
+    Unrepresentable(String),
+
+    /// A dictionary keyed by something other than a string.
+    ///
+    /// Every map in the API is `a{sv}`, and [`Value::Dict`] is keyed by [`String`], so a
+    /// `a{iv}` nested inside an option would have to lose or invent its keys.
+    #[error("dictionary keys must be strings; got a key of signature {0}")]
+    DictKey(String),
+}
+
+/// Reads a variant a client sent into the model's own [`Value`].
+///
+/// Nested variants are unwrapped: a client that builds `<<"~/Scans">>` and one that
+/// builds `<"~/Scans">` mean the same thing, and the difference is an artefact of how
+/// the map was assembled rather than something a config file should record.
+///
+/// # Errors
+///
+/// [`FromValueError`] for anything the model cannot hold — see the module documentation
+/// on what widens and what is refused.
+pub fn from_value(value: &ZValue<'_>) -> Result<Value, FromValueError> {
+    Ok(match value {
+        ZValue::Bool(v) => Value::Bool(*v),
+        ZValue::U8(v) => Value::U64((*v).into()),
+        ZValue::U16(v) => Value::U64((*v).into()),
+        ZValue::U32(v) => Value::U64((*v).into()),
+        ZValue::U64(v) => Value::U64(*v),
+        ZValue::I16(v) => Value::I64((*v).into()),
+        ZValue::I32(v) => Value::I64((*v).into()),
+        ZValue::I64(v) => Value::I64(*v),
+        ZValue::F64(v) => Value::F64(*v),
+        ZValue::Str(v) => Value::Str(v.as_str().to_owned()),
+        ZValue::ObjectPath(v) => Value::Str(v.as_str().to_owned()),
+        ZValue::Signature(v) => Value::Str(v.to_string()),
+        // The unwrapping above: `v` inside `v`.
+        ZValue::Value(inner) => from_value(inner)?,
+        ZValue::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(from_value)
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        ZValue::Dict(entries) => {
+            let mut map = BTreeMap::new();
+            for (key, item) in entries.iter() {
+                let key = match from_value(key)? {
+                    Value::Str(key) => key,
+                    _ => {
+                        return Err(FromValueError::DictKey(key.value_signature().to_string()));
+                    }
+                };
+                map.insert(key, from_value(item)?);
+            }
+            Value::Dict(map)
+        }
+        other => {
+            return Err(FromValueError::Unrepresentable(
+                other.value_signature().to_string(),
+            ));
+        }
+    })
+}
+
+/// Reads a whole `a{sv}` argument into the [`BTreeMap`] the model and the backend seam
+/// both use.
+///
+/// [`BTreeMap`] and not the [`HashMap`] the wire arrives as, to match
+/// [`ButtonInfo::profile_options`](scanbus_core::ButtonInfo::profile_options): a vendor
+/// config file this ends up in is one a user may also read, so the key order has to be
+/// stable rather than whatever the client's hasher produced.
+///
+/// # Errors
+///
+/// [`FromValueError`] for the first value that has no equivalent in the model. The map
+/// is then not partially converted — the caller gets nothing and writes nothing.
+pub fn from_dict(dict: &Dict) -> Result<BTreeMap<String, Value>, FromValueError> {
+    dict.iter()
+        .map(|(key, value)| Ok((key.clone(), from_value(value)?)))
         .collect()
 }
 
@@ -213,6 +314,99 @@ mod tests {
             bool::try_from(rendered["duplex"].clone()).unwrap(),
             "the typed field must win over a backend's homonym"
         );
+    }
+
+    /// Every shape a `ProfileOptions` write can carry survives the trip in, and the
+    /// integer widening is the documented lossy part.
+    #[test]
+    fn a_written_dict_is_read_back_into_the_model() {
+        let options = Dict::from([
+            ("multipage".to_owned(), owned(ZValue::from(true))),
+            ("quality".to_owned(), owned(ZValue::from(80u16))),
+            ("offset".to_owned(), owned(ZValue::from(-1i32))),
+            ("gamma".to_owned(), owned(ZValue::from(2.2f64))),
+            (
+                "output_folder".to_owned(),
+                owned(ZValue::from("~/Scans/invoices")),
+            ),
+            (
+                "resolutions".to_owned(),
+                owned(ZValue::from(vec![300u32, 600])),
+            ),
+        ]);
+
+        let read = from_dict(&options).unwrap();
+
+        assert_eq!(read["multipage"], Value::Bool(true));
+        // `q` and `u` both widen into the one unsigned variant core has.
+        assert_eq!(read["quality"], Value::U64(80));
+        assert_eq!(read["offset"], Value::I64(-1));
+        assert_eq!(read["gamma"], Value::F64(2.2));
+        assert_eq!(
+            read["output_folder"],
+            Value::Str("~/Scans/invoices".to_owned())
+        );
+        assert_eq!(
+            read["resolutions"],
+            Value::Array(vec![Value::U64(300), Value::U64(600)])
+        );
+
+        // And what came back out is what a client reads off the property afterwards.
+        let rendered = dict(read.iter().map(|(key, value)| (key.clone(), value)));
+        assert_eq!(from_dict(&rendered).unwrap(), read);
+    }
+
+    /// A client that wraps its values twice means the same thing as one that does not.
+    ///
+    /// [`ZValue::Value`] is built by hand here: `ZValue::from(ZValue)` is the identity, so
+    /// the only way to get a genuine `<<…>>` is to nest the variant explicitly — which is
+    /// also the shape a client assembling its map one variant at a time produces.
+    #[test]
+    fn a_nested_variant_is_unwrapped() {
+        let nested = owned(ZValue::Value(Box::new(ZValue::from("~/Scans"))));
+        assert_eq!(
+            nested.value_signature().to_string(),
+            "v",
+            "the test has to nest a variant to be about nesting at all"
+        );
+        assert_eq!(
+            from_value(&nested).unwrap(),
+            Value::Str("~/Scans".to_owned())
+        );
+
+        let dict = owned(ZValue::from(Dict::from([(
+            "folder".to_owned(),
+            owned(ZValue::from("~/Scans")),
+        )])));
+        assert_eq!(
+            from_value(&dict).unwrap(),
+            Value::Dict(BTreeMap::from([(
+                "folder".to_owned(),
+                Value::Str("~/Scans".to_owned())
+            )]))
+        );
+    }
+
+    /// What has no home in the model is refused rather than dropped: an option silently
+    /// lost is a config file that does not say what the client asked for.
+    #[test]
+    fn a_value_the_model_cannot_hold_is_refused_by_signature() {
+        let structure = owned(ZValue::from((1u32, "two")));
+        let error = from_value(&structure).expect_err("a struct has no Value variant");
+        assert_eq!(
+            error,
+            FromValueError::Unrepresentable("(us)".to_owned()),
+            "{error}"
+        );
+
+        let mut keyed_by_int = zbus::zvariant::Dict::new(
+            &<i32 as zbus::zvariant::Type>::SIGNATURE.clone(),
+            &<ZValue<'_> as zbus::zvariant::Type>::SIGNATURE.clone(),
+        );
+        keyed_by_int.add(1i32, ZValue::from("one")).unwrap();
+        let error = from_value(&ZValue::from(keyed_by_int))
+            .expect_err("every map in the API is keyed by strings");
+        assert_eq!(error, FromValueError::DictKey("i".to_owned()), "{error}");
     }
 
     /// The integer variants keep the signature core chose for them.

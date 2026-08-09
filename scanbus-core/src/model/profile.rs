@@ -54,6 +54,18 @@ impl ProfileKind {
         matches!(self, Self::Image | Self::Document)
     }
 
+    /// Every profile this daemon can run, in the order §2 lists them.
+    ///
+    /// The single derivation of that list. `Manager1.GetProfileTypes`,
+    /// `Scanner1.SupportedProfiles` and the check a `Button1.Profile` write makes are all
+    /// this same set, so a profile that becomes runnable becomes advertised and writable
+    /// in one commit rather than three — and a `Button1.Profile` outside
+    /// `GetProfileTypes` (2.5) is refused by construction rather than by two lists
+    /// happening to agree.
+    pub fn supported() -> Vec<Self> {
+        Self::ALL.into_iter().filter(Self::is_supported).collect()
+    }
+
     /// Parses the `Button1.Profile` / `Job1.Profile` rendering, where `""` means
     /// unassigned (§5) rather than invalid.
     ///

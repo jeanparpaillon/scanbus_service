@@ -15,6 +15,7 @@
 //! Session bus rather than system bus, per implementation plan §7: this is per-user and
 //! per-graphical-session, which matches how `brscan-skey` already runs.
 
+pub mod button;
 pub mod convert;
 pub mod error;
 pub mod manager;
@@ -26,6 +27,7 @@ use tracing::{info, instrument};
 use zbus::fdo::{RequestNameFlags, RequestNameReply};
 use zbus::{Connection, connection::Builder};
 
+pub use button::Button1;
 pub use error::ScanbusError;
 pub use manager::Manager1;
 pub use objects::ObjectRegistry;

@@ -89,9 +89,8 @@ impl Manager1 {
 
 /// The profile names `GetProfileTypes` answers with.
 fn profile_types() -> Vec<String> {
-    ProfileKind::ALL
+    ProfileKind::supported()
         .into_iter()
-        .filter(ProfileKind::is_supported)
         .map(|kind| kind.as_str().to_owned())
         .collect()
 }
