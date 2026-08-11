@@ -23,9 +23,10 @@ else
 profile_opt :=
 endif
 
-targets := scanbus scanbus-daemon scanbus-gui
+binaries := scanbus scanbus-daemon scanbus-gui
+targets := $(patsubst %, $(TARGET_DIR)/%, $(binaries))
 
-all: $(patsubst %, $(TARGET_DIR)/%, $(targets))
+all: $(targets)
 
 release:
 	$(MAKE) CARGO_ENV=release all
@@ -42,13 +43,20 @@ $(TARGET_DIR)/scanbus-daemon:
 $(TARGET_DIR)/scanbus-gui:
 	cargo build --package scanbus-gui --bin $(notdir $@) $(profile_opt)
 
-install: $(TARGET_DIR)/scanbus $(TARGET_DIR)/scanbus-daemon
-	install -D -m 0755 "$(TARGET_DIR)/scanbus" "$(DESTDIR)$(BINDIR)/scanbus"
-	install -D -m 0755 "$(TARGET_DIR)/scanbus-daemon" "$(DESTDIR)$(BINDIR)/scanbus-daemon"
+install: install-backend install-frontend install-services
+
+install-services:
 	install -D -m 0644 packaging/systemd/user/scanbus.service \
 		"$(DESTDIR)$(SYSTEMD_USER_DIR)/scanbus.service"
 	install -D -m 0644 packaging/dbus-1/services/org.scanbus.service \
 		"$(DESTDIR)$(DBUS_SERVICE_DIR)/org.scanbus.service"
+
+install-frontend: $(TARGET_DIR)/scanbus-gui
+	install -D -m 0755 "$(TARGET_DIR)/scanbus-gui" "$(DESTDIR)$(BINDIR)/scanbus-gui"
+
+install-backend: $(TARGET_DIR)/scanbus $(TARGET_DIR)/scanbus-daemon
+	install -D -m 0755 "$(TARGET_DIR)/scanbus" "$(DESTDIR)$(BINDIR)/scanbus"
+	install -D -m 0755 "$(TARGET_DIR)/scanbus-daemon" "$(DESTDIR)$(BINDIR)/scanbus-daemon"
 	install -D -m 0755 packaging/libexec/scanbus/scanbus-scanimage \
 		"$(DESTDIR)$(LIBEXECDIR)/scanbus-scanimage"
 
@@ -66,4 +74,6 @@ lint:
 clean:
 	cargo clean
 
-.PHONY: all release debug install reload test clean lint
+.PHONY: all release debug 
+.PHONY: install install-backend install-frontend install-services
+.PHONY: reload test clean lint
