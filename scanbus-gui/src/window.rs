@@ -1,12 +1,14 @@
 use std::rc::Rc;
 
 use async_channel::Sender;
+use gtk::gio;
+use gtk::glib::variant::ToVariant;
 use gtk4 as gtk;
 use libadwaita as adw;
 use libadwaita::prelude::*;
 
 use crate::bus::BusCommand;
-use crate::scanners::{ScannerListModel, ScannersPane};
+use crate::scanners::{ScannerListModel, ScannersPane, ToastAction};
 use crate::store::DiscoveryState;
 
 pub fn build_window(
@@ -68,6 +70,21 @@ pub fn build_window(
         .build();
 
     {
+        let commands = commands.clone();
+        let retry_pair = gio::SimpleAction::new("retry-pair", Some(&String::static_variant_type()));
+        retry_pair.connect_activate(move |_, parameter| {
+            let Some(parameter) = parameter else {
+                return;
+            };
+            let Some(path) = parameter.get::<String>() else {
+                return;
+            };
+            let _ = commands.try_send(BusCommand::Pair { path });
+        });
+        window.add_action(&retry_pair);
+    }
+
+    {
         let scanners = Rc::clone(&scanners);
         let commands = commands.clone();
         find_button.connect_clicked(move |_| match scanners.discovery_state() {
@@ -115,8 +132,20 @@ pub fn build_window(
 
     {
         let overlay = overlay.clone();
-        scanners.connect_toast(move |message| {
-            overlay.add_toast(adw::Toast::new(&message));
+        scanners.connect_toast(move |toast| {
+            let toast_widget = adw::Toast::new(&toast.message);
+            if let Some(label) = &toast.button_label {
+                toast_widget.set_button_label(Some(label));
+            }
+            if let Some(action) = &toast.action {
+                match action {
+                    ToastAction::RetryPair { path } => {
+                        toast_widget.set_action_name(Some("win.retry-pair"));
+                        toast_widget.set_action_target_value(Some(&path.to_variant()));
+                    }
+                }
+            }
+            overlay.add_toast(toast_widget);
         });
     }
 

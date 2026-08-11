@@ -9,10 +9,40 @@ use gtk::glib;
 use gtk4 as gtk;
 use libadwaita as adw;
 use libadwaita::prelude::*;
-use scanbus_core::Status;
+use scanbus_core::{PairingState, Status};
 
 use crate::bus::BusCommand;
 use crate::store::{DiscoveryState, ScannerEntry, ServiceState, Store, StoreEvent};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToastAction {
+    RetryPair { path: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToastSpec {
+    pub message: String,
+    pub button_label: Option<String>,
+    pub action: Option<ToastAction>,
+}
+
+impl ToastSpec {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            button_label: None,
+            action: None,
+        }
+    }
+
+    pub fn retry_pair(message: impl Into<String>, path: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            button_label: Some("Retry".to_owned()),
+            action: Some(ToastAction::RetryPair { path: path.into() }),
+        }
+    }
+}
 
 mod scanner_object {
     use super::*;
@@ -36,6 +66,12 @@ mod scanner_object {
         pub status: RefCell<String>,
         #[property(get, set, type = String)]
         pub status_line: RefCell<String>,
+        #[property(get, set, type = String)]
+        pub pairing_state: RefCell<String>,
+        #[property(get, set, type = String)]
+        pub pairing_error: RefCell<String>,
+        #[property(get, set, type = String)]
+        pub pairing_code: RefCell<String>,
     }
 
     #[glib::object_subclass]
@@ -70,6 +106,9 @@ impl ScannerObject {
                     entry.state.paired,
                 ),
             )
+            .property("pairing-state", pairing_state_name(&entry.state.pairing))
+            .property("pairing-error", pairing_error(&entry.state.pairing))
+            .property("pairing-code", pairing_code(&entry.state.pairing))
             .build();
         scanner
     }
@@ -90,6 +129,9 @@ impl ScannerObject {
                 entry.state.paired,
             ),
         );
+        self.set_property("pairing-state", pairing_state_name(&entry.state.pairing));
+        self.set_property("pairing-error", pairing_error(&entry.state.pairing));
+        self.set_property("pairing-code", pairing_code(&entry.state.pairing));
     }
 }
 
@@ -125,7 +167,7 @@ pub fn status_line(status: Status, connected: bool, paired: bool) -> String {
 }
 
 type Callback = Box<dyn Fn() + 'static>;
-type ToastCallback = Box<dyn Fn(String) + 'static>;
+type ToastCallback = Box<dyn Fn(ToastSpec) + 'static>;
 
 pub struct ScannerListModel {
     store: RefCell<Store>,
@@ -188,7 +230,7 @@ impl ScannerListModel {
 
     pub fn connect_toast<F>(&self, callback: F)
     where
-        F: Fn(String) + 'static,
+        F: Fn(ToastSpec) + 'static,
     {
         self.toast_callbacks.borrow_mut().push(Box::new(callback));
     }
@@ -231,11 +273,19 @@ impl ScannerListModel {
         self.set_discovery_state(DiscoveryState::Idle);
     }
 
-    pub fn emit_toast(&self, message: impl Into<String>) {
-        let message = message.into();
+    pub fn emit_toast_spec(&self, toast: ToastSpec) {
         for callback in self.toast_callbacks.borrow().iter() {
-            callback(message.clone());
+            callback(toast.clone());
         }
+    }
+
+    pub fn scanner(&self, path: &str) -> Option<ScannerEntry> {
+        self.store
+            .borrow()
+            .scanners
+            .values()
+            .find(|entry| entry.path == path)
+            .cloned()
     }
 
     pub fn apply_event(&self, event: StoreEvent) -> Result<(), scanbus_client::DecodeError> {
@@ -407,17 +457,29 @@ impl ScannersPane {
         detail_title.add_css_class("title-3");
         detail_title.set_xalign(0.0);
 
-        let detail_hint = gtk::Label::new(Some(
-            "Selection is exposed here for issue 10.5 to build on.",
-        ));
-        detail_hint.add_css_class("dim-label");
-        detail_hint.set_xalign(0.0);
-        detail_hint.set_wrap(true);
+        let detail_name = gtk::Label::new(Some("No scanner selected"));
+        detail_name.add_css_class("heading");
+        detail_name.set_xalign(0.0);
+        detail_name.set_wrap(true);
 
-        let selected_path = gtk::Label::new(Some("No scanner selected"));
-        selected_path.set_xalign(0.0);
-        selected_path.set_wrap(true);
-        selected_path.set_selectable(true);
+        let detail_status = gtk::Label::new(None);
+        detail_status.add_css_class("dim-label");
+        detail_status.set_xalign(0.0);
+        detail_status.set_wrap(true);
+
+        let detail_path = gtk::Label::new(None);
+        detail_path.set_xalign(0.0);
+        detail_path.set_wrap(true);
+        detail_path.set_selectable(true);
+
+        let detail_backend = gtk::Label::new(None);
+        detail_backend.add_css_class("dim-label");
+        detail_backend.set_xalign(0.0);
+        detail_backend.set_wrap(true);
+
+        let unpair_button = gtk::Button::with_label("Unpair");
+        unpair_button.add_css_class("destructive-action");
+        unpair_button.set_visible(false);
 
         let detail = gtk::Box::new(gtk::Orientation::Vertical, 12);
         detail.set_margin_top(24);
@@ -426,8 +488,11 @@ impl ScannersPane {
         detail.set_margin_end(24);
         detail.set_size_request(320, -1);
         detail.append(&detail_title);
-        detail.append(&detail_hint);
-        detail.append(&selected_path);
+        detail.append(&detail_name);
+        detail.append(&detail_status);
+        detail.append(&detail_path);
+        detail.append(&detail_backend);
+        detail.append(&unpair_button);
 
         let content = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         content.set_vexpand(true);
@@ -479,7 +544,11 @@ impl ScannersPane {
             let paired_group = paired_group.clone();
             let discovered_group = discovered_group.clone();
             let discovery_caption = discovery_caption.clone();
-            let selected_path = selected_path.clone();
+            let detail_name = detail_name.clone();
+            let detail_status = detail_status.clone();
+            let detail_path = detail_path.clone();
+            let detail_backend = detail_backend.clone();
+            let unpair_button = unpair_button.clone();
             model.connect_changed(move || {
                 let paired_count = paired_model.n_items();
                 let discovered_count = discovered_model.n_items();
@@ -495,11 +564,30 @@ impl ScannersPane {
                     "empty"
                 });
 
-                selected_path.set_label(
-                    &model_for_callback
-                        .selected_path()
-                        .unwrap_or_else(|| "No scanner selected".to_owned()),
-                );
+                if let Some(path) = model_for_callback.selected_path()
+                    && let Some(scanner) = model_for_callback.scanner(&path)
+                {
+                    detail_name.set_label(&scanner.state.name);
+                    detail_status.set_label(&status_line(
+                        scanner.state.status,
+                        scanner.state.connected,
+                        scanner.state.paired,
+                    ));
+                    detail_path.set_label(&path);
+                    detail_backend.set_label(&format!(
+                        "Backend: {}",
+                        humanize_backend(&scanner.state.backend)
+                    ));
+                    unpair_button.set_visible(scanner.state.paired);
+                    unpair_button.set_sensitive(scanner.state.paired);
+                } else {
+                    detail_name.set_label("No scanner selected");
+                    detail_status.set_label("");
+                    detail_path.set_label("");
+                    detail_backend.set_label("");
+                    unpair_button.set_visible(false);
+                    unpair_button.set_sensitive(false);
+                }
 
                 let caption =
                     discovery_caption_text(discovery_state, model_for_callback.discovered_count());
@@ -515,6 +603,50 @@ impl ScannersPane {
 
         // Seed the derived visibility once the widgets exist.
         model.set_selected_path(None);
+
+        {
+            let model = Rc::clone(&model);
+            let commands = commands.clone();
+            let parent = root.clone();
+            unpair_button.connect_clicked(move |_| {
+                let Some(path) = model.selected_path() else {
+                    return;
+                };
+                let Some(scanner) = model.scanner(&path) else {
+                    return;
+                };
+
+                let dialog = gtk::Dialog::builder()
+                    .modal(true)
+                    .title("Unpair scanner?")
+                    .build();
+                let body = gtk::Label::new(Some(&format!(
+                    "Unpairing {} removes its saved pairing information.",
+                    scanner.state.name
+                )));
+                body.set_wrap(true);
+                body.set_xalign(0.0);
+                body.set_margin_top(18);
+                body.set_margin_bottom(18);
+                body.set_margin_start(18);
+                body.set_margin_end(18);
+                dialog.content_area().append(&body);
+                dialog.add_button("Cancel", gtk::ResponseType::Cancel);
+                let destructive = dialog.add_button("Unpair", gtk::ResponseType::Accept);
+                destructive.add_css_class("destructive-action");
+                dialog.connect_response({
+                    let commands = commands.clone();
+                    move |dialog, response| {
+                        if response == gtk::ResponseType::Accept {
+                            let _ = commands.try_send(BusCommand::Unpair { path: path.clone() });
+                        }
+                        dialog.close();
+                    }
+                });
+                dialog.set_transient_for(parent.root().and_downcast_ref::<gtk::Window>());
+                dialog.present();
+            });
+        }
 
         Self { root }
     }
@@ -569,32 +701,155 @@ fn scanner_row(
     text.append(&subtitle);
 
     let pair_button = gtk::Button::with_label("Pair");
-    pair_button.set_sensitive(false);
     pair_button.set_valign(gtk::Align::Center);
+
+    let spinner = gtk::Spinner::new();
+    spinner.set_halign(gtk::Align::Start);
+
+    let progress_label = gtk::Label::new(None);
+    progress_label.set_xalign(0.0);
+    progress_label.add_css_class("dim-label");
+    progress_label.set_wrap(true);
+
+    let progress_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    progress_box.append(&spinner);
+    progress_box.append(&progress_label);
+
+    let confirm_label = gtk::Label::new(Some("Confirm on your device"));
+    confirm_label.set_xalign(0.0);
+
+    let code_label = gtk::Label::new(None);
+    code_label.add_css_class("title-2");
+    code_label.add_css_class("monospace");
+    code_label.set_xalign(0.0);
+
+    let confirm_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    confirm_box.append(&confirm_label);
+    confirm_box.append(&code_label);
+
+    let failure_bar = gtk::InfoBar::new();
+    failure_bar.set_message_type(gtk::MessageType::Error);
+    failure_bar.set_show_close_button(false);
+    let failure_message = gtk::Label::new(None);
+    failure_message.set_wrap(true);
+    failure_message.set_xalign(0.0);
+    failure_bar.add_child(&failure_message);
+
+    let failure_details_label = gtk::Label::new(None);
+    failure_details_label.set_selectable(true);
+    failure_details_label.set_wrap(true);
+    failure_details_label.set_xalign(0.0);
+
+    let failure_details = gtk::Expander::new(Some("Details"));
+    failure_details.set_child(Some(&failure_details_label));
+    failure_details.set_expanded(false);
+
+    let failure_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    failure_box.append(&failure_bar);
+    failure_box.append(&failure_details);
+
+    let state_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    state_box.append(&progress_box);
+    state_box.append(&confirm_box);
+    state_box.append(&failure_box);
     pair_button.connect_clicked({
-        let path = scanner.path();
+        let scanner = scanner.clone();
         move |_| {
-            let _ = commands.try_send(BusCommand::Pair { path: path.clone() });
+            let path = scanner.path();
+            match scanner.pairing_state().as_str() {
+                "pairing" | "installing_backend" | "awaiting_confirmation" => {
+                    let _ = commands.try_send(BusCommand::CancelPairing { path });
+                }
+                _ => {
+                    let _ = commands.try_send(BusCommand::Pair { path });
+                }
+            }
         }
     });
 
-    scanner
-        .bind_property("paired", &pair_button, "visible")
-        .transform_to(|_, paired: bool| Some(!paired))
-        .sync_create()
-        .build();
-
     let row_box = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-    row_box.set_margin_top(12);
-    row_box.set_margin_bottom(12);
-    row_box.set_margin_start(12);
-    row_box.set_margin_end(12);
     row_box.append(&text);
     row_box.append(&gtk::Box::builder().hexpand(true).build());
     row_box.append(&pair_button);
 
+    let outer = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    outer.set_margin_top(12);
+    outer.set_margin_bottom(12);
+    outer.set_margin_start(12);
+    outer.set_margin_end(12);
+    outer.append(&row_box);
+    outer.append(&state_box);
+
+    let update_row = {
+        let scanner = scanner.clone();
+        let pair_button = pair_button.clone();
+        let spinner = spinner.clone();
+        let progress_box = progress_box.clone();
+        let progress_label = progress_label.clone();
+        let confirm_box = confirm_box.clone();
+        let code_label = code_label.clone();
+        let failure_box = failure_box.clone();
+        let failure_bar = failure_bar.clone();
+        let failure_message = failure_message.clone();
+        let failure_details_label = failure_details_label.clone();
+        move || {
+            let paired = scanner.paired();
+            let pairing = scanner.pairing_state();
+            let code = scanner.pairing_code();
+            let error = scanner.pairing_error();
+
+            pair_button.set_visible(!paired);
+            pair_button.set_sensitive(!paired || pairing == "failed");
+
+            progress_box.set_visible(false);
+            confirm_box.set_visible(false);
+            failure_box.set_visible(false);
+            spinner.set_visible(false);
+            spinner.set_spinning(false);
+            failure_bar.set_visible(false);
+
+            match pairing.as_str() {
+                "pairing" => {
+                    pair_button.set_label("Cancel");
+                    progress_box.set_visible(true);
+                    spinner.set_visible(true);
+                    spinner.set_spinning(true);
+                    progress_label.set_label("Pairing in progress");
+                }
+                "installing_backend" => {
+                    pair_button.set_label("Cancel");
+                    progress_box.set_visible(true);
+                    spinner.set_visible(true);
+                    spinner.set_spinning(true);
+                    progress_label.set_label(&format!(
+                        "Installing {} backend…",
+                        humanize_backend(&scanner.backend())
+                    ));
+                }
+                "awaiting_confirmation" => {
+                    pair_button.set_label("Cancel");
+                    confirm_box.set_visible(true);
+                    code_label.set_label(&code);
+                }
+                "failed" => {
+                    pair_button.set_label("Try again");
+                    failure_box.set_visible(true);
+                    failure_bar.set_visible(true);
+                    failure_message.set_label("Pairing failed");
+                    failure_details_label.set_label(&error);
+                }
+                _ => {
+                    pair_button.set_label("Pair");
+                }
+            }
+        }
+    };
+
+    update_row();
+    scanner.connect_notify_local(None, move |_, _| update_row());
+
     let row = gtk::ListBoxRow::new();
-    row.set_child(Some(&row_box));
+    row.set_child(Some(&outer));
     row.set_selectable(true);
     row.set_activatable(true);
     row.set_widget_name(&scanner.path());
@@ -603,6 +858,42 @@ fn scanner_row(
         move |_| model.set_selected_path(Some(path.clone()))
     });
     row.upcast()
+}
+
+fn pairing_state_name(state: &PairingState) -> &'static str {
+    state.as_str()
+}
+
+fn pairing_error(state: &PairingState) -> String {
+    state.pairing_error().to_owned()
+}
+
+fn pairing_code(state: &PairingState) -> String {
+    state.pairing_info().to_owned()
+}
+
+fn humanize_backend(backend: &str) -> String {
+    let short = backend
+        .rsplit([':', '/', '.'])
+        .next()
+        .unwrap_or(backend)
+        .replace(['-', '_'], " ");
+
+    let mut words = Vec::new();
+    for word in short.split_whitespace() {
+        let mut chars = word.chars();
+        if let Some(first) = chars.next() {
+            let mut rendered = first.to_uppercase().collect::<String>();
+            rendered.push_str(chars.as_str());
+            words.push(rendered);
+        }
+    }
+
+    if words.is_empty() {
+        backend.to_owned()
+    } else {
+        words.join(" ")
+    }
 }
 
 #[cfg(test)]
@@ -646,5 +937,24 @@ mod tests {
             discovery_caption_text(DiscoveryState::Active, 1),
             "Finding scanners... 1 scanner found"
         );
+    }
+
+    #[test]
+    fn pairing_helpers_render_generic_confirmation_and_failure() {
+        let confirmation = PairingState::AwaitingConfirmation("482913".to_owned());
+        assert_eq!(pairing_state_name(&confirmation), "awaiting_confirmation");
+        assert_eq!(pairing_code(&confirmation), "482913");
+        assert_eq!(pairing_error(&confirmation), "");
+
+        let failed = PairingState::Failed("backend install failed".to_owned());
+        assert_eq!(pairing_state_name(&failed), "failed");
+        assert_eq!(pairing_code(&failed), "");
+        assert_eq!(pairing_error(&failed), "backend install failed");
+    }
+
+    #[test]
+    fn backend_labels_are_humanized() {
+        assert_eq!(humanize_backend("proprietary:brother"), "Brother");
+        assert_eq!(humanize_backend("mock_backend"), "Mock Backend");
     }
 }
