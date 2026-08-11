@@ -1,8 +1,11 @@
 //! [`RawPage`]: one page as the backend hands it over.
 
 use std::fmt;
+use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
+
+use crate::error::ParseError;
 
 /// A single scanned page, before any profile has touched it.
 ///
@@ -99,6 +102,20 @@ impl fmt::Display for PageFormat {
     }
 }
 
+impl FromStr for PageFormat {
+    type Err = ParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "pnm" => Ok(Self::Pnm),
+            "jpeg" => Ok(Self::Jpeg),
+            "png" => Ok(Self::Png),
+            "tiff" => Ok(Self::Tiff),
+            _ => Err(ParseError::new("PageFormat", value)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,5 +152,12 @@ mod tests {
         assert_eq!(PageFormat::Jpeg.as_str(), "jpeg");
         assert_eq!(PageFormat::Jpeg.extension(), "jpg");
         assert_eq!(PageFormat::Jpeg.mime_type(), "image/jpeg");
+    }
+
+    #[test]
+    fn formats_parse_from_their_wire_names() {
+        assert_eq!("pnm".parse::<PageFormat>().unwrap(), PageFormat::Pnm);
+        assert_eq!("jpeg".parse::<PageFormat>().unwrap(), PageFormat::Jpeg);
+        assert!("gif".parse::<PageFormat>().is_err());
     }
 }

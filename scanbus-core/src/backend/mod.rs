@@ -37,7 +37,7 @@ mod event;
 #[cfg(any(feature = "mock", test))]
 pub mod mock;
 
-pub use event::{ButtonPressedEvent, PairingProgress};
+pub use event::{PairingProgress, ScanTrigger, TriggerId, TriggerKind};
 
 /// What a backend says about a daemon-store pairing during startup reconciliation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,7 +111,7 @@ pub trait ScannerBackend: Send + Sync {
 
     /// Starts listening for physical events on this scanner.
     ///
-    /// The returned stream yields a [`ButtonPressedEvent`] per press and ends when the
+    /// The returned stream yields a [`ScanTrigger`] per trigger and ends when the
     /// backend stops producing — the device went away, the vendor daemon died. The
     /// caller stops listening either by dropping the stream or by calling
     /// [`stop_listening`](ScannerBackend::stop_listening); both are legal, and doing
@@ -124,7 +124,7 @@ pub trait ScannerBackend: Send + Sync {
     async fn start_listening(
         &self,
         scanner: &ScannerInfo,
-    ) -> Result<BoxStream<'static, ButtonPressedEvent>, BackendError>;
+    ) -> Result<BoxStream<'static, ScanTrigger>, BackendError>;
 
     /// Stops the listener started by
     /// [`start_listening`](ScannerBackend::start_listening).
@@ -207,15 +207,15 @@ pub trait ScannerBackend: Send + Sync {
 
     /// Fetches the raw data of a scan the device has already started.
     ///
-    /// **Callable exactly once per `job_id`.** The pages are a one-shot transfer, not a
+    /// **Callable exactly once per `trigger_id`.** The pages are a one-shot transfer, not a
     /// buffer the backend keeps: a second call for the same id gets
     /// [`BackendError::UnknownJob`], the same as an id that never existed. A daemon
     /// that needs the pages twice keeps them itself — which is what the document
     /// profile does when it buffers an ADF batch for PDF assembly (§6).
     ///
-    /// `job_id` is the *daemon's*, minted when the trigger arrived: the backend only has
-    /// to answer for it, not invent it. Its string form is what a vendor tool ends up
-    /// keying its spool directory on (5.3).
+    /// `trigger_id` is the backend's, minted when the trigger arrived and handed back by
+    /// the daemon unchanged. Its string form is what a vendor tool ends up keying its
+    /// spool directory on (5.3).
     ///
     /// The stream ends when the device reports no further page; for a flatbed that is
     /// after one, for an ADF batch after the last sheet. That end is what moves `Job1`
@@ -238,6 +238,6 @@ pub trait ScannerBackend: Send + Sync {
     async fn fetch_pages(
         &self,
         scanner_id: &ScannerId,
-        job_id: &str,
+        trigger_id: &str,
     ) -> Result<BoxStream<'static, Result<RawPage, BackendError>>, BackendError>;
 }

@@ -1,20 +1,31 @@
-//! What a backend reports while it is running: button presses, and install progress.
+//! What a backend reports while it is running: scan triggers, and install progress.
 
 use std::time::SystemTime;
 
-use crate::model::{PairingState, ScannerId};
+use crate::model::{PairingState, ProfileKind, ScannerId};
 
-/// One entry of the device's physical menu was selected.
+/// Identifier the backend minted for one trigger.
+pub type TriggerId = String;
+
+/// What kind of thing triggered a scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TriggerKind {
+    /// One entry of the device's physical menu was selected.
+    Button { index: u32 },
+    /// The device chose the profile and is already sending the bytes.
+    Push { profile: ProfileKind },
+}
+
+/// One thing happened that may become a job.
 ///
-/// Deliberately carries **no profile**. The profile lives in `Button1.Profile` on the
-/// service side ([`scanbus-dbus-api.md`] §5): a backend that knows only "key 2 was
-/// pressed" is complete, and a backend that reported a profile would be telling us
-/// something it read back out of a config file *we* wrote — a round trip with two
-/// copies of the truth in it.
+/// A physical key deliberately carries **no profile**. The profile lives in
+/// `Button1.Profile` on the service side ([`scanbus-dbus-api.md`] §5): a backend that
+/// knows only "key 2 was pressed" is complete, and a backend that reported a profile
+/// would be telling us something it read back out of a config file *we* wrote — a round
+/// trip with two copies of the truth in it.
 ///
-/// The daemon turns one of these into a `Job1` whose `Button` property is
-/// [`ButtonPressedEvent::button_index`] and whose `Profile` is read from the matching
-/// `Button1` object at that moment (§7).
+/// A pushed upload does carry a profile, because the host never wrote it: it genuinely
+/// originates on the phone.
 ///
 /// Not `Serialize`, for the same reason as [`RawPage`](crate::model::RawPage): an event
 /// in flight between a backend and the registry is never persisted and never on the bus
@@ -22,11 +33,13 @@ use crate::model::{PairingState, ScannerId};
 ///
 /// [`scanbus-dbus-api.md`]: https://github.com/jeanparpaillon/scanbus_service/blob/master/docs/scanbus-dbus-api.md
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ButtonPressedEvent {
-    /// The scanner the press came from.
+pub struct ScanTrigger {
+    /// The backend-issued correlation key this transfer will be fetched back with.
+    pub id: TriggerId,
+    /// The scanner the trigger came from.
     pub scanner_id: ScannerId,
-    /// Position in the physical menu, 0-based — the index of a `Button1` object.
-    pub button_index: u32,
+    /// What kind of trigger this is.
+    pub kind: TriggerKind,
     /// When the backend observed the press.
     ///
     /// The backend's clock reading, not the registry's: a backend that polls a device
@@ -34,12 +47,23 @@ pub struct ButtonPressedEvent {
     pub timestamp: SystemTime,
 }
 
-impl ButtonPressedEvent {
+impl ScanTrigger {
     /// A press observed now.
-    pub fn now(scanner_id: ScannerId, button_index: u32) -> Self {
+    pub fn button(scanner_id: ScannerId, id: impl Into<TriggerId>, index: u32) -> Self {
         Self {
+            id: id.into(),
             scanner_id,
-            button_index,
+            kind: TriggerKind::Button { index },
+            timestamp: SystemTime::now(),
+        }
+    }
+
+    /// An upload observed now.
+    pub fn push(scanner_id: ScannerId, id: impl Into<TriggerId>, profile: ProfileKind) -> Self {
+        Self {
+            id: id.into(),
+            scanner_id,
+            kind: TriggerKind::Push { profile },
             timestamp: SystemTime::now(),
         }
     }
@@ -185,12 +209,29 @@ mod tests {
     }
 
     #[test]
-    fn a_press_carries_the_key_and_nothing_about_the_profile() {
+    fn a_button_trigger_carries_the_key_and_nothing_about_the_profile() {
         let id = ScannerId::from_backend("mock", "usb:001:002").unwrap();
-        let event = ButtonPressedEvent::now(id.clone(), 2);
+        let event = ScanTrigger::button(id.clone(), "job-1", 2);
 
         assert_eq!(event.scanner_id, id);
-        assert_eq!(event.button_index, 2);
+        assert_eq!(event.id, "job-1");
+        assert_eq!(event.kind, TriggerKind::Button { index: 2 });
+        assert!(event.timestamp.elapsed().is_ok());
+    }
+
+    #[test]
+    fn a_push_trigger_carries_the_profile() {
+        let id = ScannerId::from_backend("mobile", "phone_a1b2c3").unwrap();
+        let event = ScanTrigger::push(id.clone(), "upload-1", ProfileKind::Image);
+
+        assert_eq!(event.scanner_id, id);
+        assert_eq!(event.id, "upload-1");
+        assert_eq!(
+            event.kind,
+            TriggerKind::Push {
+                profile: ProfileKind::Image
+            }
+        );
         assert!(event.timestamp.elapsed().is_ok());
     }
 }

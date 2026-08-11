@@ -1,6 +1,6 @@
 //! Wire protocol primitives and backend plumbing for `scanbus-backend-mobile`.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -8,6 +8,7 @@ use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -25,8 +26,8 @@ use scanbus_core::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
@@ -67,6 +68,10 @@ pub const PAIR_CONFIRM_TIMEOUT: Duration = Duration::from_secs(120);
 /// phone present on the network is packet loss, and turning that into a failed pairing
 /// would be inventing an outage. A record older than this is not evidence of anything.
 pub const DISCOVERY_RECORD_TTL: Duration = Duration::from_secs(30);
+pub const UPLOAD_FRAME_TIMEOUT: Duration = Duration::from_secs(30);
+pub const FETCH_CLAIM_TIMEOUT: Duration = Duration::from_secs(5);
+pub const UPLOAD_PAGE_BUFFER: usize = 2;
+pub const DEFAULT_UPLOAD_RESOLUTION_DPI: u32 = 300;
 
 const DEVICE_STORE_VERSION: u32 = 1;
 
@@ -167,28 +172,42 @@ impl From<PersistedDevice> for PairedDevice {
 struct ListenerBinding {
     port: u16,
     bind_error: Option<String>,
-    _listener: Option<std::net::TcpListener>,
+    listener: Option<std::net::TcpListener>,
+    task_started: bool,
+}
+
+#[derive(Debug)]
+struct PendingUpload {
+    scanner_id: ScannerId,
+    claim: Option<oneshot::Sender<()>>,
+    receiver: mpsc::Receiver<Result<RawPage, BackendError>>,
 }
 
 struct MobileSubscription {
     scanner_id: ScannerId,
-    subscriptions: Arc<Mutex<BTreeSet<ScannerId>>>,
+    subscriptions: Arc<Mutex<BTreeMap<ScannerId, mpsc::Sender<scanbus_core::ScanTrigger>>>>,
+    receiver: mpsc::Receiver<scanbus_core::ScanTrigger>,
 }
 
 impl MobileSubscription {
-    fn new(scanner_id: ScannerId, subscriptions: Arc<Mutex<BTreeSet<ScannerId>>>) -> Self {
+    fn new(
+        scanner_id: ScannerId,
+        subscriptions: Arc<Mutex<BTreeMap<ScannerId, mpsc::Sender<scanbus_core::ScanTrigger>>>>,
+        receiver: mpsc::Receiver<scanbus_core::ScanTrigger>,
+    ) -> Self {
         Self {
             scanner_id,
             subscriptions,
+            receiver,
         }
     }
 }
 
 impl Stream for MobileSubscription {
-    type Item = scanbus_core::ButtonPressedEvent;
+    type Item = scanbus_core::ScanTrigger;
 
-    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Poll::Pending
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.get_mut().receiver.poll_recv(cx)
     }
 }
 
@@ -204,6 +223,16 @@ impl Drop for MobileSubscription {
 impl ListenerBinding {
     fn is_bound(&self) -> bool {
         self.bind_error.is_none()
+    }
+}
+
+struct UploadStream(mpsc::Receiver<Result<RawPage, BackendError>>);
+
+impl Stream for UploadStream {
+    type Item = Result<RawPage, BackendError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.get_mut().0.poll_recv(cx)
     }
 }
 
@@ -229,7 +258,10 @@ pub struct MobileBackend {
     paired: Arc<Mutex<BTreeMap<ScannerId, PairedDevice>>>,
     store_path: Arc<PathBuf>,
     listener: Arc<Mutex<ListenerBinding>>,
-    subscriptions: Arc<Mutex<BTreeSet<ScannerId>>>,
+    listener_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    subscriptions: Arc<Mutex<BTreeMap<ScannerId, mpsc::Sender<scanbus_core::ScanTrigger>>>>,
+    pending_uploads: Arc<Mutex<BTreeMap<String, PendingUpload>>>,
+    next_trigger_id: Arc<AtomicU64>,
 }
 
 impl Default for MobileBackend {
@@ -276,7 +308,7 @@ impl MobileBackend {
             }
         }
 
-        Self {
+        let backend = Self {
             discovery_timeout,
             connect_timeout: PAIR_CONNECT_TIMEOUT,
             confirm_timeout: PAIR_CONFIRM_TIMEOUT,
@@ -287,8 +319,13 @@ impl MobileBackend {
             paired: Arc::new(Mutex::new(paired)),
             store_path: Arc::new(store_path),
             listener: Arc::new(Mutex::new(listener)),
-            subscriptions: Arc::new(Mutex::new(BTreeSet::new())),
-        }
+            listener_task: Arc::new(Mutex::new(None)),
+            subscriptions: Arc::new(Mutex::new(BTreeMap::new())),
+            pending_uploads: Arc::new(Mutex::new(BTreeMap::new())),
+            next_trigger_id: Arc::new(AtomicU64::new(1)),
+        };
+        backend.ensure_upload_task();
+        backend
     }
 
     /// The port `pair_request` advertises for uploads — the shared listener's port.
@@ -316,7 +353,50 @@ impl MobileBackend {
         self.subscriptions
             .lock()
             .expect("mobile subscriptions lock poisoned")
-            .contains(scanner_id)
+            .contains_key(scanner_id)
+    }
+
+    fn ensure_upload_task(&self) {
+        let mut binding = self.listener.lock().expect("mobile listener lock poisoned");
+        if !binding.is_bound() || binding.task_started {
+            return;
+        }
+        let Some(listener) = binding.listener.as_ref() else {
+            return;
+        };
+        let Ok(cloned) = listener.try_clone() else {
+            return;
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        if cloned.set_nonblocking(true).is_err() {
+            return;
+        }
+        let Ok(listener) = TcpListener::from_std(cloned) else {
+            return;
+        };
+        binding.task_started = true;
+        drop(binding);
+
+        let paired = Arc::clone(&self.paired);
+        let subscriptions = Arc::clone(&self.subscriptions);
+        let pending_uploads = Arc::clone(&self.pending_uploads);
+        let next_trigger_id = Arc::clone(&self.next_trigger_id);
+        let task = handle.spawn(async move {
+            run_upload_listener(
+                listener,
+                paired,
+                subscriptions,
+                pending_uploads,
+                next_trigger_id,
+            )
+            .await;
+        });
+        *self
+            .listener_task
+            .lock()
+            .expect("mobile listener task lock poisoned") = Some(task);
     }
 
     /// Shortens the two handshake deadlines, for a test or a simulator run that should
@@ -704,7 +784,7 @@ impl ScannerBackend for MobileBackend {
     async fn start_listening(
         &self,
         scanner: &ScannerInfo,
-    ) -> Result<BoxStream<'static, scanbus_core::ButtonPressedEvent>, BackendError> {
+    ) -> Result<BoxStream<'static, scanbus_core::ScanTrigger>, BackendError> {
         if self.lock_paired().contains_key(&scanner.id) && !self.listener_is_bound() {
             let detail = self
                 .listener_error()
@@ -713,13 +793,15 @@ impl ScannerBackend for MobileBackend {
                 "mobile uploads are unavailable: {detail}"
             )));
         }
+        let (sender, receiver) = mpsc::channel(8);
         self.subscriptions
             .lock()
             .expect("mobile subscriptions lock poisoned")
-            .insert(scanner.id.clone());
+            .insert(scanner.id.clone(), sender);
         Ok(Box::pin(MobileSubscription::new(
             scanner.id.clone(),
             Arc::clone(&self.subscriptions),
+            receiver,
         )))
     }
 
@@ -778,13 +860,303 @@ impl ScannerBackend for MobileBackend {
 
     async fn fetch_pages(
         &self,
-        _scanner_id: &ScannerId,
-        _job_id: &str,
+        scanner_id: &ScannerId,
+        trigger_id: &str,
     ) -> Result<BoxStream<'static, Result<RawPage, BackendError>>, BackendError> {
-        Err(BackendError::Unsupported {
-            backend: ID,
-            operation: "fetch_pages",
+        let mut pending = self
+            .pending_uploads
+            .lock()
+            .expect("mobile pending upload lock poisoned");
+        let Some(mut upload) = pending.remove(trigger_id) else {
+            return Err(BackendError::UnknownJob {
+                scanner: scanner_id.clone(),
+                job: trigger_id.to_owned(),
+            });
+        };
+        if &upload.scanner_id != scanner_id {
+            return Err(BackendError::UnknownJob {
+                scanner: scanner_id.clone(),
+                job: trigger_id.to_owned(),
+            });
+        }
+        if let Some(claim) = upload.claim.take() {
+            let _ = claim.send(());
+        }
+        Ok(Box::pin(UploadStream(upload.receiver)))
+    }
+}
+
+impl Drop for MobileBackend {
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.listener_task) != 1 {
+            return;
+        }
+        if let Some(task) = self
+            .listener_task
+            .lock()
+            .expect("mobile listener task lock poisoned")
+            .take()
+        {
+            task.abort();
+        }
+    }
+}
+
+async fn run_upload_listener(
+    listener: TcpListener,
+    paired: Arc<Mutex<BTreeMap<ScannerId, PairedDevice>>>,
+    subscriptions: Arc<Mutex<BTreeMap<ScannerId, mpsc::Sender<scanbus_core::ScanTrigger>>>>,
+    pending_uploads: Arc<Mutex<BTreeMap<String, PendingUpload>>>,
+    next_trigger_id: Arc<AtomicU64>,
+) {
+    loop {
+        let Ok((socket, _)) = listener.accept().await else {
+            continue;
+        };
+        let paired = Arc::clone(&paired);
+        let subscriptions = Arc::clone(&subscriptions);
+        let pending_uploads = Arc::clone(&pending_uploads);
+        let next_trigger_id = Arc::clone(&next_trigger_id);
+        tokio::spawn(async move {
+            let _ = handle_upload_connection(
+                socket,
+                paired,
+                subscriptions,
+                pending_uploads,
+                next_trigger_id,
+            )
+            .await;
+        });
+    }
+}
+
+async fn handle_upload_connection(
+    mut socket: TcpStream,
+    paired: Arc<Mutex<BTreeMap<ScannerId, PairedDevice>>>,
+    subscriptions: Arc<Mutex<BTreeMap<ScannerId, mpsc::Sender<scanbus_core::ScanTrigger>>>>,
+    pending_uploads: Arc<Mutex<BTreeMap<String, PendingUpload>>>,
+    next_trigger_id: Arc<AtomicU64>,
+) -> Result<(), ProtocolError> {
+    let first = match read_upload_header(&mut socket).await {
+        Ok(first) => first,
+        Err(error) => {
+            let _ = send_error_ack(&mut socket, ack_reason_for(&error)).await;
+            return Err(error);
+        }
+    };
+    let scanner_id = match authorize_upload(&paired, &first.device_id, &first.token) {
+        Ok(scanner_id) => scanner_id,
+        Err(error) => {
+            let _ = send_error_ack(&mut socket, ack_reason_for(&error)).await;
+            return Err(error);
+        }
+    };
+    let sender = {
+        subscriptions
+            .lock()
+            .expect("mobile subscriptions lock poisoned")
+            .get(&scanner_id)
+            .cloned()
+    };
+    let sender = match sender {
+        Some(sender) => sender,
+        None => {
+            let error = ProtocolError::NotConnected {
+                device_id: first.device_id.clone(),
+            };
+            let _ = send_error_ack(&mut socket, ack_reason_for(&error)).await;
+            return Err(error);
+        }
+    };
+
+    let trigger_id = format!("upload-{}", next_trigger_id.fetch_add(1, Ordering::Relaxed));
+    let trigger =
+        scanbus_core::ScanTrigger::push(scanner_id.clone(), trigger_id.clone(), first.profile);
+    let (pages_tx, pages_rx) = mpsc::channel(UPLOAD_PAGE_BUFFER);
+    let (claim_tx, claim_rx) = oneshot::channel();
+    pending_uploads
+        .lock()
+        .expect("mobile pending upload lock poisoned")
+        .insert(
+            trigger_id.clone(),
+            PendingUpload {
+                scanner_id: scanner_id.clone(),
+                claim: Some(claim_tx),
+                receiver: pages_rx,
+            },
+        );
+
+    if sender.send(trigger).await.is_err() {
+        pending_uploads
+            .lock()
+            .expect("mobile pending upload lock poisoned")
+            .remove(&trigger_id);
+        return send_error_ack(&mut socket, AckReason::NotConnected).await;
+    }
+
+    if timeout(FETCH_CLAIM_TIMEOUT, claim_rx).await.is_err() {
+        pending_uploads
+            .lock()
+            .expect("mobile pending upload lock poisoned")
+            .remove(&trigger_id);
+        return send_error_ack(&mut socket, AckReason::Malformed).await;
+    }
+
+    let result = stream_upload_pages(&mut socket, first, pages_tx).await;
+    if let Err(ref error) = result {
+        let _ = send_error_ack(&mut socket, ack_reason_for(&error)).await;
+    }
+    result
+}
+
+async fn stream_upload_pages(
+    socket: &mut TcpStream,
+    first: Upload,
+    pages_tx: mpsc::Sender<Result<RawPage, BackendError>>,
+) -> Result<(), ProtocolError> {
+    let mut current = first;
+    loop {
+        let format = current
+            .format
+            .parse::<scanbus_core::PageFormat>()
+            .map_err(|error| ProtocolError::Malformed {
+                context: error.to_string(),
+            })?;
+        let bytes = timeout(
+            UPLOAD_FRAME_TIMEOUT,
+            read_frame(socket, FrameKind::Page, DEFAULT_PAGE_MAX_BYTES),
+        )
+        .await
+        .map_err(|_| ProtocolError::Malformed {
+            context: "timed out waiting for a page frame".to_owned(),
+        })??;
+
+        if pages_tx
+            .send(Ok(RawPage {
+                index: current.page - 1,
+                format,
+                resolution_dpi: DEFAULT_UPLOAD_RESOLUTION_DPI,
+                data: bytes,
+            }))
+            .await
+            .is_err()
+        {
+            return Err(ProtocolError::Malformed {
+                context: "nobody fetched the uploaded pages".to_owned(),
+            });
+        }
+        send_ok_ack(socket).await?;
+
+        if current.page == current.of {
+            return Ok(());
+        }
+
+        let next = read_upload_header(socket).await?;
+        if next.device_id != current.device_id || next.token != current.token {
+            return Err(ProtocolError::Unauthorized {
+                device_id: next.device_id,
+            });
+        }
+        if next.profile != current.profile {
+            return Err(ProtocolError::Malformed {
+                context: "profile changed mid-upload".to_owned(),
+            });
+        }
+        if next.of != current.of || next.page != current.page + 1 {
+            return Err(ProtocolError::Malformed {
+                context: format!(
+                    "expected page {} of {}, got page {} of {}",
+                    current.page + 1,
+                    current.of,
+                    next.page,
+                    next.of
+                ),
+            });
+        }
+        current = next;
+    }
+}
+
+async fn read_upload_header(socket: &mut TcpStream) -> Result<Upload, ProtocolError> {
+    let frame = timeout(
+        UPLOAD_FRAME_TIMEOUT,
+        read_frame(socket, FrameKind::Control, DEFAULT_CONTROL_MAX_BYTES),
+    )
+    .await
+    .map_err(|_| ProtocolError::Malformed {
+        context: "timed out waiting for an upload header".to_owned(),
+    })??;
+    let message = parse_control_message(&frame)?;
+    message.validate_version()?;
+    let Message::Upload(upload) = message else {
+        return Err(ProtocolError::Malformed {
+            context: "expected an upload control message".to_owned(),
+        });
+    };
+    upload.validate_page_bounds()?;
+    Ok(upload)
+}
+
+fn authorize_upload(
+    paired: &Arc<Mutex<BTreeMap<ScannerId, PairedDevice>>>,
+    device_id: &str,
+    token: &str,
+) -> Result<ScannerId, ProtocolError> {
+    paired
+        .lock()
+        .expect("mobile paired device lock poisoned")
+        .iter()
+        .find_map(|(scanner_id, device)| {
+            (device.device_id == device_id
+                && constant_time_eq(&device.token_sha256, &hash_token(token)))
+            .then(|| scanner_id.clone())
         })
+        .ok_or_else(|| ProtocolError::Unauthorized {
+            device_id: device_id.to_owned(),
+        })
+}
+
+async fn send_ok_ack(socket: &mut TcpStream) -> Result<(), ProtocolError> {
+    send_ack(
+        socket,
+        Ack {
+            status: AckStatus::Ok,
+            reason: None,
+        },
+    )
+    .await
+}
+
+async fn send_error_ack(socket: &mut TcpStream, reason: AckReason) -> Result<(), ProtocolError> {
+    send_ack(
+        socket,
+        Ack {
+            status: AckStatus::Error,
+            reason: Some(reason),
+        },
+    )
+    .await
+}
+
+async fn send_ack(socket: &mut TcpStream, ack: Ack) -> Result<(), ProtocolError> {
+    let payload = serialize_control_message(&Message::Ack(ack))?;
+    write_frame(
+        socket,
+        FrameKind::Control,
+        &payload,
+        DEFAULT_CONTROL_MAX_BYTES,
+    )
+    .await
+}
+
+fn ack_reason_for(error: &ProtocolError) -> AckReason {
+    match error {
+        ProtocolError::Unauthorized { .. } => AckReason::Unauthorized,
+        ProtocolError::UnsupportedVersion { .. } => AckReason::UnsupportedVersion,
+        ProtocolError::NotConnected { .. } => AckReason::NotConnected,
+        ProtocolError::Malformed { .. } => AckReason::Malformed,
+        ProtocolError::TooLarge { .. } => AckReason::TooLarge,
+        ProtocolError::Unsupported { .. } => AckReason::Unsupported,
     }
 }
 
@@ -1012,12 +1384,14 @@ fn bind_listener(requested_port: u16) -> ListenerBinding {
         Ok((listener, port)) => ListenerBinding {
             port,
             bind_error: None,
-            _listener: Some(listener),
+            listener: Some(listener),
+            task_started: false,
         },
         Err(error) => ListenerBinding {
             port: requested_port,
             bind_error: Some(error),
-            _listener: None,
+            listener: None,
+            task_started: false,
         },
     }
 }
@@ -1577,6 +1951,7 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
 mod tests {
     use std::{io, pin::Pin, task::Poll};
 
+    use futures_util::StreamExt as _;
     use tempfile::TempDir;
     use tokio::io::{AsyncRead, ReadBuf, duplex};
     use tokio::net::TcpListener;
@@ -1978,6 +2353,139 @@ mod tests {
 
         backend.stop_listening(&scanner_id()).await.unwrap();
         assert!(!backend.has_subscription(&scanner_id()));
+    }
+
+    async fn upload_once(port: u16, upload: Upload, page: Vec<u8>) -> Ack {
+        let mut socket = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let payload = serialize_control_message(&Message::Upload(upload)).unwrap();
+        write_frame(
+            &mut socket,
+            FrameKind::Control,
+            &payload,
+            DEFAULT_CONTROL_MAX_BYTES,
+        )
+        .await
+        .unwrap();
+        write_frame(&mut socket, FrameKind::Page, &page, DEFAULT_PAGE_MAX_BYTES)
+            .await
+            .unwrap();
+
+        let ack = read_frame(&mut socket, FrameKind::Control, DEFAULT_CONTROL_MAX_BYTES)
+            .await
+            .unwrap();
+        let Message::Ack(ack) = parse_control_message(&ack).unwrap() else {
+            panic!("expected ack");
+        };
+        ack
+    }
+
+    #[tokio::test]
+    async fn an_upload_emits_a_push_trigger_and_fetches_its_page() {
+        let phone = FakePhone::listen(Answer::Accept {
+            device_id: DEVICE_ID,
+        })
+        .await;
+        let (_tmp, backend) = backend_that_saw(&phone.address);
+        pair_with(&backend).await.0.unwrap();
+
+        let mut triggers = backend.start_listening(&scanner_info()).await.unwrap();
+        let upload = Upload {
+            v: PROTOCOL_VERSION,
+            device_id: DEVICE_ID.to_owned(),
+            token: "phone-token".to_owned(),
+            profile: ProfileKind::Image,
+            page: 1,
+            of: 1,
+            format: "jpeg".to_owned(),
+        };
+        let page = vec![0xff, 0xd8, 0xff, 0xd9];
+        let send = tokio::spawn(upload_once(backend.upload_port(), upload, page.clone()));
+
+        let trigger = triggers.next().await.unwrap();
+        assert_eq!(trigger.scanner_id, scanner_id());
+        assert_eq!(
+            trigger.kind,
+            scanbus_core::TriggerKind::Push {
+                profile: ProfileKind::Image
+            }
+        );
+
+        let mut pages = backend
+            .fetch_pages(&scanner_id(), &trigger.id)
+            .await
+            .unwrap();
+        let received = pages.next().await.unwrap().unwrap();
+        assert_eq!(received.index, 0);
+        assert_eq!(received.format, scanbus_core::PageFormat::Jpeg);
+        assert_eq!(received.resolution_dpi, DEFAULT_UPLOAD_RESOLUTION_DPI);
+        assert_eq!(received.data, page);
+        assert!(pages.next().await.is_none());
+
+        let ack = send.await.unwrap();
+        assert_eq!(ack.status, AckStatus::Ok);
+        assert_eq!(ack.reason, None);
+    }
+
+    #[tokio::test]
+    async fn an_upload_with_a_bad_token_is_unauthorized() {
+        let phone = FakePhone::listen(Answer::Accept {
+            device_id: DEVICE_ID,
+        })
+        .await;
+        let (_tmp, backend) = backend_that_saw(&phone.address);
+        pair_with(&backend).await.0.unwrap();
+        let mut triggers = backend.start_listening(&scanner_info()).await.unwrap();
+
+        let ack = upload_once(
+            backend.upload_port(),
+            Upload {
+                v: PROTOCOL_VERSION,
+                device_id: DEVICE_ID.to_owned(),
+                token: "wrong-token".to_owned(),
+                profile: ProfileKind::Image,
+                page: 1,
+                of: 1,
+                format: "jpeg".to_owned(),
+            },
+            vec![0xff, 0xd8, 0xff, 0xd9],
+        )
+        .await;
+
+        assert_eq!(ack.status, AckStatus::Error);
+        assert_eq!(ack.reason, Some(AckReason::Unauthorized));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), triggers.next())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_upload_without_an_active_subscription_is_not_connected() {
+        let phone = FakePhone::listen(Answer::Accept {
+            device_id: DEVICE_ID,
+        })
+        .await;
+        let (_tmp, backend) = backend_that_saw(&phone.address);
+        pair_with(&backend).await.0.unwrap();
+
+        let ack = upload_once(
+            backend.upload_port(),
+            Upload {
+                v: PROTOCOL_VERSION,
+                device_id: DEVICE_ID.to_owned(),
+                token: "phone-token".to_owned(),
+                profile: ProfileKind::Image,
+                page: 1,
+                of: 1,
+                format: "jpeg".to_owned(),
+            },
+            vec![0xff, 0xd8, 0xff, 0xd9],
+        )
+        .await;
+
+        assert_eq!(ack.status, AckStatus::Error);
+        assert_eq!(ack.reason, Some(AckReason::NotConnected));
     }
 
     #[test]

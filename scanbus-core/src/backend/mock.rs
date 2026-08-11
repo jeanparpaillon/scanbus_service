@@ -16,7 +16,7 @@
 //! let handle = backend.handle();
 //! let mut events = backend.start_listening(&scanner).await?;
 //! handle.press_button(&scanner.id, 2)?;      // synchronous
-//! assert_eq!(events.next().await.unwrap().button_index, 2);
+//! assert_eq!(events.next().await.unwrap().kind, TriggerKind::Button { index: 2 });
 //! ```
 //!
 //! The tests at the bottom of this file are the worked examples, and are also the
@@ -33,7 +33,7 @@ use futures_core::stream::BoxStream;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
-use super::{ButtonPressedEvent, PairingProgress, ScannerBackend};
+use super::{PairingProgress, ScanTrigger, ScannerBackend};
 use crate::error::BackendError;
 use crate::model::{
     ButtonsCapability, Capabilities, ColorMode, ProfileKind, RawPage, ScannerId, ScannerInfo,
@@ -132,8 +132,8 @@ pub enum MockCall {
     FetchPages {
         /// The scanner.
         scanner: ScannerId,
-        /// The job id asked for.
-        job: String,
+        /// The trigger id asked for.
+        trigger: String,
     },
 }
 
@@ -240,11 +240,12 @@ struct MockState {
     install_failure: Option<BackendError>,
     installed: BTreeSet<ScannerId>,
     install_attempts: u32,
-    listeners: BTreeMap<ScannerId, mpsc::Sender<ButtonPressedEvent>>,
+    listeners: BTreeMap<ScannerId, mpsc::Sender<ScanTrigger>>,
     pages: BTreeMap<String, PageSource>,
     mappings: BTreeMap<(ScannerId, u32), ButtonMapping>,
     mapping_failure: Option<BackendError>,
     calls: Vec<MockCall>,
+    next_trigger_id: u64,
 }
 
 impl MockState {
@@ -260,6 +261,7 @@ impl MockState {
             mappings: BTreeMap::new(),
             mapping_failure: None,
             calls: Vec::new(),
+            next_trigger_id: 1,
         }
     }
 }
@@ -369,14 +371,20 @@ impl MockHandle {
     /// [`MockError::ListenerDropped`] if the consumer dropped the stream,
     /// [`MockError::ListenerFull`] if it stopped reading.
     pub fn press_button(&self, scanner_id: &ScannerId, button_index: u32) -> Result<(), MockError> {
-        let state = self.state();
+        let mut state = self.state();
+        let trigger_id = format!("job-{}", state.next_trigger_id);
+        state.next_trigger_id += 1;
         let sender = state
             .listeners
             .get(scanner_id)
             .ok_or_else(|| MockError::NotListening(scanner_id.clone()))?;
 
         sender
-            .try_send(ButtonPressedEvent::now(scanner_id.clone(), button_index))
+            .try_send(ScanTrigger::button(
+                scanner_id.clone(),
+                trigger_id,
+                button_index,
+            ))
             .map_err(|error| match error {
                 mpsc::error::TrySendError::Closed(_) => {
                     MockError::ListenerDropped(scanner_id.clone())
@@ -569,7 +577,7 @@ impl ScannerBackend for MockBackend {
     async fn start_listening(
         &self,
         scanner: &ScannerInfo,
-    ) -> Result<BoxStream<'static, ButtonPressedEvent>, BackendError> {
+    ) -> Result<BoxStream<'static, ScanTrigger>, BackendError> {
         let mut state = self.state();
         state
             .calls
@@ -648,22 +656,22 @@ impl ScannerBackend for MockBackend {
     async fn fetch_pages(
         &self,
         scanner_id: &ScannerId,
-        job_id: &str,
+        trigger_id: &str,
     ) -> Result<BoxStream<'static, Result<RawPage, BackendError>>, BackendError> {
         let mut state = self.state();
         state.calls.push(MockCall::FetchPages {
             scanner: scanner_id.clone(),
-            job: job_id.to_owned(),
+            trigger: trigger_id.to_owned(),
         });
 
         // Removing rather than reading is the trait's once-per-job rule: a second call
         // for the same id is indistinguishable from one that never existed.
         let source = state
             .pages
-            .remove(job_id)
+            .remove(trigger_id)
             .ok_or_else(|| BackendError::UnknownJob {
                 scanner: scanner_id.clone(),
-                job: job_id.to_owned(),
+                job: trigger_id.to_owned(),
             })?;
 
         Ok(match source {
@@ -674,10 +682,10 @@ impl ScannerBackend for MockBackend {
 }
 
 /// The button stream: a channel the handle writes into.
-struct EventStream(mpsc::Receiver<ButtonPressedEvent>);
+struct EventStream(mpsc::Receiver<ScanTrigger>);
 
 impl Stream for EventStream {
-    type Item = ButtonPressedEvent;
+    type Item = ScanTrigger;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.get_mut().0.poll_recv(cx)
@@ -776,7 +784,7 @@ mod tests {
         handle.press_button(&scanner.id, 2).unwrap();
         let event = events.next().await.unwrap();
         assert_eq!(event.scanner_id, scanner.id);
-        assert_eq!(event.button_index, 2);
+        assert_eq!(event.kind, crate::backend::TriggerKind::Button { index: 2 });
 
         // The job id is the daemon's; the backend only has to answer for it.
         handle.feed_pages("job-1", [page(0), page(1), page(2)]);
@@ -869,7 +877,10 @@ mod tests {
         drop(events);
         let mut events = backend.start_listening(&scanner).await.unwrap();
         backend.handle().press_button(&scanner.id, 1).unwrap();
-        assert_eq!(events.next().await.unwrap().button_index, 1);
+        assert_eq!(
+            events.next().await.unwrap().kind,
+            crate::backend::TriggerKind::Button { index: 1 }
+        );
     }
 
     /// The backend's side going away ends the stream rather than hanging the consumer.
@@ -884,7 +895,10 @@ mod tests {
         assert!(handle.end_listener(&scanner.id));
 
         // The press queued before the device went away still arrives.
-        assert_eq!(events.next().await.unwrap().button_index, 3);
+        assert_eq!(
+            events.next().await.unwrap().kind,
+            crate::backend::TriggerKind::Button { index: 3 }
+        );
         assert!(events.next().await.is_none());
         assert_eq!(
             handle.press_button(&scanner.id, 3),

@@ -22,8 +22,8 @@ use futures_util::StreamExt as _;
 use futures_util::stream::BoxStream;
 use scanbus_core::backend::mock::{MockBackend, MockCall, MockError, MockHandle};
 use scanbus_core::{
-    BackendError, ButtonPressedEvent, Capabilities, PairingProgress, ProfileKind, RawPage,
-    ScannerBackend, ScannerId, ScannerInfo, Status, Value,
+    BackendError, Capabilities, PairingProgress, ProfileKind, RawPage, ScanTrigger, ScannerBackend,
+    ScannerId, ScannerInfo, Status, Value,
 };
 use scanbus_daemon::backends::RankedBackend;
 use scanbus_daemon::dbus::{self, BUS_NAME, Manager1, ObjectRegistry, Profile1, path};
@@ -121,7 +121,7 @@ impl ScannerBackend for TestBackend {
     async fn start_listening(
         &self,
         scanner: &ScannerInfo,
-    ) -> Result<BoxStream<'static, ButtonPressedEvent>, BackendError> {
+    ) -> Result<BoxStream<'static, ScanTrigger>, BackendError> {
         if self.refuse_listening.load(Ordering::SeqCst) {
             return Err(BackendError::NotReachable {
                 scanner: scanner.id.clone(),
@@ -423,7 +423,7 @@ async fn connect_delivers_presses_and_disconnect_stops_them() {
     daemon.press(&info.id, 2).unwrap();
     let event = daemon.next_event().await;
     assert_eq!(event.scanner(), &info.id);
-    assert_eq!(event.button_index(), 2);
+    assert_eq!(event.button_index(), Some(2));
     // Nothing configured anywhere: §4's `Profile=""`, i.e. deliver it raw.
     assert_eq!(event.profile(None), None);
 
@@ -476,7 +476,7 @@ async fn connecting_twice_starts_one_listener() {
         daemon.press(&info.id, button).unwrap();
     }
     for button in 0..3 {
-        assert_eq!(daemon.next_event().await.button_index(), button);
+        assert_eq!(daemon.next_event().await.button_index(), Some(button));
     }
 
     daemon.shutdown().await;
@@ -497,13 +497,13 @@ async fn a_stream_that_ends_is_restarted() {
     let scanner = scanner_proxy(&client, &info.id).await;
     scanner.connect(HashMap::new()).await.unwrap();
     daemon.press(&info.id, 1).unwrap();
-    assert_eq!(daemon.next_event().await.button_index(), 1);
+    assert_eq!(daemon.next_event().await.button_index(), Some(1));
 
     // The device goes away as far as the backend is concerned: the stream simply ends.
     assert!(daemon.backend.handle().end_listener(&info.id));
 
     daemon.press_when_listening(&info.id, 3).await;
-    assert_eq!(daemon.next_event().await.button_index(), 3);
+    assert_eq!(daemon.next_event().await.button_index(), Some(3));
     assert!(
         scanner.connected().await.unwrap(),
         "a stream that came back is not a disconnection"
@@ -707,7 +707,7 @@ async fn pairing_starts_the_listener_without_a_connect() {
     assert!(scanner.paired().await.unwrap());
 
     daemon.press(&info.id, 3).unwrap();
-    assert_eq!(daemon.next_event().await.button_index(), 3);
+    assert_eq!(daemon.next_event().await.button_index(), Some(3));
 
     // And `Unpair()` takes it away again, before the association goes.
     scanner.unpair().await.unwrap();

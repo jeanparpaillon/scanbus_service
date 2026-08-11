@@ -19,8 +19,8 @@ use futures_util::stream::BoxStream;
 use scanbus_client::proxy::{Manager1Proxy, Scanner1Proxy, object_manager, properties};
 use scanbus_core::backend::mock::MockBackend;
 use scanbus_core::{
-    BackendError, ButtonPressedEvent, Capabilities, PairingProgress, ProfileKind, RawPage,
-    ScannerBackend, ScannerId, ScannerInfo, Status, Value,
+    BackendError, Capabilities, PairingProgress, ProfileKind, RawPage, ScanTrigger, ScannerBackend,
+    ScannerId, ScannerInfo, Status, Value,
 };
 use scanbus_daemon::Backends;
 use scanbus_daemon::dbus::path;
@@ -144,7 +144,7 @@ impl ScannerBackend for GatedBackend {
     async fn start_listening(
         &self,
         scanner: &ScannerInfo,
-    ) -> Result<BoxStream<'static, ButtonPressedEvent>, BackendError> {
+    ) -> Result<BoxStream<'static, ScanTrigger>, BackendError> {
         self.inner.start_listening(scanner).await
     }
 
