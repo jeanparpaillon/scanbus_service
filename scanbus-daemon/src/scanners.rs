@@ -70,8 +70,8 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use scanbus_core::{
-    ButtonInfo, PairingMachine, PairingStore, ProfileKind, Restorable, ScannerBackend,
-    ScannerId, ScannerInfo, Status,
+    ButtonInfo, PairingMachine, PairingStore, PairingState, ProfileKind, Restorable,
+    RestoreDisposition, ScannerBackend, ScannerId, ScannerInfo, Status,
 };
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -301,6 +301,17 @@ impl ScannerRegistry {
         backend: Arc<dyn ScannerBackend>,
         info: ScannerInfo,
     ) -> Result<(), Error> {
+        self.register_persistent_with_state(backend, info, PairingState::Done)
+            .await
+    }
+
+    #[instrument(level = "info", skip_all, fields(id = %info.id))]
+    async fn register_persistent_with_state(
+        &self,
+        backend: Arc<dyn ScannerBackend>,
+        info: ScannerInfo,
+        pairing_state: PairingState,
+    ) -> Result<(), Error> {
         let mut state = self.state.lock().await;
         let address = physical_address(&info);
         let path = path::scanner(&info.id);
@@ -323,9 +334,9 @@ impl ScannerRegistry {
                 .await;
             // The supervisor turns this into the `Paired`/`PairingState` signals; doing
             // it here as well would be the second writer this design does not have.
-            iface.get().await.machine().restore_paired();
+            set_restored_pairing_state(iface.get().await.machine(), &pairing_state);
 
-            info!("scanner is now paired");
+            info!(state = %pairing_state, "scanner restored");
             return Ok(());
         }
 
@@ -346,9 +357,15 @@ impl ScannerRegistry {
                 address,
                 discovered: false,
             },
-            true,
+            matches!(pairing_state, PairingState::Done),
         )
-        .await
+        .await?;
+
+        let iface = self.objects.interface::<Scanner1>(&path).await?;
+        set_restored_pairing_state(iface.get().await.machine(), &pairing_state);
+        info!(state = %pairing_state, "scanner restored");
+
+        Ok(())
     }
 
     /// Restores every persisted scanner before `org.scanbus` is requested (4.2).
@@ -379,8 +396,26 @@ impl ScannerRegistry {
             }
         };
 
+        let mut restored_per_backend: BTreeMap<String, Vec<ScannerId>> = BTreeMap::new();
+        for entry in &entries {
+            restored_per_backend
+                .entry(entry.scanner.backend.clone())
+                .or_default()
+                .push(entry.scanner.id.clone());
+        }
+
         for entry in entries {
             self.restore_one(backends, entry, per_scanner_timeout).await;
+        }
+
+        for backend_id in backends.ids() {
+            let Some(backend) = backends.get(backend_id) else {
+                continue;
+            };
+            let restored = restored_per_backend.remove(backend_id).unwrap_or_default();
+            if let Err(error) = backend.prune_unrestored_pairings(&restored).await {
+                warn!(backend = backend_id, %error, "could not prune backend-side orphaned pairings");
+            }
         }
     }
 
@@ -397,11 +432,22 @@ impl ScannerRegistry {
             return;
         };
 
+        let disposition = backend.restore_disposition(&entry.scanner).await;
+        let state = match disposition {
+            RestoreDisposition::Paired => PairingState::Done,
+            RestoreDisposition::Failed(message) => PairingState::Failed(message),
+        };
+
         if let Err(error) = self
-            .register_persistent(Arc::clone(&backend), entry.scanner.clone())
+            .register_persistent_with_state(Arc::clone(&backend), entry.scanner.clone(), state.clone())
             .await
         {
             warn!(%id, %error, "could not publish a restored scanner");
+            return;
+        }
+
+        if matches!(state, PairingState::Failed(_)) {
+            info!(%id, state = %state, "restored: backend-side pairing is missing, scanner left unpaired");
             return;
         }
 
@@ -1039,6 +1085,19 @@ impl ScannerRegistry {
         entry.info = info;
 
         Ok(())
+    }
+}
+
+fn set_restored_pairing_state(machine: &PairingMachine, state: &PairingState) {
+    match state {
+        PairingState::Done => machine.restore_paired(),
+        PairingState::Failed(message) => machine.restore_failed(message.clone()),
+        PairingState::None
+        | PairingState::Pairing
+        | PairingState::InstallingBackend
+        | PairingState::AwaitingConfirmation(_) => {
+            panic!("invalid restore pairing state: {state}")
+        }
     }
 }
 

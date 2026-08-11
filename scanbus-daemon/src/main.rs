@@ -5,7 +5,6 @@
 //! `Button1`, `Job1`) hang off the registry built here as the rest of workstream 2
 //! lands.
 
-use std::env;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,9 +24,6 @@ use tracing_subscriber::{EnvFilter, fmt};
 /// that is actually there answers a local backend call well inside this, and one that
 /// is not there is exactly the case the reconnect backoff exists for, not this timeout.
 const RESTORE_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// The environment variable README.md documents for the mobile upload listener port.
-const MOBILE_BACKEND_PORT_ENV: &str = "SCANBUS_MOBILE_BACKEND_PORT";
 
 /// Backends compiled into this binary, in the order they will be probed.
 ///
@@ -52,13 +48,17 @@ const BACKENDS: &[&str] = &[
 /// on default builds.
 fn backends() -> Result<(Backends, u16), String> {
     let mut entries: Vec<Arc<dyn scanbus_core::ScannerBackend>> = Vec::new();
-    let upload_port = mobile_backend_port()?;
+    #[cfg(feature = "mobile")]
+    let upload_port;
+    #[cfg(not(feature = "mobile"))]
+    let upload_port = 0;
 
     #[cfg(feature = "mobile")]
-    entries.push(Arc::new(
-        scanbus_backend_mobile::MobileBackend::default()
-            .with_upload_port(upload_port),
-    ));
+    {
+        let backend = scanbus_backend_mobile::MobileBackend::default();
+        upload_port = backend.upload_port();
+        entries.push(Arc::new(backend));
+    }
 
     Ok((Backends::new(entries), upload_port))
 }
@@ -100,27 +100,6 @@ async fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
-}
-
-#[cfg(feature = "mobile")]
-fn mobile_backend_port() -> Result<u16, String> {
-    match env::var(MOBILE_BACKEND_PORT_ENV) {
-        Ok(value) => value.parse::<u16>().map_err(|error| {
-            format!(
-                "{MOBILE_BACKEND_PORT_ENV} must be a valid TCP port in 0..=65535, got {value:?}: \
-                 {error}"
-            )
-        }),
-        Err(env::VarError::NotPresent) => Ok(0),
-        Err(env::VarError::NotUnicode(_)) => Err(format!(
-            "{MOBILE_BACKEND_PORT_ENV} must be valid Unicode text"
-        )),
-    }
-}
-
-#[cfg(not(feature = "mobile"))]
-fn mobile_backend_port() -> Result<u16, String> {
-    Ok(0)
 }
 
 /// Serves until a termination signal arrives, then takes the object tree down.

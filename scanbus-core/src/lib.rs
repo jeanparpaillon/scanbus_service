@@ -12,7 +12,7 @@ pub mod pairing;
 pub mod path;
 pub mod profile;
 
-pub use backend::{ButtonPressedEvent, PairingProgress, ScannerBackend};
+pub use backend::{ButtonPressedEvent, PairingProgress, RestoreDisposition, ScannerBackend};
 pub use error::{BackendError, InvalidScannerId, ParseError};
 pub use model::{
     ButtonInfo, ButtonsCapability, Capabilities, ColorMode, JobState, PageFormat, PairingState,
