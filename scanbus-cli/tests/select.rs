@@ -1,10 +1,9 @@
 //! Selectors against a bus with an object tree on it ([`scanbus-cli.md`] §5).
 //!
-//! The commands that take a selector are all stubs, and that is precisely what makes
-//! these assertions possible: the stub connects, resolves, and only then reports itself
-//! unfinished, so a run that ends in **exit 1 naming the issue** is a run whose selector
-//! resolved, and exit 4 is one whose selector did not. Every case below is one of those
-//! two, which is the same pair the finished commands will produce.
+//! These assertions target selector resolution, not stub plumbing. The fixture therefore
+//! exports the minimum surface that today's real commands read after resolution succeeds,
+//! so the acceptance remains "success when the selector resolves, exit 4 when it does
+//! not" even though several of these commands are no longer stubs.
 //!
 //! The stand-in is not the daemon — same reason as `status.rs`: what is under test is the
 //! client's reading of an object tree, and a real daemon would bring a backend probe and
@@ -17,10 +16,11 @@ mod common;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use common::{PrivateBus, skipped};
-use zbus::zvariant::OwnedValue;
+use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 
 /// The two Brothers of §5's ambiguity example, on the same subnet.
 const BROTHER_23: &str = "brother_net_192_2E168_2E1_2E23";
@@ -45,8 +45,8 @@ impl Manager {
     }
 }
 
-/// The two `Scanner1` properties a selector matches on. The rest of §3 is not needed
-/// here: resolution reads `GetManagedObjects`, not a typed `ScannerState`.
+/// A `Scanner1` with the minimum surface the selector tests' real commands reach after
+/// resolution succeeds.
 struct Scanner {
     id: String,
     name: String,
@@ -63,12 +63,72 @@ impl Scanner {
     fn name(&self) -> String {
         self.name.clone()
     }
+
+    #[zbus(property)]
+    fn backend(&self) -> String {
+        "mock".to_owned()
+    }
+
+    #[zbus(property)]
+    fn address(&self) -> String {
+        format!("mock://{}", self.id)
+    }
+
+    #[zbus(property)]
+    fn capabilities(&self) -> HashMap<String, OwnedValue> {
+        HashMap::new()
+    }
+
+    #[zbus(property)]
+    fn supported_profiles(&self) -> Vec<String> {
+        vec!["image".to_owned(), "document".to_owned()]
+    }
+
+    #[zbus(property)]
+    fn paired(&self) -> bool {
+        true
+    }
+
+    #[zbus(property)]
+    fn connected(&self) -> bool {
+        false
+    }
+
+    #[zbus(property)]
+    fn status(&self) -> String {
+        "online".to_owned()
+    }
+
+    #[zbus(property)]
+    fn default_profile(&self) -> String {
+        String::new()
+    }
+
+    #[zbus(property)]
+    fn pairing_state(&self) -> String {
+        "none".to_owned()
+    }
+
+    #[zbus(property)]
+    fn pairing_error(&self) -> String {
+        String::new()
+    }
+
+    fn connect(&self, _options: HashMap<String, OwnedValue>) {}
 }
 
 /// A `Button1` reduced the same way: an index, in the path, and the label §5 matches.
 struct Button {
     index: u32,
     device_label: String,
+    state: Arc<Mutex<ButtonState>>,
+}
+
+#[derive(Default)]
+struct ButtonState {
+    label: String,
+    profile: String,
+    profile_options: HashMap<String, OwnedValue>,
 }
 
 #[zbus::interface(name = "org.scanbus.Button1")]
@@ -82,16 +142,90 @@ impl Button {
     fn device_label(&self) -> String {
         self.device_label.clone()
     }
+
+    #[zbus(property)]
+    fn label_configurable(&self) -> bool {
+        false
+    }
+
+    #[zbus(property)]
+    fn label(&self) -> String {
+        let label = self.state.lock().unwrap().label.clone();
+        if label.is_empty() {
+            self.device_label.clone()
+        } else {
+            label
+        }
+    }
+
+    #[zbus(property)]
+    fn set_label(&self, _value: &str) -> zbus::fdo::Result<()> {
+        Err(zbus::fdo::Error::PropertyReadOnly(
+            "fixed device label".to_owned(),
+        ))
+    }
+
+    #[zbus(property)]
+    fn profile(&self) -> String {
+        self.state.lock().unwrap().profile.clone()
+    }
+
+    #[zbus(property)]
+    fn set_profile(&self, value: &str) {
+        self.state.lock().unwrap().profile = value.to_owned();
+    }
+
+    #[zbus(property)]
+    fn profile_options(&self) -> HashMap<String, OwnedValue> {
+        self.state.lock().unwrap().profile_options.clone()
+    }
+
+    #[zbus(property)]
+    fn set_profile_options(&self, value: HashMap<String, OwnedValue>) {
+        self.state.lock().unwrap().profile_options = value;
+    }
 }
 
 /// A `Job1`, which a selector reaches by its path alone.
-struct Job;
+struct Job {
+    scanner: String,
+}
 
 #[zbus::interface(name = "org.scanbus.Job1")]
 impl Job {
     #[zbus(property)]
+    fn scanner(&self) -> OwnedObjectPath {
+        OwnedObjectPath::try_from(format!("/org/scanbus/scanner/{}", self.scanner)).unwrap()
+    }
+
+    #[zbus(property)]
+    fn button(&self) -> i32 {
+        2
+    }
+
+    #[zbus(property)]
+    fn profile(&self) -> String {
+        "document".to_owned()
+    }
+
+    #[zbus(property)]
     fn state(&self) -> String {
         "receiving".to_owned()
+    }
+
+    #[zbus(property)]
+    fn page_count(&self) -> u32 {
+        1
+    }
+
+    #[zbus(property)]
+    fn result(&self) -> HashMap<String, OwnedValue> {
+        HashMap::new()
+    }
+
+    #[zbus(property)]
+    fn error(&self) -> String {
+        String::new()
     }
 }
 
@@ -140,24 +274,51 @@ async fn serve(address: &str, discoveries: Arc<AtomicUsize>) -> zbus::Connection
         (2, "Scan to OCR"),
         (3, "Scan to E-mail"),
     ] {
+        let state = Arc::new(Mutex::new(ButtonState {
+            label: String::new(),
+            profile: if index == 2 {
+                "document".to_owned()
+            } else {
+                String::new()
+            },
+            profile_options: HashMap::new(),
+        }));
         server
             .at(
                 format!("/org/scanbus/scanner/{BROTHER_23}/button/{index}"),
                 Button {
                     index,
                     device_label: label.to_owned(),
+                    state,
                 },
             )
             .await
             .expect("cannot export the button");
     }
 
-    for path in [
-        format!("/org/scanbus/scanner/{BROTHER_23}/job/7"),
-        format!("/org/scanbus/scanner/{BROTHER_23}/job/8"),
-        format!("/org/scanbus/scanner/{BROTHER_24}/job/7"),
+    for (path, scanner) in [
+        (
+            format!("/org/scanbus/scanner/{BROTHER_23}/job/7"),
+            BROTHER_23,
+        ),
+        (
+            format!("/org/scanbus/scanner/{BROTHER_23}/job/8"),
+            BROTHER_23,
+        ),
+        (
+            format!("/org/scanbus/scanner/{BROTHER_24}/job/7"),
+            BROTHER_24,
+        ),
     ] {
-        server.at(path, Job).await.expect("cannot export the job");
+        server
+            .at(
+                path,
+                Job {
+                    scanner: scanner.to_owned(),
+                },
+            )
+            .await
+            .expect("cannot export the job");
     }
 
     connection
@@ -187,12 +348,9 @@ async fn a_shared_id_prefix_exits_four_and_the_full_id_of_either_works() {
     assert!(run.stderr.contains("use the full id"), "{}", run.stderr);
     assert!(run.stdout.is_empty(), "errors go to stderr: {}", run.stdout);
 
-    // Resolved, then unfinished: exit 1 naming the issue is what a *successful*
-    // resolution looks like today.
     for full in [BROTHER_23, BROTHER_24] {
         let run = bus.scanbus(&["connect", full]);
-        run.assert_code(1);
-        assert!(run.stderr.contains("8.7"), "{}", run.stderr);
+        run.assert_code(0);
     }
 }
 
@@ -203,8 +361,8 @@ async fn a_name_substring_resolves_when_unique_and_exits_four_when_not() {
         return skipped("a_name_substring_resolves_when_unique_and_exits_four_when_not");
     };
 
-    bus.scanbus(&["connect", "l2710"]).assert_code(1);
-    bus.scanbus(&["connect", "officejet"]).assert_code(1);
+    bus.scanbus(&["connect", "l2710"]).assert_code(0);
+    bus.scanbus(&["connect", "officejet"]).assert_code(0);
 
     let run = bus.scanbus(&["connect", "MFC"]);
     run.assert_code(4);
@@ -220,7 +378,7 @@ async fn the_id_flag_refuses_a_name_that_would_otherwise_resolve() {
     };
 
     // Unambiguous as a name substring, and still not an id.
-    bus.scanbus(&["connect", "l2710"]).assert_code(1);
+    bus.scanbus(&["connect", "l2710"]).assert_code(0);
 
     let run = bus.scanbus(&["connect", "--id", "l2710"]);
     run.assert_code(4);
@@ -231,7 +389,7 @@ async fn the_id_flag_refuses_a_name_that_would_otherwise_resolve() {
         .assert_code(4);
     bus.scanbus(&["connect", "--id", &format!("/org/scanbus/scanner/{ESCL}")])
         .assert_code(4);
-    bus.scanbus(&["connect", "--id", ESCL]).assert_code(1);
+    bus.scanbus(&["connect", "--id", ESCL]).assert_code(0);
 }
 
 /// A selector matching nothing is exit 4 and lists what does exist — not exit 1, which
@@ -257,7 +415,7 @@ async fn an_object_path_resolves_and_a_wrong_one_does_not() {
     };
 
     bus.scanbus(&["connect", &format!("/org/scanbus/scanner/{ESCL}")])
-        .assert_code(1);
+        .assert_code(0);
     bus.scanbus(&["connect", "/org/scanbus/scanner/nothing"])
         .assert_code(4);
 }
@@ -269,12 +427,10 @@ async fn a_button_resolves_by_index_or_label_and_refuses_an_ambiguous_one() {
         return skipped("a_button_resolves_by_index_or_label_and_refuses_an_ambiguous_one");
     };
 
-    // Resolved (scanner *and* button), then unfinished.
     let run = bus.scanbus(&["button", "set", "l2710", "2", "--profile", "document"]);
-    run.assert_code(1);
-    assert!(run.stderr.contains("8.9"), "{}", run.stderr);
+    run.assert_code(0);
     bus.scanbus(&["button", "clear", "l2710", "E-mail"])
-        .assert_code(1);
+        .assert_code(0);
 
     // "Scan to" is every key of this menu.
     let run = bus.scanbus(&["button", "clear", "l2710", "Scan to"]);
@@ -309,8 +465,7 @@ async fn a_job_resolves_by_short_id_unless_two_scanners_share_it() {
     };
 
     let run = bus.scanbus(&["job", "show", "8"]);
-    run.assert_code(1);
-    assert!(run.stderr.contains("8.8"), "{}", run.stderr);
+    run.assert_code(0);
 
     let run = bus.scanbus(&["job", "show", "7"]);
     run.assert_code(4);
@@ -331,7 +486,7 @@ async fn a_job_resolves_by_short_id_unless_two_scanners_share_it() {
         "show",
         &format!("/org/scanbus/scanner/{BROTHER_24}/job/7"),
     ])
-    .assert_code(1);
+    .assert_code(0);
 }
 
 /// The `--scanner` of a listing is a selector like any other, and `--id` pins it.
@@ -342,14 +497,14 @@ async fn a_job_listing_resolves_its_scanner_filter() {
     };
 
     bus.scanbus(&["job", "list", "--scanner", "l2710"])
-        .assert_code(1);
+        .assert_code(0);
     bus.scanbus(&["job", "list", "--scanner", "MFC"])
         .assert_code(4);
     bus.scanbus(&["job", "list", "--scanner", "l2710", "--id"])
         .assert_code(4);
 
     // No filter, nothing to resolve: a listing must not fail for want of a selector.
-    bus.scanbus(&["job", "list"]).assert_code(1);
+    bus.scanbus(&["job", "list"]).assert_code(0);
 
     // And `--id` with nothing to qualify is a usage error, before any bus traffic.
     bus.scanbus(&["job", "list", "--id"]).assert_code(2);

@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 
-use futures_util::StreamExt as _;
+use futures_util::{FutureExt as _, StreamExt as _};
 use scanbus_client::proxy::{self, JOB_INTERFACE};
 use scanbus_client::{
     Connection, Error as ClientError, ObjectKind, Objects, PropertyWatch, ScanbusError,
@@ -124,8 +124,11 @@ pub async fn watch(context: &Context, filter: &ScannerFilter, until_done: bool) 
                 previous.insert(path, item);
 
                 if until_done && terminal {
+                    let job = previous.values().last().expect("just inserted");
+                    if !failed && job.result.is_empty() {
+                        continue;
+                    }
                     if failed {
-                        let job = previous.values().last().expect("just inserted");
                         return Err(Error::call(
                             format!("waiting for job {}", job_follow::short_id(&job.path)?),
                             ClientError::Call(ScanbusError::Other {
@@ -152,10 +155,16 @@ struct JobDetail {
 }
 
 fn detail(objects: &Objects, job: &JobView) -> JobDetail {
+    let scanner = scanbus_core::path::scanner_id(&job.scanner);
     let button_label = objects
         .buttons()
         .iter()
-        .find(|button| button.scanner.as_str() == job.scanner && button.index == job.button as u32)
+        .find(|button| {
+            scanner
+                .as_ref()
+                .is_some_and(|scanner| &button.scanner == scanner)
+                && button.index == job.button as u32
+        })
         .map(|button| button.device_label.clone())
         .unwrap_or_default();
     let profile_hint = profile_hint(&button_label);
@@ -361,6 +370,19 @@ fn start_watch(
             }
             if job.apply(&args.changed_properties).is_err() {
                 return;
+            }
+            if job.state.is_terminal() {
+                while let Some(Some(signal)) = changes.next().now_or_never() {
+                    let Ok(args) = signal.args() else {
+                        return;
+                    };
+                    if !args.invalidated_properties.is_empty() {
+                        return;
+                    }
+                    if job.apply(&args.changed_properties).is_err() {
+                        return;
+                    }
+                }
             }
             if tx.send(job.clone()).is_err() {
                 return;
