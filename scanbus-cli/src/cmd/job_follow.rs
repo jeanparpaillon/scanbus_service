@@ -37,7 +37,7 @@ pub struct JobView {
 }
 
 impl JobView {
-    fn from_properties(path: OwnedObjectPath, properties: &Dict) -> Result<Self> {
+    pub(crate) fn from_properties(path: OwnedObjectPath, properties: &Dict) -> Result<Self> {
         let scanner = object_path(properties, "Scanner")?;
         let button = integer(properties, "Button")?;
         let profile = string(properties, "Profile")?;
@@ -59,7 +59,10 @@ impl JobView {
         })
     }
 
-    fn apply(&mut self, changed: &std::collections::HashMap<&str, ZValue<'_>>) -> Result<()> {
+    pub(crate) fn apply(
+        &mut self,
+        changed: &std::collections::HashMap<&str, ZValue<'_>>,
+    ) -> Result<()> {
         let mut state_name = self.state.as_str().to_owned();
         let mut error = self.state.error().to_owned();
 
@@ -80,7 +83,7 @@ impl JobView {
         Ok(())
     }
 
-    fn terminal_paths(&self) -> Vec<String> {
+    pub(crate) fn terminal_paths(&self) -> Vec<String> {
         match (self.result.get("path"), self.result.get("paths")) {
             (Some(Value::Str(path)), _) => vec![path.clone()],
             (_, Some(Value::Array(paths))) => paths
@@ -94,7 +97,7 @@ impl JobView {
         }
     }
 
-    fn json(&self) -> serde_json::Value {
+    pub(crate) fn json(&self) -> serde_json::Value {
         serde_json::json!({
             "Path": self.path.as_str(),
             "Scanner": self.scanner,

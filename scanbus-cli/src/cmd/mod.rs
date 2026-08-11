@@ -24,8 +24,10 @@ pub mod status;
 
 mod connect;
 mod discover;
+mod job;
 mod job_follow;
 mod list;
+mod monitor;
 mod pair;
 mod scanner_view;
 mod show;
@@ -69,6 +71,12 @@ pub async fn dispatch(context: &Context, command: &Command) -> Result<u8> {
             options,
             no_wait,
         } => connect::scan(context, scanner, profile, options, *no_wait).await,
+        Command::Job { command } => match command {
+            JobCommand::List { filter } => job::list(context, filter).await,
+            JobCommand::Show { job } => job::show(context, job).await,
+            JobCommand::Watch { filter, until_done } => job::watch(context, filter, *until_done).await,
+        },
+        Command::Monitor { path } => monitor::run(context, path.as_deref()).await,
         pending => stub(context, pending).await,
     }
 }
