@@ -222,7 +222,21 @@ with it.
 - Do not enable or mask anything from maintainer scripts in global scope. The package should
   install the files; `systemctl --user enable scanbus.service` is a per-user choice, and doing
   it globally is how you end up with root-owned links a user manager cannot clean up later.
-- System dependencies to declare: `libdbus-1-3` (through `zbus`, which can work without `libdbus` depending on the transport chosen — check whether we keep zbus's native Rust transport precisely to avoid this dependency).
+- The Brother helper script is the one packaging exception: `brscan-skey.config` points at it by
+  absolute path, so it must live at a stable system location. Package it under
+  `/usr/libexec/scanbus/scanbus-scanimage`, and have the future config rewrite point there rather
+  than into a user's home directory.
+- The packaged build should enable the daemon's `brother,hplip,mobile` features. Shipping a `.deb`
+  whose daemon cannot even instantiate the Brother backend would contradict the whole point of the
+  package.
+- `zbus` is kept on its native Rust transport (`default-features = false`, `features = ["tokio"]`),
+  so the package should not grow a `libdbus-1-3` dependency unless the actual built binaries start
+  linking it later. Derive the ELF dependencies from the release binaries (`dpkg-shlibdeps` /
+  `ldd`), then add only the runtime tools the packaged helper actually spawns — today `sane-utils`
+  for `scanimage`.
+- Maintainer scripts may print guidance and warn about a stale `brscan-skey.config` helper path,
+  but they must not enable the user unit, create global symlinks, or edit other users' session
+  state on install or removal.
 ## 9. Testing strategy
 
 - A `MockBackend` implementing `ScannerBackend` with synthetic events (`ButtonPressedEvent` triggered manually in tests) → covers the whole D-Bus/profile pipeline without hardware.
