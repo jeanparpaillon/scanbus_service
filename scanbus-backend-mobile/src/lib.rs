@@ -2,9 +2,13 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use flume::RecvTimeoutError;
@@ -17,6 +21,7 @@ use scanbus_core::{
 	ScannerBackend, ScannerId, ScannerInfo, Status, Value,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -61,6 +66,8 @@ pub const PAIR_CONFIRM_TIMEOUT: Duration = Duration::from_secs(120);
 /// would be inventing an outage. A record older than this is not evidence of anything.
 pub const DISCOVERY_RECORD_TTL: Duration = Duration::from_secs(30);
 
+const DEVICE_STORE_VERSION: u32 = 1;
+
 /// What one sighting of a phone is worth to a pairing: an address to dial, and the TXT
 /// `id` that `pair_response.device_id` has to match.
 ///
@@ -85,10 +92,10 @@ struct DiscoveryRecord {
 #[derive(Clone)]
 struct PairedDevice {
 	device_id: String,
-	/// The phone's upload credential. Never logged and never rendered by [`fmt::Debug`]
-	/// — see [`PairedDevice`]'s manual impl.
-	token: String,
+	/// SHA-256 of the phone's upload credential.
+	token_sha256: String,
 	profiles: Vec<ProfileKind>,
+	paired_at: u64,
 }
 
 /// Redacted on purpose: the token must not reach a log through a `?device` that seemed
@@ -97,9 +104,73 @@ impl fmt::Debug for PairedDevice {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		f.debug_struct("PairedDevice")
 			.field("device_id", &self.device_id)
-			.field("token", &"<redacted>")
+			.field("token_sha256", &"<redacted>")
 			.field("profiles", &self.profiles)
+			.field("paired_at", &self.paired_at)
 			.finish()
+	}
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedDeviceStore {
+	version: u32,
+	#[serde(default)]
+	upload_port: u16,
+	#[serde(default)]
+	devices: BTreeMap<ScannerId, PersistedDevice>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedDevice {
+	device_id: String,
+	token_sha256: String,
+	#[serde(default)]
+	profiles: Vec<ProfileKind>,
+	paired_at: u64,
+}
+
+impl Default for PersistedDeviceStore {
+	fn default() -> Self {
+		Self {
+			version: DEVICE_STORE_VERSION,
+			upload_port: 0,
+			devices: BTreeMap::new(),
+		}
+	}
+}
+
+impl From<&PairedDevice> for PersistedDevice {
+	fn from(device: &PairedDevice) -> Self {
+		Self {
+			device_id: device.device_id.clone(),
+			token_sha256: device.token_sha256.clone(),
+			profiles: device.profiles.clone(),
+			paired_at: device.paired_at,
+		}
+	}
+}
+
+impl From<PersistedDevice> for PairedDevice {
+	fn from(device: PersistedDevice) -> Self {
+		Self {
+			device_id: device.device_id,
+			token_sha256: device.token_sha256,
+			profiles: device.profiles,
+			paired_at: device.paired_at,
+		}
+	}
+}
+
+#[derive(Debug)]
+struct ListenerBinding {
+	port: u16,
+	bind_error: Option<String>,
+	_listener: Option<std::net::TcpListener>,
+}
+
+impl ListenerBinding {
+	fn is_bound(&self) -> bool {
+		self.bind_error.is_none()
 	}
 }
 
@@ -111,11 +182,6 @@ pub struct MobileBackend {
 	connect_timeout: Duration,
 	/// §4.2 step 4's 120 s, overridable for the same reason.
 	confirm_timeout: Duration,
-	/// What `pair_request.upload_port` carries: where the phone uploads from now on.
-	///
-	/// Zero until [`9.4`](PairedDevice) binds the shared listener and hands its port
-	/// here — a phone paired against a zero is paired but has nowhere to send, which is
-	/// exactly as far as this issue goes.
 	upload_port: u16,
 	/// What `pair_request.host_id` carries. Generated once per process, not persisted:
 	/// nothing on the wire needs it to survive a restart, only to be stable for the
@@ -128,6 +194,8 @@ pub struct MobileBackend {
 	discovered: Arc<Mutex<BTreeMap<ScannerId, DiscoveryRecord>>>,
 	/// What pairing issued, keyed by the scanner it belongs to.
 	paired: Arc<Mutex<BTreeMap<ScannerId, PairedDevice>>>,
+	store_path: Arc<PathBuf>,
+	listener: Arc<Mutex<ListenerBinding>>,
 }
 
 impl Default for MobileBackend {
@@ -138,22 +206,59 @@ impl Default for MobileBackend {
 
 impl MobileBackend {
 	pub fn new(discovery_timeout: Duration) -> Self {
+		Self::with_store_path(default_store_path(), discovery_timeout, 0)
+	}
+
+	pub fn with_store_path(
+		store_path: PathBuf,
+		discovery_timeout: Duration,
+		requested_upload_port: u16,
+	) -> Self {
+		let mut store = load_or_reset_store(&store_path);
+		let paired = store
+			.devices
+			.clone()
+			.into_iter()
+			.map(|(scanner_id, device)| (scanner_id, PairedDevice::from(device)))
+			.collect();
+		let configured_port = if requested_upload_port != 0 {
+			requested_upload_port
+		} else {
+			store.upload_port
+		};
+		let listener = bind_listener(configured_port);
+		let upload_port = listener.port;
+		if store.upload_port != upload_port {
+			store.upload_port = upload_port;
+			if let Err(error) = persist_device_store(&store_path, &store) {
+				warn!(path = %store_path.display(), %error, "could not persist mobile device store");
+			}
+		}
+
 		Self {
 			discovery_timeout,
 			connect_timeout: PAIR_CONNECT_TIMEOUT,
 			confirm_timeout: PAIR_CONFIRM_TIMEOUT,
-			upload_port: 0,
+			upload_port,
 			host_id: generate_host_id(),
 			host_name: host_name(),
 			discovered: Arc::new(Mutex::new(BTreeMap::new())),
-			paired: Arc::new(Mutex::new(BTreeMap::new())),
+			paired: Arc::new(Mutex::new(paired)),
+			store_path: Arc::new(store_path),
+			listener: Arc::new(Mutex::new(listener)),
 		}
 	}
 
-	/// The port `pair_request` advertises for uploads — [`9.4`](PairedDevice)'s listener.
-	pub fn with_upload_port(mut self, upload_port: u16) -> Self {
-		self.upload_port = upload_port;
-		self
+	/// The port `pair_request` advertises for uploads — the shared listener's port.
+	pub fn upload_port(&self) -> u16 {
+		self.upload_port
+	}
+
+	pub fn listener_is_bound(&self) -> bool {
+		self.listener
+			.lock()
+			.expect("mobile listener lock poisoned")
+			.is_bound()
 	}
 
 	/// Shortens the two handshake deadlines, for a test or a simulator run that should
@@ -173,7 +278,8 @@ impl MobileBackend {
 	/// whole of what `Unpair()` does to a device that is switched off.
 	pub fn is_authorized(&self, device_id: &str, token: &str) -> bool {
 		self.lock_paired().values().any(|device| {
-			device.device_id == device_id && constant_time_eq(&device.token, token)
+			device.device_id == device_id
+				&& constant_time_eq(&device.token_sha256, &hash_token(token))
 		})
 	}
 
@@ -188,11 +294,16 @@ impl MobileBackend {
 		scanner: &ScannerInfo,
 		progress: &mpsc::Sender<scanbus_core::PairingProgress>,
 	) -> Result<(), BackendError> {
-		if self.upload_port == 0 {
+		if !self.listener_is_bound() {
+			let detail = self
+				.listener
+				.lock()
+				.expect("mobile listener lock poisoned")
+				.bind_error
+				.clone()
+				.unwrap_or_else(|| "the mobile upload listener is down".to_owned());
 			return Err(BackendError::Other(
-				"mobile pairing is not configured yet: the daemon has no upload port to \
-				 advertise, so the phone refuses the pair_request"
-					.to_owned(),
+				format!("mobile pairing is unavailable: {detail}"),
 			));
 		}
 
@@ -290,14 +401,13 @@ impl MobileBackend {
 			));
 		}
 
-		self.lock_paired().insert(
-			scanner.id.clone(),
-			PairedDevice {
-				device_id: response.device_id,
-				token: response.token,
-				profiles: response.capabilities.profiles,
-			},
-		);
+		let device = PairedDevice {
+			device_id: response.device_id,
+			token_sha256: hash_token(&response.token),
+			profiles: response.capabilities.profiles,
+			paired_at: unix_timestamp_now(),
+		};
+		self.store_paired_device(&scanner.id, device)?;
 
 		Ok(())
 	}
@@ -331,6 +441,18 @@ impl MobileBackend {
 			.unwrap_or_default()
 	}
 
+	fn status_for(&self, scanner: &ScannerId) -> Status {
+		if self.lock_paired().contains_key(scanner) {
+			if self.listener_is_bound() {
+				Status::Online
+			} else {
+				Status::Offline
+			}
+		} else {
+			Status::Online
+		}
+	}
+
 	fn lock_discovered(&self) -> std::sync::MutexGuard<'_, BTreeMap<ScannerId, DiscoveryRecord>> {
 		self.discovered
 			.lock()
@@ -341,6 +463,33 @@ impl MobileBackend {
 		self.paired
 			.lock()
 			.expect("mobile paired device lock poisoned")
+	}
+
+	fn store_paired_device(
+		&self,
+		scanner_id: &ScannerId,
+		device: PairedDevice,
+	) -> Result<(), BackendError> {
+		let mut paired = self.lock_paired();
+		paired.insert(scanner_id.clone(), device);
+		if let Err(error) = self.persist_paired_locked(&paired) {
+			paired.remove(scanner_id);
+			return Err(BackendError::Other(error));
+		}
+		Ok(())
+	}
+
+	fn persist_paired_locked(
+		&self,
+		paired: &BTreeMap<ScannerId, PairedDevice>,
+	) -> Result<(), String> {
+		let mut store = load_or_reset_store(self.store_path.as_ref());
+		store.upload_port = self.upload_port;
+		store.devices = paired
+			.iter()
+			.map(|(scanner_id, device)| (scanner_id.clone(), PersistedDevice::from(device)))
+			.collect();
+		persist_device_store(self.store_path.as_ref(), &store)
 	}
 
 	async fn connect_to_record(
@@ -448,6 +597,7 @@ impl ScannerBackend for MobileBackend {
 			// to the daemon's full list at the next round would advertise a profile
 			// the app told us it cannot do.
 			info.capabilities.profiles = self.advertised_profiles(&info.id);
+			info.status = self.status_for(&info.id);
 			records.push((info.id.clone(), record));
 			scanners.push(info);
 		}
@@ -485,8 +635,20 @@ impl ScannerBackend for MobileBackend {
 	/// [`9.5`]: https://github.com/jeanparpaillon/scanbus_service/issues/44
 	async fn start_listening(
 		&self,
-		_scanner: &ScannerInfo,
+		scanner: &ScannerInfo,
 	) -> Result<BoxStream<'static, scanbus_core::ButtonPressedEvent>, BackendError> {
+		if self.lock_paired().contains_key(&scanner.id) && !self.listener_is_bound() {
+			let detail = self
+				.listener
+				.lock()
+				.expect("mobile listener lock poisoned")
+				.bind_error
+				.clone()
+				.unwrap_or_else(|| "the mobile upload listener is down".to_owned());
+			return Err(BackendError::Other(format!(
+				"mobile uploads are unavailable: {detail}"
+			)));
+		}
 		Ok(Box::pin(futures_util::stream::empty()))
 	}
 
@@ -502,7 +664,9 @@ impl ScannerBackend for MobileBackend {
 	/// The phone is not told: there is no channel to tell it on, and `Unpair()` has to
 	/// work with the phone switched off. It learns at its next upload.
 	async fn forget(&self, scanner_id: &ScannerId) -> Result<(), BackendError> {
-		if self.lock_paired().remove(scanner_id).is_some() {
+		let mut paired = self.lock_paired();
+		if paired.remove(scanner_id).is_some() {
+			self.persist_paired_locked(&paired).map_err(BackendError::Other)?;
 			debug!(scanner_id = %scanner_id, "mobile pairing revoked");
 		}
 		Ok(())
@@ -548,6 +712,23 @@ fn constant_time_eq(left: &str, right: &str) -> bool {
 			== 0
 }
 
+fn hash_token(token: &str) -> String {
+	let digest = Sha256::digest(token.as_bytes());
+	let mut out = String::with_capacity(digest.len() * 2);
+	for byte in digest {
+		use fmt::Write as _;
+		let _ = write!(out, "{byte:02x}");
+	}
+	out
+}
+
+fn unix_timestamp_now() -> u64 {
+	SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.map(|duration| duration.as_secs())
+		.unwrap_or(0)
+}
+
 /// A CSPRNG-drawn host identifier for `pair_request.host_id`.
 fn generate_host_id() -> String {
 	use fmt::Write as _;
@@ -571,6 +752,187 @@ fn host_name() -> String {
 		.map(|value| value.trim().to_owned())
 		.filter(|value| !value.is_empty())
 		.unwrap_or_else(|| "scanbus".to_owned())
+}
+
+fn default_store_path() -> PathBuf {
+	if let Some(data_home) = std::env::var_os("XDG_DATA_HOME") {
+		return PathBuf::from(data_home)
+			.join("scanbus")
+			.join("mobile")
+			.join("devices.json");
+	}
+
+	std::env::var_os("HOME")
+		.map(PathBuf::from)
+		.unwrap_or_else(|| PathBuf::from("."))
+		.join(".local")
+		.join("share")
+		.join("scanbus")
+		.join("mobile")
+		.join("devices.json")
+}
+
+fn load_or_reset_store(path: &Path) -> PersistedDeviceStore {
+	match load_store(path) {
+		Ok(store) => store,
+		Err(reason) => {
+			rename_store_aside(path, &reason);
+			PersistedDeviceStore::default()
+		}
+	}
+}
+
+fn load_store(path: &Path) -> Result<PersistedDeviceStore, String> {
+	if !path.exists() {
+		return Ok(PersistedDeviceStore::default());
+	}
+
+	let bytes = fs::read(path)
+		.map_err(|error| format!("cannot read mobile device store {}: {error}", path.display()))?;
+	let store: PersistedDeviceStore = serde_json::from_slice(&bytes).map_err(|error| {
+		format!(
+			"cannot parse mobile device store {}: {error}",
+			path.display()
+		)
+	})?;
+
+	if store.version != DEVICE_STORE_VERSION {
+		return Err(format!(
+			"mobile device store version {} is unsupported (expected {})",
+			store.version, DEVICE_STORE_VERSION
+		));
+	}
+
+	Ok(store)
+}
+
+fn rename_store_aside(path: &Path, reason: &str) {
+	if !path.exists() {
+		return;
+	}
+
+	let stamp = unix_timestamp_now();
+	let aside = path.with_extension(format!("json.unreadable.{stamp}"));
+	match fs::rename(path, &aside) {
+		Ok(()) => warn!(
+			from = %path.display(),
+			to = %aside.display(),
+			reason,
+			"mobile device store is unreadable; renamed aside and starting empty"
+		),
+		Err(error) => warn!(
+			path = %path.display(),
+			%error,
+			reason,
+			"mobile device store is unreadable; starting empty without renaming"
+		),
+	}
+}
+
+fn persist_device_store(path: &Path, store: &PersistedDeviceStore) -> Result<(), String> {
+	let parent = path
+		.parent()
+		.ok_or_else(|| format!("cannot resolve parent directory for {}", path.display()))?;
+	ensure_store_dir(parent)?;
+
+	let payload = serde_json::to_vec_pretty(store)
+		.map_err(|error| format!("cannot serialize mobile device store: {error}"))?;
+	let tmp = path.with_extension("json.tmp");
+	let mut file = OpenOptions::new()
+		.create(true)
+		.write(true)
+		.truncate(true)
+		.open(&tmp)
+		.map_err(|error| format!("cannot open temporary device store {}: {error}", tmp.display()))?;
+	file.write_all(&payload)
+		.map_err(|error| format!("cannot write temporary device store {}: {error}", tmp.display()))?;
+	file.sync_all()
+		.map_err(|error| format!("cannot fsync temporary device store {}: {error}", tmp.display()))?;
+	fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600)).map_err(|error| {
+		format!(
+			"cannot enforce mode 0600 on temporary device store {}: {error}",
+			tmp.display()
+		)
+	})?;
+
+	fs::rename(&tmp, path)
+		.map_err(|error| format!("cannot replace device store {}: {error}", path.display()))?;
+	let dir = File::open(parent)
+		.map_err(|error| format!("cannot open device store directory {}: {error}", parent.display()))?;
+	dir.sync_all().map_err(|error| {
+		format!(
+			"cannot fsync device store directory {} after rename: {error}",
+			parent.display()
+		)
+	})?;
+	fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|error| {
+		format!(
+			"cannot enforce mode 0600 on device store {}: {error}",
+			path.display()
+		)
+	})?;
+
+	Ok(())
+}
+
+fn ensure_store_dir(path: &Path) -> Result<(), String> {
+	if !path.exists() {
+		fs::create_dir_all(path).map_err(|error| {
+			format!(
+				"cannot create mobile device store directory {}: {error}",
+				path.display()
+			)
+		})?;
+	}
+
+	fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|error| {
+		format!(
+			"cannot enforce mode 0700 on mobile device store directory {}: {error}",
+			path.display()
+		)
+	})
+}
+
+fn bind_listener(requested_port: u16) -> ListenerBinding {
+	match bind_listener_once(requested_port) {
+		Ok((listener, port)) => ListenerBinding {
+			port,
+			bind_error: None,
+			_listener: Some(listener),
+		},
+		Err(error) => ListenerBinding {
+			port: requested_port,
+			bind_error: Some(error),
+			_listener: None,
+		},
+	}
+}
+
+fn bind_listener_once(requested_port: u16) -> Result<(std::net::TcpListener, u16), String> {
+	match std::net::TcpListener::bind((std::net::Ipv6Addr::UNSPECIFIED, requested_port)) {
+		Ok(listener) => {
+			let port = listener
+				.local_addr()
+				.map_err(|error| format!("could not read the bound IPv6 listener address: {error}"))?
+				.port();
+			Ok((listener, port))
+		}
+		Err(ipv6_error) => {
+			let listener =
+				std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, requested_port))
+					.map_err(|ipv4_error| {
+						format!(
+							"could not bind mobile upload listener on port {requested_port}: \
+							 IPv6: {ipv6_error}; IPv4 fallback: {ipv4_error}"
+						)
+					})?;
+			let port = listener
+				.local_addr()
+				.map_err(|error| format!("could not read the bound IPv4 listener address: {error}"))?
+				.port();
+			Ok((listener, port))
+		}
+	}
 }
 
 /// The six digits of §4.2 step 2: uniform over `000000`–`999999`, zero-padded.
@@ -1089,6 +1451,7 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
 mod tests {
 	use std::{io, pin::Pin, task::Poll};
 
+	use tempfile::TempDir;
 	use tokio::io::{AsyncRead, ReadBuf, duplex};
 	use tokio::net::TcpListener;
 
@@ -1215,9 +1578,9 @@ mod tests {
 
 	/// A backend that has just seen `address`, with the handshake deadlines shortened so
 	/// a timeout is observable inside a test.
-	fn backend_that_saw(address: &str) -> MobileBackend {
-		let backend = MobileBackend::default()
-			.with_upload_port(4242)
+	fn backend_that_saw(address: &str) -> (TempDir, MobileBackend) {
+		let tmp = TempDir::new().unwrap();
+		let backend = backend_in(&tmp)
 			.with_pairing_timeouts(Duration::from_millis(200), Duration::from_millis(200));
 		backend.remember(vec![(
 			scanner_id(),
@@ -1227,7 +1590,11 @@ mod tests {
 				seen_at: Instant::now(),
 			},
 		)]);
-		backend
+		(tmp, backend)
+	}
+
+	fn backend_in(tmp: &TempDir) -> MobileBackend {
+		MobileBackend::with_store_path(tmp.path().join("devices.json"), DISCOVERY_TIMEOUT, 0)
 	}
 
 	/// Runs one pairing and returns its outcome along with every progress step it sent.
@@ -1255,7 +1622,7 @@ mod tests {
 			device_id: DEVICE_ID,
 		})
 		.await;
-		let backend = backend_that_saw(&phone.address);
+		let (_tmp, backend) = backend_that_saw(&phone.address);
 
 		let (outcome, steps) = pair_with(&backend).await;
 		outcome.unwrap();
@@ -1288,7 +1655,7 @@ mod tests {
 			device_id: DEVICE_ID,
 		})
 		.await;
-		let backend = backend_that_saw(&phone.address);
+		let (_tmp, backend) = backend_that_saw(&phone.address);
 		pair_with(&backend).await.0.unwrap();
 
 		let mut info = scanner_info();
@@ -1306,7 +1673,7 @@ mod tests {
 	#[tokio::test]
 	async fn a_rejection_on_the_device_is_reported_as_such() {
 		let phone = FakePhone::listen(Answer::Reject).await;
-		let backend = backend_that_saw(&phone.address);
+		let (_tmp, backend) = backend_that_saw(&phone.address);
 
 		let (outcome, _) = pair_with(&backend).await;
 		assert_eq!(
@@ -1325,7 +1692,7 @@ mod tests {
 			device_id: "phone_deadbeef",
 		})
 		.await;
-		let backend = backend_that_saw(&phone.address);
+		let (_tmp, backend) = backend_that_saw(&phone.address);
 
 		let (outcome, _) = pair_with(&backend).await;
 		let message = outcome.unwrap_err().to_string();
@@ -1341,7 +1708,7 @@ mod tests {
 	#[tokio::test]
 	async fn silence_from_the_phone_ends_the_pairing_at_the_deadline() {
 		let phone = FakePhone::listen(Answer::Silence).await;
-		let backend = backend_that_saw(&phone.address);
+		let (_tmp, backend) = backend_that_saw(&phone.address);
 
 		let (outcome, steps) = pair_with(&backend).await;
 		let message = outcome.unwrap_err().to_string();
@@ -1364,7 +1731,8 @@ mod tests {
 	async fn dropping_the_pairing_closes_the_socket_the_app_is_waiting_on() {
 		let phone = FakePhone::listen(Answer::Silence).await;
 		// Long deadlines: what ends this pairing must be the abort, not a timeout.
-		let backend = backend_that_saw(&phone.address)
+		let (_tmp, backend) = backend_that_saw(&phone.address);
+		let backend = backend
 			.with_pairing_timeouts(PAIR_CONNECT_TIMEOUT, PAIR_CONFIRM_TIMEOUT);
 
 		let (tx, mut rx) = mpsc::channel(8);
@@ -1394,7 +1762,8 @@ mod tests {
 	/// address, and nothing opened.
 	#[tokio::test]
 	async fn pairing_a_phone_that_was_never_seen_is_not_reachable() {
-		let backend = MobileBackend::default();
+		let tmp = TempDir::new().unwrap();
+		let backend = backend_in(&tmp);
 
 		let (outcome, steps) = pair_with(&backend).await;
 		assert!(
@@ -1402,30 +1771,6 @@ mod tests {
 			"expected NotReachable, got {outcome:?}"
 		);
 		// No socket was opened, so no code was ever shown.
-		assert!(steps.is_empty());
-	}
-
-	#[tokio::test]
-	async fn pairing_refuses_to_start_without_an_upload_port() {
-		let backend = MobileBackend::default().with_pairing_timeouts(
-			Duration::from_millis(200),
-			Duration::from_millis(200),
-		);
-		backend.remember(vec![(
-			scanner_id(),
-			DiscoveryRecord {
-				device_id: DEVICE_ID.to_owned(),
-				address: "127.0.0.1:9".to_owned(),
-				seen_at: Instant::now(),
-			},
-		)]);
-
-		let (outcome, steps) = pair_with(&backend).await;
-		assert_eq!(
-			outcome.unwrap_err().to_string(),
-			"mobile pairing is not configured yet: the daemon has no upload port to \
-			 advertise, so the phone refuses the pair_request"
-		);
 		assert!(steps.is_empty());
 	}
 
@@ -1437,7 +1782,8 @@ mod tests {
 			device_id: DEVICE_ID,
 		})
 		.await;
-		let backend = MobileBackend::default();
+		let tmp = TempDir::new().unwrap();
+		let backend = backend_in(&tmp);
 		backend.lock_discovered().insert(
 			scanner_id(),
 			DiscoveryRecord {
@@ -1464,7 +1810,7 @@ mod tests {
 			device_id: DEVICE_ID,
 		})
 		.await;
-		let backend = backend_that_saw(&phone.address);
+		let (_tmp, backend) = backend_that_saw(&phone.address);
 		pair_with(&backend).await.0.unwrap();
 		assert!(backend.is_authorized(DEVICE_ID, "phone-token"));
 
@@ -1481,10 +1827,56 @@ mod tests {
 	async fn listening_to_a_phone_succeeds_and_yields_nothing() {
 		use futures_util::StreamExt as _;
 
-		let backend = MobileBackend::default();
+		let tmp = TempDir::new().unwrap();
+		let backend = backend_in(&tmp);
 		let mut events = backend.start_listening(&scanner_info()).await.unwrap();
 		assert!(events.next().await.is_none());
 		backend.stop_listening(&scanner_id()).await.unwrap();
+	}
+
+	#[test]
+	fn upload_port_is_chosen_once_and_persisted() {
+		let tmp = TempDir::new().unwrap();
+		let path = tmp.path().join("devices.json");
+
+		let first = MobileBackend::with_store_path(path.clone(), DISCOVERY_TIMEOUT, 0);
+		let first_port = first.upload_port();
+		assert!(first_port > 0);
+
+		drop(first);
+
+		let second = MobileBackend::with_store_path(path.clone(), DISCOVERY_TIMEOUT, 0);
+		assert_eq!(second.upload_port(), first_port);
+	}
+
+	#[tokio::test]
+	async fn device_store_hashes_the_token_and_uses_private_permissions() {
+		let tmp = TempDir::new().unwrap();
+		let path = tmp.path().join("devices.json");
+		let phone = FakePhone::listen(Answer::Accept {
+			device_id: DEVICE_ID,
+		})
+		.await;
+		let backend = MobileBackend::with_store_path(path.clone(), DISCOVERY_TIMEOUT, 0)
+			.with_pairing_timeouts(Duration::from_millis(200), Duration::from_millis(200));
+		backend.remember(vec![(
+			scanner_id(),
+			DiscoveryRecord {
+				device_id: DEVICE_ID.to_owned(),
+				address: phone.address,
+				seen_at: Instant::now(),
+			},
+		)]);
+
+		pair_with(&backend).await.0.unwrap();
+
+		let bytes = fs::read(&path).unwrap();
+		let text = String::from_utf8(bytes).unwrap();
+		assert!(!text.contains("phone-token"));
+		assert!(text.contains(&hash_token("phone-token")));
+
+		let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+		assert_eq!(mode, 0o600);
 	}
 
 	/// The nonce is the whole security value of the comparison: six digits, every one of
