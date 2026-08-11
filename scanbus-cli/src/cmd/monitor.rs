@@ -22,17 +22,19 @@ pub async fn run(context: &Context, prefix: Option<&str>) -> Result<u8> {
         .map_err(|error| Error::call("subscribing to /org/scanbus", error))?
         .build();
     let mut stream = context
-        .within(
-            "subscribing to /org/scanbus",
-            async { MessageStream::for_match_rule(rule, &connection, None).await.map_err(scanbus_client::Error::from) },
-        )
+        .within("subscribing to /org/scanbus", async {
+            MessageStream::for_match_rule(rule, &connection, None)
+                .await
+                .map_err(scanbus_client::Error::from)
+        })
         .await?;
 
     loop {
         let Some(message) = stream.next().await else {
             break;
         };
-        let message = message.map_err(|error| Error::call("reading /org/scanbus signals", error.into()))?;
+        let message =
+            message.map_err(|error| Error::call("reading /org/scanbus signals", error.into()))?;
         let header = message.header();
         let path = match header.path() {
             Some(path) => path.as_str().to_owned(),
@@ -56,25 +58,36 @@ pub async fn run(context: &Context, prefix: Option<&str>) -> Result<u8> {
             let Some(signal) = zbus::fdo::InterfacesAdded::from_message(message) else {
                 continue;
             };
-            let args = signal
-                .args()
-                .map_err(|error| Error::call("reading InterfacesAdded", scanbus_client::Error::Bus(error)))?;
-            print_added(context, args.object_path().as_str(), &args.interfaces_and_properties)?;
-        } else if interface == "org.freedesktop.DBus.ObjectManager" && member == "InterfacesRemoved" {
+            let args = signal.args().map_err(|error| {
+                Error::call("reading InterfacesAdded", scanbus_client::Error::Bus(error))
+            })?;
+            print_added(
+                context,
+                args.object_path().as_str(),
+                &args.interfaces_and_properties,
+            )?;
+        } else if interface == "org.freedesktop.DBus.ObjectManager" && member == "InterfacesRemoved"
+        {
             let Some(signal) = zbus::fdo::InterfacesRemoved::from_message(message) else {
                 continue;
             };
-            let args = signal
-                .args()
-                .map_err(|error| Error::call("reading InterfacesRemoved", scanbus_client::Error::Bus(error)))?;
+            let args = signal.args().map_err(|error| {
+                Error::call(
+                    "reading InterfacesRemoved",
+                    scanbus_client::Error::Bus(error),
+                )
+            })?;
             print_removed(context, args.object_path().as_str(), &args.interfaces)?;
         } else if interface == "org.freedesktop.DBus.Properties" && member == "PropertiesChanged" {
             let Some(signal) = zbus::fdo::PropertiesChanged::from_message(message) else {
                 continue;
             };
-            let args = signal
-                .args()
-                .map_err(|error| Error::call("reading PropertiesChanged", scanbus_client::Error::Bus(error)))?;
+            let args = signal.args().map_err(|error| {
+                Error::call(
+                    "reading PropertiesChanged",
+                    scanbus_client::Error::Bus(error),
+                )
+            })?;
             print_changed(
                 context,
                 &path,
@@ -193,7 +206,10 @@ fn value_json(value: &zbus::zvariant::Value<'_>) -> serde_json::Value {
 
 fn classify_interfaces<'a>(interfaces: impl Iterator<Item = &'a String>) -> &'static str {
     for interface in interfaces {
-        if interface == SCANNER_INTERFACE || interface == BUTTON_INTERFACE || interface == JOB_INTERFACE {
+        if interface == SCANNER_INTERFACE
+            || interface == BUTTON_INTERFACE
+            || interface == JOB_INTERFACE
+        {
             return interface_type(interface);
         }
     }

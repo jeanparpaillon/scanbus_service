@@ -115,11 +115,17 @@ async fn run(compiled_backends: Backends) -> Result<&'static str, Error> {
         Arc::new(JsonPairingStore::new()),
         Arc::clone(&profiles),
     );
-    let discovery = Arc::new(Discovery::new(compiled_backends.clone(), Arc::clone(&scanners)));
+    let discovery = Arc::new(Discovery::new(
+        compiled_backends.clone(),
+        Arc::clone(&scanners),
+    ));
 
     for kind in profiles.registered_profiles() {
         registry
-            .add(path::profile(kind), Profile1::new(kind, Arc::clone(&profiles)))
+            .add(
+                path::profile(kind),
+                Profile1::new(kind, Arc::clone(&profiles)),
+            )
             .await?;
     }
 

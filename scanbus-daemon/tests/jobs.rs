@@ -526,7 +526,8 @@ async fn document_profile_multi_page_false_reports_paths() {
     let feed = open_next_job(&daemon.handle(), JobRegistry::FIRST_ID);
     daemon.press(&info.id, 2);
     for index in 0..3 {
-        feed.page(jpeg_page(index, 20 + (index as u8) * 50)).unwrap();
+        feed.page(jpeg_page(index, 20 + (index as u8) * 50))
+            .unwrap();
     }
     let path = await_job(&client, &info.id, JobRegistry::FIRST_ID).await;
     let job = job_proxy(&client, &info.id, JobRegistry::FIRST_ID).await;

@@ -171,34 +171,34 @@ struct ListenerBinding {
 }
 
 struct MobileSubscription {
-	scanner_id: ScannerId,
-	subscriptions: Arc<Mutex<BTreeSet<ScannerId>>>,
+    scanner_id: ScannerId,
+    subscriptions: Arc<Mutex<BTreeSet<ScannerId>>>,
 }
 
 impl MobileSubscription {
-	fn new(scanner_id: ScannerId, subscriptions: Arc<Mutex<BTreeSet<ScannerId>>>) -> Self {
-		Self {
-			scanner_id,
-			subscriptions,
-		}
-	}
+    fn new(scanner_id: ScannerId, subscriptions: Arc<Mutex<BTreeSet<ScannerId>>>) -> Self {
+        Self {
+            scanner_id,
+            subscriptions,
+        }
+    }
 }
 
 impl Stream for MobileSubscription {
-	type Item = scanbus_core::ButtonPressedEvent;
+    type Item = scanbus_core::ButtonPressedEvent;
 
-	fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-		Poll::Pending
-	}
+    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Poll::Pending
+    }
 }
 
 impl Drop for MobileSubscription {
-	fn drop(&mut self) {
-		self.subscriptions
-			.lock()
-			.expect("mobile subscriptions lock poisoned")
-			.remove(&self.scanner_id);
-	}
+    fn drop(&mut self) {
+        self.subscriptions
+            .lock()
+            .expect("mobile subscriptions lock poisoned")
+            .remove(&self.scanner_id);
+    }
 }
 
 impl ListenerBinding {
@@ -226,10 +226,10 @@ pub struct MobileBackend {
     /// address for [`MobileBackend::pair`].
     discovered: Arc<Mutex<BTreeMap<ScannerId, DiscoveryRecord>>>,
     /// What pairing issued, keyed by the scanner it belongs to.
-	paired: Arc<Mutex<BTreeMap<ScannerId, PairedDevice>>>,
-	store_path: Arc<PathBuf>,
-	listener: Arc<Mutex<ListenerBinding>>,
-	subscriptions: Arc<Mutex<BTreeSet<ScannerId>>>,
+    paired: Arc<Mutex<BTreeMap<ScannerId, PairedDevice>>>,
+    store_path: Arc<PathBuf>,
+    listener: Arc<Mutex<ListenerBinding>>,
+    subscriptions: Arc<Mutex<BTreeSet<ScannerId>>>,
 }
 
 impl Default for MobileBackend {
@@ -283,13 +283,13 @@ impl MobileBackend {
             upload_port,
             host_id: generate_host_id(),
             host_name: host_name(),
-			discovered: Arc::new(Mutex::new(BTreeMap::new())),
-			paired: Arc::new(Mutex::new(paired)),
-			store_path: Arc::new(store_path),
-			listener: Arc::new(Mutex::new(listener)),
-			subscriptions: Arc::new(Mutex::new(BTreeSet::new())),
-		}
-	}
+            discovered: Arc::new(Mutex::new(BTreeMap::new())),
+            paired: Arc::new(Mutex::new(paired)),
+            store_path: Arc::new(store_path),
+            listener: Arc::new(Mutex::new(listener)),
+            subscriptions: Arc::new(Mutex::new(BTreeSet::new())),
+        }
+    }
 
     /// The port `pair_request` advertises for uploads — the shared listener's port.
     pub fn upload_port(&self) -> u16 {
@@ -303,21 +303,21 @@ impl MobileBackend {
             .is_bound()
     }
 
-	fn listener_error(&self) -> Option<String> {
+    fn listener_error(&self) -> Option<String> {
         self.listener
             .lock()
             .expect("mobile listener lock poisoned")
             .bind_error
-			.clone()
-	}
+            .clone()
+    }
 
-	#[cfg(test)]
-	fn has_subscription(&self, scanner_id: &ScannerId) -> bool {
-		self.subscriptions
-			.lock()
-			.expect("mobile subscriptions lock poisoned")
-			.contains(scanner_id)
-	}
+    #[cfg(test)]
+    fn has_subscription(&self, scanner_id: &ScannerId) -> bool {
+        self.subscriptions
+            .lock()
+            .expect("mobile subscriptions lock poisoned")
+            .contains(scanner_id)
+    }
 
     /// Shortens the two handshake deadlines, for a test or a simulator run that should
     /// not take two minutes to observe a timeout ([`9.6`]).
@@ -689,11 +689,11 @@ impl ScannerBackend for MobileBackend {
         self.pair(scanner, &progress).await
     }
 
-	/// A phone has no buttons to listen for, so this is a pending subscription rather
-	/// than a stream that ends.
-	///
-	/// It has to succeed: 1.4's sequence is `ensure_installed` → `start_listening` →
-	/// `Done`, so a backend that refuses here can never reach `Paired=true`, however
+    /// A phone has no buttons to listen for, so this is a pending subscription rather
+    /// than a stream that ends.
+    ///
+    /// It has to succeed: 1.4's sequence is `ensure_installed` → `start_listening` →
+    /// `Done`, so a backend that refuses here can never reach `Paired=true`, however
     /// well the handshake went. What a phone triggers a job with is an *upload*, not a
     /// button press ([`9.5`]), and the listener that receives one is a single shared
     /// socket ([`9.4`]) — neither belongs on this per-scanner button stream, and
@@ -701,37 +701,37 @@ impl ScannerBackend for MobileBackend {
     ///
     /// [`9.4`]: https://github.com/jeanparpaillon/scanbus_service/issues/43
     /// [`9.5`]: https://github.com/jeanparpaillon/scanbus_service/issues/44
-	async fn start_listening(
-		&self,
-		scanner: &ScannerInfo,
-	) -> Result<BoxStream<'static, scanbus_core::ButtonPressedEvent>, BackendError> {
+    async fn start_listening(
+        &self,
+        scanner: &ScannerInfo,
+    ) -> Result<BoxStream<'static, scanbus_core::ButtonPressedEvent>, BackendError> {
         if self.lock_paired().contains_key(&scanner.id) && !self.listener_is_bound() {
             let detail = self
                 .listener_error()
                 .unwrap_or_else(|| "the mobile upload listener is down".to_owned());
-			return Err(BackendError::Other(format!(
-				"mobile uploads are unavailable: {detail}"
-			)));
-		}
-		self.subscriptions
-			.lock()
-			.expect("mobile subscriptions lock poisoned")
-			.insert(scanner.id.clone());
-		Ok(Box::pin(MobileSubscription::new(
-			scanner.id.clone(),
-			Arc::clone(&self.subscriptions),
-		)))
-	}
+            return Err(BackendError::Other(format!(
+                "mobile uploads are unavailable: {detail}"
+            )));
+        }
+        self.subscriptions
+            .lock()
+            .expect("mobile subscriptions lock poisoned")
+            .insert(scanner.id.clone());
+        Ok(Box::pin(MobileSubscription::new(
+            scanner.id.clone(),
+            Arc::clone(&self.subscriptions),
+        )))
+    }
 
-	/// Nothing per-scanner is listening, so there is nothing to stop — and the trait
-	/// requires the no-op case to be `Ok(())`, not an error.
-	async fn stop_listening(&self, scanner_id: &ScannerId) -> Result<(), BackendError> {
-		self.subscriptions
-			.lock()
-			.expect("mobile subscriptions lock poisoned")
-			.remove(scanner_id);
-		Ok(())
-	}
+    /// Nothing per-scanner is listening, so there is nothing to stop — and the trait
+    /// requires the no-op case to be `Ok(())`, not an error.
+    async fn stop_listening(&self, scanner_id: &ScannerId) -> Result<(), BackendError> {
+        self.subscriptions
+            .lock()
+            .expect("mobile subscriptions lock poisoned")
+            .remove(scanner_id);
+        Ok(())
+    }
 
     async fn restore_disposition(&self, scanner: &ScannerInfo) -> RestoreDisposition {
         if self.lock_paired().contains_key(&scanner.id) {
@@ -1942,43 +1942,43 @@ mod tests {
         backend.forget(&scanner_id()).await.unwrap();
     }
 
-	/// A phone has no buttons, but pairing still has to reach `Done`, so this is a
-	/// pending subscription and not the refusal it was before 9.3.
-	#[tokio::test]
-	async fn listening_to_a_phone_succeeds_and_stays_registered_until_dropped() {
-		use futures_util::StreamExt as _;
+    /// A phone has no buttons, but pairing still has to reach `Done`, so this is a
+    /// pending subscription and not the refusal it was before 9.3.
+    #[tokio::test]
+    async fn listening_to_a_phone_succeeds_and_stays_registered_until_dropped() {
+        use futures_util::StreamExt as _;
 
-		let tmp = TempDir::new().unwrap();
-		let backend = backend_in(&tmp);
-		let mut events = backend.start_listening(&scanner_info()).await.unwrap();
-		assert!(backend.has_subscription(&scanner_id()));
-		assert!(
-			tokio::time::timeout(Duration::from_millis(50), events.next())
-				.await
-				.is_err(),
-			"a mobile subscription should stay pending, not end immediately"
-		);
+        let tmp = TempDir::new().unwrap();
+        let backend = backend_in(&tmp);
+        let mut events = backend.start_listening(&scanner_info()).await.unwrap();
+        assert!(backend.has_subscription(&scanner_id()));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), events.next())
+                .await
+                .is_err(),
+            "a mobile subscription should stay pending, not end immediately"
+        );
 
-		drop(events);
-		assert!(!backend.has_subscription(&scanner_id()));
-		backend.stop_listening(&scanner_id()).await.unwrap();
-	}
+        drop(events);
+        assert!(!backend.has_subscription(&scanner_id()));
+        backend.stop_listening(&scanner_id()).await.unwrap();
+    }
 
-	#[tokio::test]
-	async fn stop_listening_deregisters_a_mobile_subscription() {
-		let phone = FakePhone::listen(Answer::Accept {
-			device_id: DEVICE_ID,
-		})
-		.await;
-		let (_tmp, backend) = backend_that_saw(&phone.address);
-		pair_with(&backend).await.0.unwrap();
+    #[tokio::test]
+    async fn stop_listening_deregisters_a_mobile_subscription() {
+        let phone = FakePhone::listen(Answer::Accept {
+            device_id: DEVICE_ID,
+        })
+        .await;
+        let (_tmp, backend) = backend_that_saw(&phone.address);
+        pair_with(&backend).await.0.unwrap();
 
-		let _subscription = backend.start_listening(&scanner_info()).await.unwrap();
-		assert!(backend.has_subscription(&scanner_id()));
+        let _subscription = backend.start_listening(&scanner_info()).await.unwrap();
+        assert!(backend.has_subscription(&scanner_id()));
 
-		backend.stop_listening(&scanner_id()).await.unwrap();
-		assert!(!backend.has_subscription(&scanner_id()));
-	}
+        backend.stop_listening(&scanner_id()).await.unwrap();
+        assert!(!backend.has_subscription(&scanner_id()));
+    }
 
     #[test]
     fn upload_port_is_chosen_once_and_persisted() {

@@ -224,7 +224,10 @@ impl Daemon {
 
         for kind in profiles.registered_profiles() {
             objects
-                .add(path::profile(kind), Profile1::new(kind, Arc::clone(&profiles)))
+                .add(
+                    path::profile(kind),
+                    Profile1::new(kind, Arc::clone(&profiles)),
+                )
                 .await
                 .unwrap();
         }

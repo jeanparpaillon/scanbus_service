@@ -22,9 +22,7 @@ use scanbus_core::{
 };
 use scanbus_daemon::backends::RankedBackend;
 use scanbus_daemon::dbus::{self, BUS_NAME, Manager1, ObjectRegistry, Profile1, path};
-use scanbus_daemon::{
-    Backends, Discovery, MemoryPairingStore, ProfileRegistry, ScannerRegistry,
-};
+use scanbus_daemon::{Backends, Discovery, MemoryPairingStore, ProfileRegistry, ScannerRegistry};
 use zbus::fdo::{ObjectManagerProxy, PropertiesChangedStream, PropertiesProxy};
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value as ZValue};
 
@@ -101,7 +99,10 @@ impl Daemon {
 
         for kind in profiles.registered_profiles() {
             objects
-                .add(path::profile(kind), Profile1::new(kind, Arc::clone(&profiles)))
+                .add(
+                    path::profile(kind),
+                    Profile1::new(kind, Arc::clone(&profiles)),
+                )
                 .await
                 .unwrap();
         }

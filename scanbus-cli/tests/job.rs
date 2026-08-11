@@ -217,14 +217,20 @@ async fn serve_for_watch(address: &str) -> zbus::Connection {
     let spawned = connection.clone();
     tokio::spawn(async move {
         sleep(Duration::from_millis(50)).await;
-        spawned.object_server().at(JOB_PATH, Job::new()).await.unwrap();
+        spawned
+            .object_server()
+            .at(JOB_PATH, Job::new())
+            .await
+            .unwrap();
 
         sleep(Duration::from_millis(50)).await;
         let iface: InterfaceRef<Job> = spawned.object_server().interface(JOB_PATH).await.unwrap();
         {
             let job = iface.get().await;
             *job.page_count.lock().unwrap() = 2;
-            job.page_count_changed(iface.signal_emitter()).await.unwrap();
+            job.page_count_changed(iface.signal_emitter())
+                .await
+                .unwrap();
         }
 
         sleep(Duration::from_millis(50)).await;
@@ -265,13 +271,22 @@ async fn job_list_and_show_report_jobs_with_button_context() {
     };
     let _daemon = serve(bus.address()).await;
 
-    let jobs = bus.scanbus(&["--json", "job", "list"]).assert_code(0).json();
+    let jobs = bus
+        .scanbus(&["--json", "job", "list"])
+        .assert_code(0)
+        .json();
     assert_eq!(jobs.as_array().unwrap().len(), 1);
-    assert_eq!(jobs[0]["Scanner"], format!("/org/scanbus/scanner/{SCANNER}"));
+    assert_eq!(
+        jobs[0]["Scanner"],
+        format!("/org/scanbus/scanner/{SCANNER}")
+    );
     assert_eq!(jobs[0]["State"], "receiving");
     assert_eq!(jobs[0]["PageCount"], 1);
 
-    let show = bus.scanbus(&["--json", "job", "show", "7"]).assert_code(0).json();
+    let show = bus
+        .scanbus(&["--json", "job", "show", "7"])
+        .assert_code(0)
+        .json();
     assert_eq!(show["ButtonDeviceLabel"], "Scan to OCR");
     assert_eq!(show["ButtonLabelDivergesFromProfile"], true);
     assert_eq!(show["Profile"], "document");
@@ -292,8 +307,14 @@ async fn job_watch_until_done_streams_the_job_lifecycle() {
     assert!(events.len() >= 4, "{events:?}");
     assert_eq!(events[0]["State"], "receiving");
     assert_eq!(events[0]["PageCount"], 1);
-    assert!(events.iter().any(|event| event["PageCount"] == 2), "{events:?}");
-    assert!(events.iter().any(|event| event["State"] == "processing"), "{events:?}");
+    assert!(
+        events.iter().any(|event| event["PageCount"] == 2),
+        "{events:?}"
+    );
+    assert!(
+        events.iter().any(|event| event["State"] == "processing"),
+        "{events:?}"
+    );
     assert_eq!(events.last().unwrap()["State"], "done");
     assert_eq!(events.last().unwrap()["Result"]["path"], "/tmp/scan.pdf");
 }

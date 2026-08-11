@@ -134,7 +134,10 @@ impl Scanner {
         self.pair_calls.fetch_add(1, Ordering::SeqCst);
 
         if *self.paired.lock().unwrap() {
-            return Err(MockError::AlreadyPaired(format!("{} is already paired", self.id)));
+            return Err(MockError::AlreadyPaired(format!(
+                "{} is already paired",
+                self.id
+            )));
         }
 
         let state = match self.behaviour {
@@ -143,7 +146,8 @@ impl Scanner {
                 "done"
             }
             Behaviour::FailsInstantly => {
-                *self.pairing_error.lock().unwrap() = "brscan4 has no package for this arch".to_owned();
+                *self.pairing_error.lock().unwrap() =
+                    "brscan4 has no package for this arch".to_owned();
                 "failed"
             }
             Behaviour::NeverFinishes => "pairing",
@@ -162,7 +166,10 @@ impl Scanner {
         Ok(())
     }
 
-    async fn cancel_pairing(&self, #[zbus(signal_emitter)] emitter: SignalEmitter<'_>) -> Result<(), MockError> {
+    async fn cancel_pairing(
+        &self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> Result<(), MockError> {
         self.cancel_calls.fetch_add(1, Ordering::SeqCst);
         *self.pairing_state.lock().unwrap() = "none".to_owned();
         self.pairing_state_changed(&emitter).await.ok();
@@ -238,7 +245,12 @@ async fn fixture(
     id: &'static str,
     paired: bool,
     behaviour: Behaviour,
-) -> Option<(PrivateBus, zbus::Connection, Arc<AtomicUsize>, Arc<AtomicUsize>)> {
+) -> Option<(
+    PrivateBus,
+    zbus::Connection,
+    Arc<AtomicUsize>,
+    Arc<AtomicUsize>,
+)> {
     let bus = PrivateBus::start()?;
     let (daemon, pair_calls, cancel_calls) = serve(bus.address(), id, paired, behaviour).await;
     Some((bus, daemon, pair_calls, cancel_calls))
@@ -248,7 +260,8 @@ async fn fixture(
 /// still reports `done` and exits 0 — the race described in scanbus-cli.md §7 is closed.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pairing_that_finishes_instantly_still_reports_done() {
-    let Some((bus, _daemon, ..)) = fixture(UNPAIRED, false, Behaviour::SucceedsInstantly).await else {
+    let Some((bus, _daemon, ..)) = fixture(UNPAIRED, false, Behaviour::SucceedsInstantly).await
+    else {
         return skipped("a_pairing_that_finishes_instantly_still_reports_done");
     };
 
@@ -327,7 +340,8 @@ async fn unpair_with_yes_calls_the_method() {
 /// `unpair` on a scanner that is not paired is exit 7.
 #[tokio::test(flavor = "multi_thread")]
 async fn unpair_not_paired_exits_seven() {
-    let Some((bus, _daemon, ..)) = fixture(UNPAIRED, false, Behaviour::SucceedsInstantly).await else {
+    let Some((bus, _daemon, ..)) = fixture(UNPAIRED, false, Behaviour::SucceedsInstantly).await
+    else {
         return skipped("unpair_not_paired_exits_seven");
     };
 

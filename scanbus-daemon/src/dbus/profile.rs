@@ -29,7 +29,11 @@ impl Profile1 {
     /// Profile defaults this daemon applies for this profile kind.
     #[zbus(property)]
     async fn options(&self) -> Dict {
-        let options = self.profiles.options_for(self.kind).await.unwrap_or_default();
+        let options = self
+            .profiles
+            .options_for(self.kind)
+            .await
+            .unwrap_or_default();
         convert::dict(options.iter().map(|(key, value)| (key.clone(), value)))
     }
 

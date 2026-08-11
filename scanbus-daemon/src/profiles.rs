@@ -337,7 +337,8 @@ impl ProfileProcessor for DocumentProcessor {
             out_paths.push(path.to_string_lossy().to_string());
         } else {
             for (index, page) in spooled.iter().enumerate() {
-                let path = unique_path(output_dir.join(format!("scan-{stamp}-p{:03}.pdf", index + 1)));
+                let path =
+                    unique_path(output_dir.join(format!("scan-{stamp}-p{:03}.pdf", index + 1)));
                 write_pdf_document(std::slice::from_ref(page), &path)?;
                 out_paths.push(path.to_string_lossy().to_string());
             }
@@ -355,8 +356,9 @@ fn write_pdf_document(pages: &[SpoolPage], output_path: &Path) -> Result<(), Str
     for (index, page) in pages.iter().enumerate() {
         let image_name = format!("Im{}", index + 1);
         let image_object_name = Object::Name(image_name.as_bytes().to_vec());
-        let image_bytes = fs::read(&page.path)
-            .map_err(|error| format!("cannot read spooled page {}: {error}", page.path.display()))?;
+        let image_bytes = fs::read(&page.path).map_err(|error| {
+            format!("cannot read spooled page {}: {error}", page.path.display())
+        })?;
 
         let image_stream = Stream::new(
             dictionary! {
@@ -392,12 +394,15 @@ fn write_pdf_document(pages: &[SpoolPage], output_path: &Path) -> Result<(), Str
                 Operation::new("Q", vec![]),
             ],
         };
-        let content_stream = Stream::new(dictionary! {}, content.encode().map_err(|error| {
-            format!(
-                "cannot encode PDF content stream for page {}: {error}",
-                index + 1
-            )
-        })?);
+        let content_stream = Stream::new(
+            dictionary! {},
+            content.encode().map_err(|error| {
+                format!(
+                    "cannot encode PDF content stream for page {}: {error}",
+                    index + 1
+                )
+            })?,
+        );
         let content_id = doc.add_object(content_stream);
 
         let resources = dictionary! {
@@ -433,8 +438,12 @@ fn write_pdf_document(pages: &[SpoolPage], output_path: &Path) -> Result<(), Str
     });
     doc.trailer.set("Root", Object::Reference(catalog_id));
 
-    doc.save(output_path)
-        .map_err(|error| format!("cannot write document to {}: {error}", output_path.display()))?;
+    doc.save(output_path).map_err(|error| {
+        format!(
+            "cannot write document to {}: {error}",
+            output_path.display()
+        )
+    })?;
 
     Ok(())
 }
@@ -526,11 +535,13 @@ fn sweep_spool_root(root: &Path) -> Result<(), String> {
             .map_err(|error| format!("cannot read spool root entry {}: {error}", root.display()))?;
         let path = entry.path();
         if path.is_dir() {
-            fs::remove_dir_all(&path)
-                .map_err(|error| format!("cannot remove stale spool {}: {error}", path.display()))?;
+            fs::remove_dir_all(&path).map_err(|error| {
+                format!("cannot remove stale spool {}: {error}", path.display())
+            })?;
         } else {
-            fs::remove_file(&path)
-                .map_err(|error| format!("cannot remove stale spool file {}: {error}", path.display()))?;
+            fs::remove_file(&path).map_err(|error| {
+                format!("cannot remove stale spool file {}: {error}", path.display())
+            })?;
         }
     }
 
@@ -1079,7 +1090,10 @@ mod tests {
 
         let width_pt = as_f32(&media_box[2]).unwrap();
         let height_pt = as_f32(&media_box[3]).unwrap();
-        assert!((width_pt - 72.0).abs() < 0.2, "unexpected width: {width_pt}");
+        assert!(
+            (width_pt - 72.0).abs() < 0.2,
+            "unexpected width: {width_pt}"
+        );
         assert!(
             (height_pt - 144.0).abs() < 0.2,
             "unexpected height: {height_pt}"

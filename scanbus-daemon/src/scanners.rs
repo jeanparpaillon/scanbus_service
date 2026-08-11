@@ -70,7 +70,7 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use scanbus_core::{
-    ButtonInfo, PairingMachine, PairingStore, PairingState, ProfileKind, Restorable,
+    ButtonInfo, PairingMachine, PairingState, PairingStore, ProfileKind, Restorable,
     RestoreDisposition, ScannerBackend, ScannerId, ScannerInfo, Status,
 };
 use tokio::sync::Mutex;
@@ -439,7 +439,11 @@ impl ScannerRegistry {
         };
 
         if let Err(error) = self
-            .register_persistent_with_state(Arc::clone(&backend), entry.scanner.clone(), state.clone())
+            .register_persistent_with_state(
+                Arc::clone(&backend),
+                entry.scanner.clone(),
+                state.clone(),
+            )
             .await
         {
             warn!(%id, %error, "could not publish a restored scanner");

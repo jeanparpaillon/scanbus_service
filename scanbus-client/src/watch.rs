@@ -321,7 +321,9 @@ impl Stream for ScannerAdditions {
             };
 
             let dict = to_dict(properties);
-            return Poll::Ready(Some(ScannerState::from_properties(&dict).map_err(Error::from)));
+            return Poll::Ready(Some(
+                ScannerState::from_properties(&dict).map_err(Error::from),
+            ));
         }
     }
 }

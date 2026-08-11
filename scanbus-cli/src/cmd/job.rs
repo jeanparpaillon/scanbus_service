@@ -169,7 +169,11 @@ fn detail(objects: &Objects, job: &JobView) -> JobDetail {
     }
 }
 
-async fn fetch_job(context: &Context, connection: &Connection, path: &str) -> Result<Option<JobView>> {
+async fn fetch_job(
+    context: &Context,
+    connection: &Connection,
+    path: &str,
+) -> Result<Option<JobView>> {
     match read_job(context, connection, path).await {
         Ok(job) => Ok(Some(job)),
         Err(error) if is_gone(&error) => Ok(None),
@@ -205,7 +209,8 @@ async fn read_job(context: &Context, connection: &Connection, path: &str) -> Res
             proxy.get_all(interface).await.map_err(ClientError::from)
         })
         .await?;
-    let path_value = OwnedObjectPath::try_from(path.to_owned()).expect("job path from the bus is valid");
+    let path_value =
+        OwnedObjectPath::try_from(path.to_owned()).expect("job path from the bus is valid");
     JobView::from_properties(path_value, &properties)
 }
 
@@ -241,40 +246,41 @@ fn report_show(context: &Context, detail: &JobDetail) -> Result<()> {
         Format::Json => {
             let mut value = detail.job.json();
             value["ButtonDeviceLabel"] = serde_json::Value::String(detail.button_label.clone());
-            value["ButtonLabelDivergesFromProfile"] = serde_json::Value::Bool(detail.label_diverges);
+            value["ButtonLabelDivergesFromProfile"] =
+                serde_json::Value::Bool(detail.label_diverges);
             output::json(&mut stdout, &value)
         }
-        Format::Human => {
-            output::fields(
-                &mut stdout,
-                context.style,
-                &[
-                    ("path", detail.job.path.as_str().to_owned()),
-                    ("scanner", detail.job.scanner.clone()),
-                    ("button", detail.job.button.to_string()),
-                    ("button label", detail.button_label.clone()),
-                    ("profile", detail.job.profile.clone()),
-                    (
-                        "label/profile",
-                        if detail.label_diverges {
-                            "diverges".to_owned()
-                        } else {
-                            String::new()
-                        },
-                    ),
-                    ("state", detail.job.state.as_str().to_owned()),
-                    ("pages", detail.job.page_count.to_string()),
-                    ("error", detail.job.state.error().to_owned()),
-                    ("result", render_result(&detail.job.result)),
-                ],
-            )
-        }
+        Format::Human => output::fields(
+            &mut stdout,
+            context.style,
+            &[
+                ("path", detail.job.path.as_str().to_owned()),
+                ("scanner", detail.job.scanner.clone()),
+                ("button", detail.job.button.to_string()),
+                ("button label", detail.button_label.clone()),
+                ("profile", detail.job.profile.clone()),
+                (
+                    "label/profile",
+                    if detail.label_diverges {
+                        "diverges".to_owned()
+                    } else {
+                        String::new()
+                    },
+                ),
+                ("state", detail.job.state.as_str().to_owned()),
+                ("pages", detail.job.page_count.to_string()),
+                ("error", detail.job.state.error().to_owned()),
+                ("result", render_result(&detail.job.result)),
+            ],
+        ),
     }
 }
 
 fn list_row(job: &JobView) -> Vec<String> {
     vec![
-        job_follow::short_id(&job.path).map(|id| id.to_string()).unwrap_or_default(),
+        job_follow::short_id(&job.path)
+            .map(|id| id.to_string())
+            .unwrap_or_default(),
         job.scanner.clone(),
         job.button.to_string(),
         empty_raw(&job.profile),
@@ -331,7 +337,9 @@ fn start_watch(
         let Ok(path_value) = OwnedObjectPath::try_from(path.clone()) else {
             return;
         };
-        let Ok(watch) = PropertyWatch::subscribe(&connection, path_value.clone(), JOB_INTERFACE).await else {
+        let Ok(watch) =
+            PropertyWatch::subscribe(&connection, path_value.clone(), JOB_INTERFACE).await
+        else {
             return;
         };
         let Ok((snapshot, mut changes)) = watch.snapshot().await else {

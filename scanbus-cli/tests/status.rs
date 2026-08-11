@@ -155,7 +155,11 @@ async fn a_stub_command_says_which_issue_implements_it() {
 
     let run = bus.scanbus(&["profile", "list"]);
     run.assert_code(1);
-    assert!(run.stderr.contains("scanbus profile list"), "{}", run.stderr);
+    assert!(
+        run.stderr.contains("scanbus profile list"),
+        "{}",
+        run.stderr
+    );
     assert!(run.stderr.contains("8.10"), "{}", run.stderr);
 }
 

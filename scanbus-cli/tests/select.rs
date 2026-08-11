@@ -227,7 +227,8 @@ async fn the_id_flag_refuses_a_name_that_would_otherwise_resolve() {
     assert!(run.stderr.contains("no scanner matches"), "{}", run.stderr);
 
     // A unique id prefix and the object path are refused by `--id` too; the id is not.
-    bus.scanbus(&["connect", "--id", "escl_avahi"]).assert_code(4);
+    bus.scanbus(&["connect", "--id", "escl_avahi"])
+        .assert_code(4);
     bus.scanbus(&["connect", "--id", &format!("/org/scanbus/scanner/{ESCL}")])
         .assert_code(4);
     bus.scanbus(&["connect", "--id", ESCL]).assert_code(1);

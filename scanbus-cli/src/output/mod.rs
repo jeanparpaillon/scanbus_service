@@ -172,9 +172,13 @@ pub fn table(
     writeln!(writer, "{}", style.bold(&header)).map_err(Error::write)?;
 
     for row in rows {
-        let cells = row
-            .iter()
-            .map(|cell| if cell.is_empty() { EMPTY } else { cell.as_str() });
+        let cells = row.iter().map(|cell| {
+            if cell.is_empty() {
+                EMPTY
+            } else {
+                cell.as_str()
+            }
+        });
         writeln!(writer, "{}", pad(cells, &widths)).map_err(Error::write)?;
     }
 

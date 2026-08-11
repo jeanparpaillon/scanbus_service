@@ -31,12 +31,10 @@ impl ProfileResult {
             Self::Document { paths } if paths.len() == 1 => {
                 BTreeMap::from([("path".to_owned(), Value::Str(paths[0].clone()))])
             }
-            Self::Document { paths } => {
-                BTreeMap::from([(
-                    "paths".to_owned(),
-                    Value::Array(paths.iter().cloned().map(Value::Str).collect()),
-                )])
-            }
+            Self::Document { paths } => BTreeMap::from([(
+                "paths".to_owned(),
+                Value::Array(paths.iter().cloned().map(Value::Str).collect()),
+            )]),
         }
     }
 }

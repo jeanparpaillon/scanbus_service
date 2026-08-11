@@ -270,8 +270,8 @@ fn load(path: &Path) -> Result<PersistedStore, String> {
         return Ok(PersistedStore::default());
     }
 
-    let bytes = fs::read(path)
-        .map_err(|error| format!("cannot read store {}: {error}", path.display()))?;
+    let bytes =
+        fs::read(path).map_err(|error| format!("cannot read store {}: {error}", path.display()))?;
     let loaded: PersistedStore = serde_json::from_slice(&bytes)
         .map_err(|error| format!("cannot parse store {}: {error}", path.display()))?;
 
@@ -424,7 +424,10 @@ mod tests {
         let entry = loaded.scanners.get(&scanner().id).unwrap();
         assert_eq!(entry.scanner, scanner());
         assert_eq!(entry.default_profile, Some(ProfileKind::Image));
-        assert_eq!(entry.buttons.get(&2).unwrap().profile, Some(ProfileKind::Document));
+        assert_eq!(
+            entry.buttons.get(&2).unwrap().profile,
+            Some(ProfileKind::Document)
+        );
     }
 
     #[tokio::test]
@@ -453,6 +456,10 @@ mod tests {
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| n.starts_with("pairings.json.unreadable."))
         }));
-        assert!(entries.iter().any(|p| p.file_name().and_then(|n| n.to_str()) == Some("pairings.json")));
+        assert!(
+            entries
+                .iter()
+                .any(|p| p.file_name().and_then(|n| n.to_str()) == Some("pairings.json"))
+        );
     }
 }
