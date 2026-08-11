@@ -1,0 +1,17 @@
+[Unit]
+Description=Scanbus document scanner service
+Requires=dbus.socket
+After=dbus.socket
+StartLimitIntervalSec=30
+StartLimitBurst=5
+
+[Service]
+Type=dbus
+BusName=org.scanbus
+ExecStart=/usr/bin/scanbus-daemon
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=45
+
+[Install]
+WantedBy=default.target
