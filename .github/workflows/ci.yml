@@ -65,9 +65,9 @@ jobs:
 
       # The backend crates only ever reach the daemon through these features, so this
       # is the one build that links them.
-      - run: cargo build -p scanbus-daemon --features brother,hplip --locked
+      - run: cargo build -p scanbus-daemon --features brother,hplip,mobile --locked
 
-      - run: cargo clippy -p scanbus-daemon --features brother,hplip --all-targets --locked -- -D warnings
+      - run: cargo clippy -p scanbus-daemon --features brother,hplip,mobile --all-targets --locked -- -D warnings
 
       # `cargo test` compiles the mock backend for core's own tests, but only this
       # feature exports it as a public module — which is how the daemon's tests get at

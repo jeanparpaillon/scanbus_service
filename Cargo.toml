@@ -7,15 +7,17 @@ members = [
     "scanbus-daemon",
     "scanbus-backend-brother",
     "scanbus-backend-hplip",
+    "scanbus-backend-mobile",
 ]
-# `cargo build` with no `--workspace` builds only these four. The backend crates are
-# reachable through the daemon's `brother` / `hplip` features, so the default build
-# never compiles hardware-specific code — see scanbus-daemon/Cargo.toml.
+# `cargo build` with no `--workspace` builds these five members. The mobile backend is
+# a pure protocol crate that CI can exercise without hardware, so it is compiled by
+# default; hardware-specific backends stay opt-in through daemon features.
 default-members = [
     "scanbus-core",
     "scanbus-client",
     "scanbus-cli",
     "scanbus-daemon",
+    "scanbus-backend-mobile",
 ]
 
 [workspace.package]
@@ -34,6 +36,7 @@ scanbus-core = { path = "scanbus-core", version = "0.1.0" }
 scanbus-client = { path = "scanbus-client", version = "0.1.0" }
 scanbus-backend-brother = { path = "scanbus-backend-brother", version = "0.1.0" }
 scanbus-backend-hplip = { path = "scanbus-backend-hplip", version = "0.1.0" }
+scanbus-backend-mobile = { path = "scanbus-backend-mobile", version = "0.1.0" }
 
 async-trait = "0.1"
 # The CLI's only non-scanbus surface of its own. `derive` is not enabled here: the

@@ -13,6 +13,7 @@ This application implements scanbus D-Bus API, as described in
 | `scanbus-daemon` | The binary: D-Bus service, registry, persistence, profile pipeline |
 | `scanbus-backend-brother` | Brother backend (`brscan4`/`brscan5` + `brscan-skey`) |
 | `scanbus-backend-hplip` | HP backend (HPLIP walk-up, `hpssd`) |
+| `scanbus-backend-mobile` | Mobile protocol backend |
 
 The dependency direction is one-way: backends and `scanbus-client` depend on
 `scanbus-core`, the daemon depends on the backends, and nothing depends on the daemon.
@@ -37,7 +38,7 @@ packages match that compiler.
 ```sh
 cargo build                                     # core + client + daemon, no backend
 cargo build --workspace                         # everything, including the backend crates
-cargo build -p scanbus-daemon --features brother,hplip   # daemon with the backends linked
+cargo build -p scanbus-daemon --features brother,hplip,mobile   # daemon with the backends linked
 ```
 
 Both backends are behind cargo features and off by default, because both shell out to
