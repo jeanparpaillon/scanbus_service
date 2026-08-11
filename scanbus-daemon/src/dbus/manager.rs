@@ -18,12 +18,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use scanbus_core::ProfileKind;
 use tracing::{info, instrument};
 use zbus::fdo;
 use zbus::zvariant::{OwnedValue, Value};
 
 use crate::discovery::Discovery;
+use crate::profiles::ProfileRegistry;
 
 /// The `filters` key of §2: `{"backends": ["sane","avahi"]}`.
 const BACKENDS_FILTER: &str = "backends";
@@ -31,12 +31,16 @@ const BACKENDS_FILTER: &str = "backends";
 /// The `org.scanbus.Manager1` object of §2.
 pub struct Manager1 {
     discovery: Arc<Discovery>,
+    profiles: Arc<ProfileRegistry>,
 }
 
 impl Manager1 {
     /// A manager driving `discovery`.
-    pub fn new(discovery: Arc<Discovery>) -> Self {
-        Self { discovery }
+    pub fn new(discovery: Arc<Discovery>, profiles: Arc<ProfileRegistry>) -> Self {
+        Self {
+            discovery,
+            profiles,
+        }
     }
 }
 
@@ -75,24 +79,12 @@ impl Manager1 {
     /// The profile types this daemon can actually run.
     ///
     /// `["image","document"]` in this iteration, not the four of §2: advertising `email`
-    /// or `ocr` before [3.1](https://github.com/jeanparpaillon/scanbus_service/issues/13)
-    /// implements them would have a UI offer a profile that fails at scan time, and
+    /// or `ocr` before their processors exist would have a UI offer a profile that fails
+    /// at scan time, and
     /// `Button1.Profile` accepts what this returns.
-    ///
-    /// Derived from [`ProfileKind::is_supported`] rather than from the exported
-    /// `Profile1` objects, which do not exist yet; 3.1 moves the source without moving
-    /// the answer.
-    fn get_profile_types(&self) -> Vec<String> {
-        profile_types()
+    async fn get_profile_types(&self) -> Vec<String> {
+        self.profiles.profile_types().await
     }
-}
-
-/// The profile names `GetProfileTypes` answers with.
-fn profile_types() -> Vec<String> {
-    ProfileKind::supported()
-        .into_iter()
-        .map(|kind| kind.as_str().to_owned())
-        .collect()
 }
 
 /// Reads the `backends` selection out of a `filters` map.
@@ -200,8 +192,9 @@ mod tests {
 
     /// The list this iteration can honour, and the reason `GetProfileTypes` is not §2's
     /// four-element list.
-    #[test]
-    fn only_the_implemented_profiles_are_advertised() {
-        assert_eq!(profile_types(), ["image", "document"]);
+    #[tokio::test]
+    async fn only_the_implemented_profiles_are_advertised() {
+        let profiles = ProfileRegistry::ephemeral();
+        assert_eq!(profiles.profile_types().await, ["image", "document"]);
     }
 }

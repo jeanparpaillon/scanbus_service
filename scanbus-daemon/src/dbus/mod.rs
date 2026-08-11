@@ -22,6 +22,7 @@ pub mod job;
 pub mod manager;
 pub mod objects;
 pub mod path;
+pub mod profile;
 pub mod scanner;
 
 use tracing::{info, instrument};
@@ -33,6 +34,7 @@ pub use error::ScanbusError;
 pub use job::Job1;
 pub use manager::Manager1;
 pub use objects::ObjectRegistry;
+pub use profile::Profile1;
 pub use scanner::Scanner1;
 
 /// The well-known name this daemon owns on the session bus.

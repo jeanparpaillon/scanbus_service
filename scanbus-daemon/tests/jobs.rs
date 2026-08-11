@@ -27,10 +27,10 @@ use scanbus_core::{
     BackendError, ButtonsCapability, Capabilities, PageFormat, RawPage, ScannerBackend, ScannerId,
     ScannerInfo, Status,
 };
-use scanbus_daemon::dbus::{self, BUS_NAME, Manager1, ObjectRegistry, path};
+use scanbus_daemon::dbus::{self, BUS_NAME, Manager1, ObjectRegistry, Profile1, path};
 use scanbus_daemon::{
-    Backends, Discovery, JobRegistry, JobTrigger, MemoryPairingStore, RestartPolicy,
-    ScannerRegistry,
+    Backends, Discovery, JobRegistry, JobTrigger, MemoryPairingStore, ProfileRegistry,
+    RestartPolicy, ScannerRegistry,
 };
 use zbus::fdo::{ObjectManagerProxy, PropertiesChangedStream, PropertiesProxy};
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value as ZValue};
@@ -106,11 +106,13 @@ impl Daemon {
         let connection = bus.connect().await;
         let objects = Arc::new(ObjectRegistry::new(connection.clone()).await.unwrap());
         let backend = Arc::new(MockBackend::with_scanners(scanners));
+        let profiles = Arc::new(ProfileRegistry::ephemeral());
 
         // The real sink, with the real lifecycle — only the window is a test's. Anything
         // else here would be testing a stand-in.
         let jobs = Arc::new(JobRegistry::with_retention(
             Arc::clone(&objects),
+            Arc::clone(&profiles),
             TEST_RETENTION,
         ));
         let registry = ScannerRegistry::with_listeners(
@@ -124,8 +126,18 @@ impl Daemon {
             Arc::clone(&registry),
         ));
 
+        for kind in profiles.registered_profiles() {
+            objects
+                .add(path::profile(kind), Profile1::new(kind, Arc::clone(&profiles)))
+                .await
+                .unwrap();
+        }
+
         objects
-            .add(path::manager(), Manager1::new(Arc::clone(&discovery)))
+            .add(
+                path::manager(),
+                Manager1::new(Arc::clone(&discovery), Arc::clone(&profiles)),
+            )
             .await
             .unwrap();
         dbus::request_name(&connection).await.unwrap();
@@ -397,6 +409,7 @@ async fn a_press_publishes_a_job_stamped_with_its_key_and_profile() {
     assert_eq!(job.page_count().await.unwrap(), 1);
     assert_eq!(job.error().await.unwrap(), "");
     assert!(job.result().await.unwrap().is_empty());
+    let mut announced = changes(&client, path::job(&info.id, JobRegistry::FIRST_ID)).await;
 
     // Acceptance: a client that arrives now — mid-scan — finds the job in the manager's
     // dict without having seen the signal that created it.
@@ -404,6 +417,15 @@ async fn a_press_publishes_a_job_stamped_with_its_key_and_profile() {
     assert_eq!(job_paths(&late).await, vec![path]);
 
     feed.end();
+    assert_eq!(next_string(&mut announced, "State").await, "processing");
+    assert_eq!(next_string(&mut announced, "State").await, "done");
+    let result = job.result().await.unwrap();
+    let path = String::try_from(result["path"].clone()).unwrap();
+    assert!(
+        path.ends_with(".pdf"),
+        "document profile maps to {{\"path\": s}}"
+    );
+
     daemon.shutdown().await;
 }
 
@@ -444,14 +466,14 @@ async fn three_pages_count_up_and_then_the_capture_ends() {
     // The last sheet: the stream ends, which is what marks the end of capture.
     feed.end();
     assert_eq!(next_string(&mut announced, "State").await, "processing");
-    // And then the pipeline, which has nothing in it yet (3.1): the job still finishes.
+    // And then the profile pipeline result.
     assert_eq!(next_string(&mut announced, "State").await, "done");
 
     assert_eq!(job.page_count().await.unwrap(), 3);
     assert_eq!(job.error().await.unwrap(), "");
     assert!(
         job.result().await.unwrap().is_empty(),
-        "there is no ProfileProcessor yet (3.1), so Result stays empty"
+        "this run has no profile assignment, so Result stays empty"
     );
 
     daemon.shutdown().await;
@@ -548,7 +570,7 @@ async fn a_transfer_that_dies_lands_in_error_and_is_then_removed() {
         message.contains("stopped answering after page 1"),
         "the backend's own message has to reach the client: {message}"
     );
-    // The capture never completed, so the pipeline never ran.
+    // The capture never completed, so there is no successful profile output.
     assert!(job.result().await.unwrap().is_empty());
     assert_eq!(job.page_count().await.unwrap(), 1);
 
@@ -821,7 +843,11 @@ async fn a_host_driven_job_reports_button_minus_one() {
     let client = bus.connect().await;
     daemon.ready(&info).await;
 
-    let jobs = JobRegistry::with_retention(Arc::clone(&daemon.objects), TEST_RETENTION);
+    let jobs = JobRegistry::with_retention(
+        Arc::clone(&daemon.objects),
+        Arc::new(ProfileRegistry::ephemeral()),
+        TEST_RETENTION,
+    );
     let feed = open_next_job(&daemon.handle(), JobRegistry::FIRST_ID);
 
     let started = tokio::spawn({

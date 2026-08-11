@@ -17,10 +17,9 @@
 //!
 //! # What is not here yet
 //!
-//! `Button1`, `Job1` and `Profile1` have no implementation on the daemon side ([2.5],
-//! [2.6], [3.1]). Their proxies are written from the specification anyway, which is the
-//! point of a client crate: the interface is the contract, and a proxy that only appears
-//! once a server exists cannot be what the server is checked against.
+//! `Button1`, `Job1` and `Profile1` started as specification-first proxies. `Profile1` is
+//! now implemented server-side (3.1), while `Job1` remains transient and only exists for
+//! in-flight scans.
 //!
 //! [`scanbus-dbus-api.md`]: https://github.com/jeanparpaillon/scanbus_service/blob/master/docs/scanbus-dbus-api.md
 //! [`scanbus-cli.md`]: https://github.com/jeanparpaillon/scanbus_service/blob/master/docs/scanbus-cli.md

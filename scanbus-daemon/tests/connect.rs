@@ -26,9 +26,9 @@ use scanbus_core::{
     ScannerBackend, ScannerId, ScannerInfo, Status, Value,
 };
 use scanbus_daemon::backends::RankedBackend;
-use scanbus_daemon::dbus::{self, BUS_NAME, Manager1, ObjectRegistry, path};
+use scanbus_daemon::dbus::{self, BUS_NAME, Manager1, ObjectRegistry, Profile1, path};
 use scanbus_daemon::listeners::{ButtonEvent, ButtonEventSink, RestartPolicy};
-use scanbus_daemon::{Backends, Discovery, MemoryPairingStore, ScannerRegistry};
+use scanbus_daemon::{Backends, Discovery, MemoryPairingStore, ProfileRegistry, ScannerRegistry};
 use tokio::sync::mpsc;
 use zbus::fdo::{PropertiesChangedStream, PropertiesProxy};
 use zbus::zvariant::{OwnedValue, Value as ZValue};
@@ -208,6 +208,7 @@ impl Daemon {
         let connection = bus.connect().await;
         let objects = Arc::new(ObjectRegistry::new(connection.clone()).await.unwrap());
         let backend = TestBackend::new(scanners);
+        let profiles = Arc::new(ProfileRegistry::ephemeral());
         let (sender, events) = mpsc::unbounded_channel();
 
         let registry = ScannerRegistry::with_listeners(
@@ -221,8 +222,18 @@ impl Daemon {
             Arc::clone(&registry),
         ));
 
+        for kind in profiles.registered_profiles() {
+            objects
+                .add(path::profile(kind), Profile1::new(kind, Arc::clone(&profiles)))
+                .await
+                .unwrap();
+        }
+
         objects
-            .add(path::manager(), Manager1::new(Arc::clone(&discovery)))
+            .add(
+                path::manager(),
+                Manager1::new(Arc::clone(&discovery), Arc::clone(&profiles)),
+            )
             .await
             .unwrap();
         dbus::request_name(&connection).await.unwrap();
