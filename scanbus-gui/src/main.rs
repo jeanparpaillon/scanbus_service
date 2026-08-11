@@ -39,7 +39,7 @@ fn main() -> glib::ExitCode {
                         }
                         BusEvent::DiscoveryActive(true) => scanners.mark_discovery_active(),
                         BusEvent::DiscoveryActive(false) => scanners.mark_discovery_idle(),
-                        BusEvent::Toast(message) => scanners.emit_toast(message),
+                        BusEvent::Toast(toast) => scanners.emit_toast_spec(toast),
                     }
                 }
             });

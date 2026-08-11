@@ -1,11 +1,12 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::thread;
 use std::time::Duration;
 
 use async_channel::{Receiver, Sender};
 use futures_util::StreamExt as _;
 use scanbus_client::proxy::{Button1Proxy, Manager1Proxy, Scanner1Proxy, object_manager};
-use scanbus_client::{Bus, Error, connect, owner};
+use scanbus_client::{Bus, Error, ScanbusError, connect, owner};
 use scanbus_core::{ProfileKind, path};
 use tokio::runtime::Builder;
 use tokio::select;
@@ -14,6 +15,7 @@ use zbus::message::Type;
 use zbus::zvariant::OwnedValue;
 use zbus::{Message, MessageStream};
 
+use crate::scanners::ToastSpec;
 use crate::store::{Dict, ManagedSnapshot, StoreEvent};
 
 #[derive(Debug, Clone)]
@@ -23,6 +25,12 @@ pub enum BusCommand {
         quiet: bool,
     },
     Pair {
+        path: String,
+    },
+    CancelPairing {
+        path: String,
+    },
+    Unpair {
         path: String,
     },
     #[allow(
@@ -39,7 +47,7 @@ pub enum BusCommand {
 pub enum BusEvent {
     Store(StoreEvent),
     DiscoveryActive(bool),
-    Toast(String),
+    Toast(ToastSpec),
 }
 
 #[derive(Clone)]
@@ -100,6 +108,7 @@ async fn run_session(
     events: &Sender<BusEvent>,
 ) -> Result<(), Error> {
     let connection = connect(bus, true).await?;
+    let mut leases = DiscoveryLeases::default();
     let mut messages = MessageStream::from(&connection);
 
     loop {
@@ -130,7 +139,9 @@ async fn run_session(
                     let Ok(command) = command else {
                         return Ok(());
                     };
-                    if let Err(error) = handle_command(&connection, command, events).await {
+                    if let Err(error) =
+                        handle_command(bus, &connection, command, events, &mut leases).await
+                    {
                         if !matches!(error, Error::Call(_)) {
                             warn!(%error, "GUI command failed");
                         }
@@ -140,7 +151,7 @@ async fn run_session(
                     let Some(message) = message else {
                         return Ok(());
                     };
-                    if dispatch_signal(message?, events).await? {
+                    if dispatch_signal(message?, events, &mut leases).await? {
                         break;
                     }
                 }
@@ -165,7 +176,11 @@ async fn wait_for_owner(messages: &mut MessageStream) -> Result<(), Error> {
     Ok(())
 }
 
-async fn dispatch_signal(message: Message, events: &Sender<BusEvent>) -> Result<bool, Error> {
+async fn dispatch_signal(
+    message: Message,
+    events: &Sender<BusEvent>,
+    leases: &mut DiscoveryLeases,
+) -> Result<bool, Error> {
     if message.message_type() != Type::Signal {
         return Ok(false);
     }
@@ -185,6 +200,7 @@ async fn dispatch_signal(message: Message, events: &Sender<BusEvent>) -> Result<
         && name == scanbus_client::BUS_NAME
     {
         if new_owner.is_empty() {
+            leases.clear();
             let _ = events
                 .send(BusEvent::Store(StoreEvent::ServicePresent(false)))
                 .await;
@@ -224,6 +240,9 @@ async fn dispatch_signal(message: Message, events: &Sender<BusEvent>) -> Result<
         let (iface, changed, invalidated) = message
             .body()
             .deserialize::<(String, Dict, Vec<String>)>()?;
+        leases
+            .release_finished_pairing(&path, &iface, &changed)
+            .await?;
         let _ = events
             .send(BusEvent::Store(StoreEvent::PropertiesChanged {
                 path,
@@ -265,9 +284,11 @@ fn normalize_snapshot(managed: zbus::fdo::ManagedObjects) -> ManagedSnapshot {
 }
 
 async fn handle_command(
+    bus: &Bus,
     connection: &zbus::Connection,
     command: BusCommand,
     events: &Sender<BusEvent>,
+    leases: &mut DiscoveryLeases,
 ) -> Result<(), Error> {
     match command {
         BusCommand::StartDiscovery => {
@@ -286,7 +307,9 @@ async fn handle_command(
                             "GUI command failed"
                         );
                         let _ = events
-                            .send(BusEvent::Toast(crate::error::present(refusal)))
+                            .send(BusEvent::Toast(ToastSpec::new(crate::error::present(
+                                refusal,
+                            ))))
                             .await;
                     }
                     return Err(error);
@@ -304,7 +327,9 @@ async fn handle_command(
                     let _ = events.send(BusEvent::DiscoveryActive(false)).await;
                     if !quiet && let Error::Call(ref refusal) = error {
                         let _ = events
-                            .send(BusEvent::Toast(crate::error::present(refusal)))
+                            .send(BusEvent::Toast(ToastSpec::new(crate::error::present(
+                                refusal,
+                            ))))
                             .await;
                     }
                     return Err(error);
@@ -313,8 +338,48 @@ async fn handle_command(
         }
         BusCommand::Pair { path } => {
             if let Some(id) = path::scanner_id(&path) {
+                leases.acquire_pairing_hold(bus, &path).await?;
                 let proxy = Scanner1Proxy::for_scanner(connection, &id).await?;
-                proxy.pair(HashMap::new()).await?;
+                match proxy.pair(HashMap::new()).await {
+                    Ok(()) => {}
+                    Err(error) => {
+                        leases.release_pairing_hold(&path).await?;
+                        let error = Error::from(error);
+                        if let Error::Call(ref refusal) = error {
+                            match refusal {
+                                ScanbusError::AlreadyPaired(_) => return Ok(()),
+                                ScanbusError::NotReachable(_) => {
+                                    let _ = events
+                                        .send(BusEvent::Toast(ToastSpec::retry_pair(
+                                            crate::error::present(refusal),
+                                            path,
+                                        )))
+                                        .await;
+                                }
+                                _ => {
+                                    let _ = events
+                                        .send(BusEvent::Toast(ToastSpec::new(
+                                            crate::error::present(refusal),
+                                        )))
+                                        .await;
+                                }
+                            }
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        BusCommand::CancelPairing { path } => {
+            if let Some(id) = path::scanner_id(&path) {
+                let proxy = Scanner1Proxy::for_scanner(connection, &id).await?;
+                proxy.cancel_pairing().await?;
+            }
+        }
+        BusCommand::Unpair { path } => {
+            if let Some(id) = path::scanner_id(&path) {
+                let proxy = Scanner1Proxy::for_scanner(connection, &id).await?;
+                proxy.unpair().await?;
             }
         }
         BusCommand::SetProfile { path, kind } => {
@@ -331,4 +396,80 @@ async fn handle_command(
     }
 
     Ok(())
+}
+
+#[derive(Default)]
+struct DiscoveryLeases {
+    held_paths: HashSet<String>,
+    hold_connection: Option<zbus::Connection>,
+}
+
+impl DiscoveryLeases {
+    async fn acquire_pairing_hold(&mut self, bus: &Bus, path: &str) -> Result<(), Error> {
+        if !self.held_paths.insert(path.to_owned()) {
+            return Ok(());
+        }
+
+        if self.hold_connection.is_some() {
+            return Ok(());
+        }
+
+        let connection = connect(bus, true).await?;
+        let manager = Manager1Proxy::new(&connection).await?;
+        manager.start_discovery(HashMap::new()).await?;
+        self.hold_connection = Some(connection);
+        Ok(())
+    }
+
+    async fn release_pairing_hold(&mut self, path: &str) -> Result<(), Error> {
+        if !self.held_paths.remove(path) {
+            return Ok(());
+        }
+
+        if !self.held_paths.is_empty() {
+            return Ok(());
+        }
+
+        if let Some(connection) = self.hold_connection.take() {
+            let manager = Manager1Proxy::new(&connection).await?;
+            manager.stop_discovery().await?;
+        }
+
+        Ok(())
+    }
+
+    async fn release_finished_pairing(
+        &mut self,
+        path: &str,
+        interface: &str,
+        changed: &Dict,
+    ) -> Result<(), Error> {
+        if interface != scanbus_client::proxy::SCANNER_INTERFACE {
+            return Ok(());
+        }
+
+        let Some(value) = changed.get("PairingState") else {
+            return Ok(());
+        };
+
+        let state = value
+            .try_clone()
+            .ok()
+            .and_then(|value| String::try_from(value).ok());
+        let in_progress = matches!(
+            state.as_deref(),
+            Some("pairing" | "installing_backend" | "awaiting_confirmation")
+        );
+
+        if !in_progress {
+            self.release_pairing_hold(path).await?;
+        }
+
+        Ok(())
+    }
+
+    fn clear(&mut self) {
+        self.held_paths.clear();
+        self.hold_connection = None;
+    }
 }
