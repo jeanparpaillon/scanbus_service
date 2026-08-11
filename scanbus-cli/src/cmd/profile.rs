@@ -126,9 +126,7 @@ async fn profile_proxy(
 ) -> Result<Profile1Proxy<'static>> {
     context
         .within(format!("resolving profile {}", kind.as_str()), async {
-            Profile1Proxy::for_profile(connection, kind)
-                .await
-                .map_err(ClientError::from)
+            Profile1Proxy::for_profile(connection, kind).await
         })
         .await
 }
