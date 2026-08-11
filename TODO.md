@@ -32,6 +32,10 @@ D-Bus for Windows ?
 
 ## Gnome
 
-- See `docs/design` for disovery, configuration
-- For jobs, use Desktop Notification Specs from
-  https://specifications.freedesktop.org/notification-spec/
+Planned: `docs/scanbus-gnome-gui.md`, workstream 10. A GTK4/libadwaita
+client in a `scanbus-gui` crate, taking `scanbus-client` so it breaks at compile time with the
+CLI and the daemon's conformance tests. The window covers discovery and configuration
+(`docs/design`); job notifications come from a windowless background mode of the same binary,
+using the Desktop Notification Spec —
+https://specifications.freedesktop.org/notification-spec/ — because a button press happens
+with nobody at the computer.
