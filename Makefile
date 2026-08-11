@@ -43,7 +43,7 @@ $(TARGET_DIR)/scanbus-daemon:
 $(TARGET_DIR)/scanbus-gui:
 	cargo build --package scanbus-gui --bin $(notdir $@) $(profile_opt)
 
-install: install-backend install-frontend install-services
+install: install-backend install-frontend install-services install-doc
 
 install-services:
 	install -D -m 0644 packaging/systemd/user/scanbus.service \
@@ -60,6 +60,10 @@ install-backend: $(TARGET_DIR)/scanbus $(TARGET_DIR)/scanbus-daemon
 	install -D -m 0755 packaging/libexec/scanbus/scanbus-scanimage \
 		"$(DESTDIR)$(LIBEXECDIR)/scanbus-scanimage"
 
+install-doc: target/$(CARGO_ENV)/scanbus 
+	target/$(CARGO_ENV)/scanbus manpage > \
+		"$(DESTDIR)$(PREFIX)/share/man/man1/scanbus.1"
+
 reload:
 	systemctl --user daemon-reload
 	dbus-send --session --type=method_call --dest=org.freedesktop.DBus \
@@ -75,5 +79,5 @@ clean:
 	cargo clean
 
 .PHONY: all release debug 
-.PHONY: install install-backend install-frontend install-services
+.PHONY: install install-backend install-frontend install-services install-doc
 .PHONY: reload test clean lint
