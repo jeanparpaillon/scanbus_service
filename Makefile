@@ -52,6 +52,11 @@ install: $(TARGET_DIR)/scanbus $(TARGET_DIR)/scanbus-daemon
 	install -D -m 0755 packaging/libexec/scanbus/scanbus-scanimage \
 		"$(DESTDIR)$(LIBEXECDIR)/scanbus-scanimage"
 
+reload:
+	systemctl --user daemon-reload
+	dbus-send --session --type=method_call --dest=org.freedesktop.DBus \
+		/ org.freedesktop.DBus.ReloadConfig
+
 test:
 	cargo test --workspace --features $(BACKENDS)
 
@@ -61,4 +66,4 @@ lint:
 clean:
 	cargo clean
 
-.PHONY: all release debug install test clean lint
+.PHONY: all release debug install reload test clean lint
