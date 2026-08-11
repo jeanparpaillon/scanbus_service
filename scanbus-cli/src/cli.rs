@@ -395,6 +395,10 @@ pub enum ProfileCommand {
         /// Option assignments
         #[arg(value_name = "K=V", required = true)]
         options: Vec<String>,
+
+        /// Option values written as JSON
+        #[arg(long = "option-json", value_name = "K=JSON")]
+        option_json: Vec<String>,
     },
 }
 
@@ -509,6 +513,30 @@ mod tests {
             panic!("that is a button set")
         };
         assert_eq!(option_json, ["profile={\"dir\":\"/tmp\"}"]);
+
+        let cli = Cli::try_parse_from([
+            "scanbus",
+            "profile",
+            "set",
+            "image",
+            "quality=85",
+            "--option-json",
+            "output_folder=\"/tmp/scans\"",
+        ])
+        .unwrap();
+        let Command::Profile {
+            command:
+                ProfileCommand::Set {
+                    options,
+                    option_json,
+                    ..
+                },
+        } = cli.command
+        else {
+            panic!("that is a profile set")
+        };
+        assert_eq!(options, ["quality=85"]);
+        assert_eq!(option_json, ["output_folder=\"/tmp/scans\""]);
     }
 
     /// `--paired --unpaired` asks for the empty set; `--watch --for` asks for two

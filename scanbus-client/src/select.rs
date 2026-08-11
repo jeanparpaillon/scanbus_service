@@ -80,6 +80,8 @@ pub enum ObjectKind {
     Button,
     /// An `org.scanbus.Job1`.
     Job,
+    /// An `org.scanbus.Profile1`.
+    Profile,
 }
 
 impl ObjectKind {
@@ -89,6 +91,7 @@ impl ObjectKind {
             Self::Scanner => "scanner",
             Self::Button => "button",
             Self::Job => "job",
+            Self::Profile => "profile",
         }
     }
 
@@ -98,6 +101,7 @@ impl ObjectKind {
             Self::Scanner => "scanners",
             Self::Button => "buttons",
             Self::Job => "jobs",
+            Self::Profile => "profiles",
         }
     }
 
@@ -110,6 +114,7 @@ impl ObjectKind {
             Self::Scanner => "use the full id — it is stable, a name is not",
             Self::Button => "use the button's index",
             Self::Job => "use the full object path",
+            Self::Profile => "use one of the exported profile names",
         }
     }
 
@@ -123,6 +128,7 @@ impl ObjectKind {
             Self::Scanner => " — an unpaired scanner exists only while a discovery session does",
             Self::Button => " — a button goes away with the scanner that owns it",
             Self::Job => " — a job's object is unexported shortly after the job finishes",
+            Self::Profile => "",
         }
     }
 }

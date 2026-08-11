@@ -29,7 +29,9 @@ mod job;
 mod job_follow;
 mod list;
 mod monitor;
+mod options;
 mod pair;
+mod profile;
 mod scanner_view;
 mod show;
 
@@ -50,6 +52,10 @@ use crate::error::{Error, Result};
 /// [`Error`], whose [`exit_code`](Error::exit_code) is what the process ends with.
 ///
 /// [`scanbus-cli.md`]: https://github.com/jeanparpaillon/scanbus_service/blob/master/docs/scanbus-cli.md
+#[allow(
+    unreachable_patterns,
+    reason = "the stub arm stays as the future-command checklist even when all current commands are implemented"
+)]
 pub async fn dispatch(context: &Context, command: &Command) -> Result<u8> {
     match command {
         Command::Status => status::run(context).await,
@@ -105,6 +111,15 @@ pub async fn dispatch(context: &Context, command: &Command) -> Result<u8> {
             }
         },
         Command::Monitor { path } => monitor::run(context, path.as_deref()).await,
+        Command::Profile { command } => match command {
+            ProfileCommand::List => profile::list(context).await,
+            ProfileCommand::Show { name } => profile::show(context, name).await,
+            ProfileCommand::Set {
+                name,
+                options,
+                option_json,
+            } => profile::set(context, name, options, option_json).await,
+        },
         pending => stub(context, pending).await,
     }
 }
@@ -145,6 +160,12 @@ async fn resolve(context: &Context, connection: &Connection, command: &Command) 
         Selectors::Scanner(argument) => {
             scanner(&objects, argument)?;
         }
+        Selectors::ScannerButton(argument, button) => {
+            let found = scanner(&objects, argument)?;
+            objects
+                .button(&found.id, button)
+                .map_err(|error| Error::call("finding the button", error.into()))?;
+        }
         Selectors::Job(selector) => {
             objects
                 .job(selector)
@@ -171,6 +192,8 @@ fn scanner<'a>(objects: &'a Objects, argument: &ScannerArg) -> Result<&'a Scanne
 enum Selectors<'a> {
     /// One scanner.
     Scanner(&'a ScannerArg),
+    /// One scanner, then one of its buttons.
+    ScannerButton(&'a ScannerArg, &'a str),
     /// One job, which names its scanner through its path.
     Job(&'a str),
     /// The optional `--scanner` of a `job` listing.
@@ -192,7 +215,15 @@ fn selectors(command: &Command) -> Option<Selectors<'_>> {
         | Command::Disconnect { scanner }
         | Command::Scan { scanner, .. } => Some(Selectors::Scanner(scanner)),
 
-        Command::Button { .. } => None,
+        Command::Button { command } => match command {
+            ButtonCommand::List { scanner } => Some(Selectors::Scanner(scanner)),
+            ButtonCommand::Set {
+                scanner, button, ..
+            }
+            | ButtonCommand::Clear { scanner, button } => {
+                Some(Selectors::ScannerButton(scanner, button))
+            }
+        },
 
         Command::Job { command } => match command {
             JobCommand::Show { job } => Some(Selectors::Job(job)),
@@ -272,7 +303,15 @@ mod tests {
             (vec!["scanbus", "list"], ("list", "8.5")),
             (vec!["scanbus", "connect", "MFC"], ("connect", "8.7")),
             (
-                vec!["scanbus", "button", "set", "MFC", "2"],
+                vec![
+                    "scanbus",
+                    "button",
+                    "set",
+                    "MFC",
+                    "2",
+                    "--profile",
+                    "document",
+                ],
                 ("button set", "8.9"),
             ),
             (vec!["scanbus", "profile", "list"], ("profile list", "8.10")),
@@ -292,7 +331,15 @@ mod tests {
             (vec!["scanbus", "unpair", "MFC", "--yes"], Some("scanner")),
             (vec!["scanbus", "button", "list", "MFC"], Some("scanner")),
             (
-                vec!["scanbus", "button", "set", "MFC", "2"],
+                vec![
+                    "scanbus",
+                    "button",
+                    "set",
+                    "MFC",
+                    "2",
+                    "--profile",
+                    "document",
+                ],
                 Some("scanner+button"),
             ),
             (
@@ -319,6 +366,7 @@ mod tests {
             let command = command(&args);
             let named = selectors(&command).map(|selectors| match selectors {
                 Selectors::Scanner(_) => "scanner",
+                Selectors::ScannerButton(..) => "scanner+button",
                 Selectors::Job(_) => "job",
                 Selectors::ScannerFilter(..) => "filter",
             });
