@@ -24,6 +24,12 @@ pub enum BusCommand {
     StopDiscovery {
         quiet: bool,
     },
+    Connect {
+        path: String,
+    },
+    Disconnect {
+        path: String,
+    },
     Pair {
         path: String,
     },
@@ -353,6 +359,72 @@ async fn handle_command(
                                         .send(BusEvent::Toast(ToastSpec::retry_pair(
                                             crate::error::present(refusal),
                                             path,
+                                        )))
+                                        .await;
+                                }
+                                _ => {
+                                    let _ = events
+                                        .send(BusEvent::Toast(ToastSpec::new(
+                                            crate::error::present(refusal),
+                                        )))
+                                        .await;
+                                }
+                            }
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        BusCommand::Connect { path } => {
+            if let Some(id) = path::scanner_id(&path) {
+                let proxy = Scanner1Proxy::for_scanner(connection, &id).await?;
+                match proxy.connect(HashMap::new()).await {
+                    Ok(()) => {}
+                    Err(error) => {
+                        let error = Error::from(error);
+                        if let Error::Call(ref refusal) = error {
+                            match refusal {
+                                ScanbusError::NotPaired(_) | ScanbusError::NotConnected(_) => {
+                                    return Ok(());
+                                }
+                                ScanbusError::Busy(_) | ScanbusError::NotReachable(_) => {
+                                    let _ = events
+                                        .send(BusEvent::Toast(ToastSpec::new(
+                                            crate::error::present(refusal),
+                                        )))
+                                        .await;
+                                }
+                                _ => {
+                                    let _ = events
+                                        .send(BusEvent::Toast(ToastSpec::new(
+                                            crate::error::present(refusal),
+                                        )))
+                                        .await;
+                                }
+                            }
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        BusCommand::Disconnect { path } => {
+            if let Some(id) = path::scanner_id(&path) {
+                let proxy = Scanner1Proxy::for_scanner(connection, &id).await?;
+                match proxy.disconnect().await {
+                    Ok(()) => {}
+                    Err(error) => {
+                        let error = Error::from(error);
+                        if let Error::Call(ref refusal) = error {
+                            match refusal {
+                                ScanbusError::NotPaired(_) | ScanbusError::NotConnected(_) => {
+                                    return Ok(());
+                                }
+                                ScanbusError::Busy(_) => {
+                                    let _ = events
+                                        .send(BusEvent::Toast(ToastSpec::new(
+                                            crate::error::present(refusal),
                                         )))
                                         .await;
                                 }
