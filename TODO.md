@@ -9,6 +9,12 @@
 - Lookup for Canon solutions for network attached scanners with send-to-computer function
 - Plan implementation of Canon backend(s)
 
+Resources:
+- See IJ Network Scanner Selector EX2 protocol for 'scan to PC' features
+- Canon proprietary protocols : BJNP / MFNP
+    - https://www.sane-project.org/man/sane-pixma.5.html
+    - https://gitlab.com/sane-project/backends
+
 ## Epson
 
 Different product lines:
