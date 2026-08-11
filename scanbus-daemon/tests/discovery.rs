@@ -518,3 +518,177 @@ async fn shutdown_stops_the_session_before_the_tree_goes() {
     assert!(daemon.scanners.ids().await.is_empty());
     drop(daemon.connection);
 }
+
+/// Polls `is_running` until it says the session ended, or panics past `SIGNAL_TIMEOUT`.
+///
+/// `NameOwnerChanged` reaches [`watch_owners`](scanbus_daemon::discovery::watch_owners)
+/// asynchronously, so "the session stopped because the owner disappeared" has no single
+/// event to await the way an `InterfacesRemoved` does.
+async fn wait_until_not_running(discovery: &scanbus_daemon::Discovery) {
+    tokio::time::timeout(SIGNAL_TIMEOUT, async {
+        while discovery.is_running().await {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("discovery did not stop within the timeout");
+}
+
+/// 2.9's acceptance: two callers, one `StopDiscovery` each. The first taking its
+/// reference back must not touch what the second is watching, and the backends keep
+/// running until neither is left.
+#[tokio::test]
+async fn a_second_caller_keeps_the_session_running_after_the_first_stops() {
+    let Some(bus) = PrivateBus::start().await else {
+        return skipped("a_second_caller_keeps_the_session_running_after_the_first_stops");
+    };
+
+    let found = scanner_info("escl", "http://192.168.1.50:80/eSCL/", "a scanner");
+    let daemon = Daemon::start(&bus, backends([backend("escl", [found.clone()])])).await;
+
+    // A paired scanner throughout, to check it is untouched by either `StopDiscovery`.
+    let paired = scanner_info("escl", "usb:001:002", "a paired scanner");
+    daemon
+        .scanners
+        .register_persistent(absent_backend("escl"), paired.clone())
+        .await
+        .unwrap();
+
+    let watcher = bus.connect().await;
+    let manager = manager_proxy(&watcher).await;
+    let mut added = manager.receive_interfaces_added().await.unwrap();
+    let mut removed = manager.receive_interfaces_removed().await.unwrap();
+
+    let first = Manager1Proxy::new(&bus.connect().await).await.unwrap();
+    let second = Manager1Proxy::new(&bus.connect().await).await.unwrap();
+
+    first.start_discovery(HashMap::new()).await.unwrap();
+    second.start_discovery(HashMap::new()).await.unwrap();
+    next_scanner_added(&mut added).await;
+
+    first.stop_discovery().await.unwrap();
+
+    // The first caller's `StopDiscovery` released only its own reference: the object the
+    // second caller is watching, and the probing behind it, are both still there.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), removed.next())
+            .await
+            .is_err(),
+        "the first caller's StopDiscovery must not remove the second's objects"
+    );
+    assert!(daemon.discovery.is_running().await);
+    let mut still_published = vec![
+        path::scanner(&found.id).as_str().to_owned(),
+        path::scanner(&paired.id).as_str().to_owned(),
+    ];
+    still_published.sort();
+    assert_eq!(
+        scanner_paths(&manager.get_managed_objects().await.unwrap()),
+        still_published
+    );
+
+    second.stop_discovery().await.unwrap();
+
+    // The last reference releases: the unpaired scanner goes, the probe stops, the
+    // paired one does not move.
+    assert_eq!(
+        next_scanner_removed(&mut removed).await,
+        path::scanner(&found.id)
+    );
+    assert!(!daemon.discovery.is_running().await);
+    assert_eq!(
+        scanner_paths(&manager.get_managed_objects().await.unwrap()),
+        vec![path::scanner(&paired.id).as_str().to_owned()]
+    );
+}
+
+/// `StopDiscovery` from a client that never called `StartDiscovery` is a no-op, not an
+/// error — and does not touch a session another client is running.
+#[tokio::test]
+async fn stop_discovery_from_a_non_owner_changes_nothing() {
+    let Some(bus) = PrivateBus::start().await else {
+        return skipped("stop_discovery_from_a_non_owner_changes_nothing");
+    };
+
+    let found = scanner_info("escl", "http://192.168.1.50:80/eSCL/", "a scanner");
+    let daemon = Daemon::start(&bus, backends([backend("escl", [found.clone()])])).await;
+
+    let client = bus.connect().await;
+    let manager = manager_proxy(&client).await;
+    let mut added = manager.receive_interfaces_added().await.unwrap();
+    let mut removed = manager.receive_interfaces_removed().await.unwrap();
+
+    let owner = Manager1Proxy::new(&bus.connect().await).await.unwrap();
+    let bystander = Manager1Proxy::new(&bus.connect().await).await.unwrap();
+
+    // Nobody has started anything yet.
+    bystander.stop_discovery().await.unwrap();
+    assert!(!daemon.discovery.is_running().await);
+
+    owner.start_discovery(HashMap::new()).await.unwrap();
+    next_scanner_added(&mut added).await;
+
+    // A client that never called `StartDiscovery` cannot stop the owner's session.
+    bystander.stop_discovery().await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), removed.next())
+            .await
+            .is_err(),
+        "a non-owner's StopDiscovery must not remove the owner's objects"
+    );
+    assert!(daemon.discovery.is_running().await);
+
+    owner.stop_discovery().await.unwrap();
+    assert!(!daemon.discovery.is_running().await);
+}
+
+/// 2.9's other half: a client that disappears without calling `StopDiscovery` — the
+/// in-process stand-in for `SIGKILL`, since these tests share a process — must still
+/// lose its reference, closing the session (and taking its unpaired objects with it)
+/// rather than leaving the daemon probing forever.
+#[tokio::test]
+async fn a_caller_that_disappears_releases_its_reference() {
+    let Some(bus) = PrivateBus::start().await else {
+        return skipped("a_caller_that_disappears_releases_its_reference");
+    };
+
+    let found = scanner_info("escl", "http://192.168.1.50:80/eSCL/", "a scanner");
+    let daemon = Daemon::start(&bus, backends([backend("escl", [found.clone()])])).await;
+
+    // Untouched throughout, same as every other ending of a session.
+    let paired = scanner_info("escl", "usb:001:002", "a paired scanner");
+    daemon
+        .scanners
+        .register_persistent(absent_backend("escl"), paired.clone())
+        .await
+        .unwrap();
+
+    let watcher = bus.connect().await;
+    let manager = manager_proxy(&watcher).await;
+    let mut added = manager.receive_interfaces_added().await.unwrap();
+    let mut removed = manager.receive_interfaces_removed().await.unwrap();
+
+    let doomed = bus.connect().await;
+    Manager1Proxy::new(&doomed)
+        .await
+        .unwrap()
+        .start_discovery(HashMap::new())
+        .await
+        .unwrap();
+    next_scanner_added(&mut added).await;
+    assert!(daemon.discovery.is_running().await);
+
+    // No `StopDiscovery` — the connection just goes, exactly as it would if the
+    // process holding it were killed.
+    drop(doomed);
+
+    assert_eq!(
+        next_scanner_removed(&mut removed).await,
+        path::scanner(&found.id)
+    );
+    wait_until_not_running(&daemon.discovery).await;
+    assert_eq!(
+        scanner_paths(&manager.get_managed_objects().await.unwrap()),
+        vec![path::scanner(&paired.id).as_str().to_owned()]
+    );
+}

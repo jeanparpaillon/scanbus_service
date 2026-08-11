@@ -18,8 +18,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 use zbus::fdo;
+use zbus::message::Header;
 use zbus::zvariant::{OwnedValue, Value};
 
 use crate::discovery::Discovery;
@@ -49,7 +50,10 @@ impl Manager1 {
     /// Starts discovery through every active backend, or the subset `filters` names.
     ///
     /// Returns as soon as the session is running — the scanners arrive afterwards, as
-    /// `InterfacesAdded` for objects with `Paired=false`.
+    /// `InterfacesAdded` for objects with `Paired=false`. The caller's bus name is what
+    /// [`2.9`](crate::discovery) reference-counts the session by: a second client's
+    /// `StartDiscovery` joins the session rather than restarting it, and the objects it
+    /// finds stay up until every caller that asked has released its reference.
     ///
     /// # Errors
     ///
@@ -57,23 +61,41 @@ impl Manager1 {
     /// honour: an unknown key, a `backends` value that is not an array of strings, or a
     /// backend id that does not exist.
     #[instrument(level = "info", skip_all)]
-    async fn start_discovery(&self, filters: HashMap<String, OwnedValue>) -> fdo::Result<()> {
+    async fn start_discovery(
+        &self,
+        filters: HashMap<String, OwnedValue>,
+        #[zbus(header)] header: Header<'_>,
+    ) -> fdo::Result<()> {
         let backends = backend_filter(&filters)?;
+        let Some(owner) = header.sender() else {
+            // Only reachable off a bus connection this daemon never makes (§7 of
+            // scanbus-dbus-api.md: session bus only), so there is no client to
+            // attribute the session to.
+            warn!("StartDiscovery with no sender header; refusing");
+            return Err(fdo::Error::Failed("no sender for this call".to_owned()));
+        };
 
         self.discovery
-            .start(backends.as_deref())
+            .start(owner.to_owned().into(), backends.as_deref())
             .await
             .map_err(|error| fdo::Error::InvalidArgs(error.to_string()))
     }
 
-    /// Stops the discovery in progress.
+    /// Releases the caller's discovery reference.
     ///
     /// Returns once the unpaired scanner objects are off the bus, so the
-    /// `InterfacesRemoved` signals precede the method reply. Succeeds when no session
-    /// is running.
+    /// `InterfacesRemoved` signals precede the method reply — but only when this was the
+    /// *last* reference; see [`2.9`](crate::discovery). Succeeds when the caller holds
+    /// no reference at all, whether because no session is running or because a second
+    /// client is still watching one: stopping what you do not own is not an error.
     #[instrument(level = "info", skip_all)]
-    async fn stop_discovery(&self) {
-        self.discovery.stop().await;
+    async fn stop_discovery(&self, #[zbus(header)] header: Header<'_>) {
+        let Some(owner) = header.sender() else {
+            warn!("StopDiscovery with no sender header; ignoring");
+            return;
+        };
+
+        self.discovery.release(owner).await;
     }
 
     /// The profile types this daemon can actually run.

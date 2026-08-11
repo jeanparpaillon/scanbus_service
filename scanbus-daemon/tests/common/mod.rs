@@ -24,9 +24,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use scanbus_daemon::dbus::{self, Manager1, ObjectRegistry, Profile1, path};
+use scanbus_daemon::discovery::watch_owners;
 use scanbus_daemon::{Backends, Discovery, MemoryPairingStore, ProfileRegistry, ScannerRegistry};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
+use tokio::task::JoinHandle;
 
 /// Minimal session-bus policy: anything may be owned, sent and received.
 ///
@@ -158,6 +160,9 @@ pub struct Daemon {
     pub objects: Arc<ObjectRegistry>,
     /// Where pairings are persisted — in memory, so nothing outlives the test.
     pub store: Arc<MemoryPairingStore>,
+    /// Watches `NameOwnerChanged` so a test can kill a client's connection and see its
+    /// discovery reference dropped, same as [`2.9`](https://github.com/jeanparpaillon/scanbus_service/issues/34).
+    owner_watch: JoinHandle<()>,
 }
 
 impl Daemon {
@@ -189,6 +194,7 @@ impl Daemon {
             .await
             .unwrap();
         dbus::request_name(&connection).await.unwrap();
+        let owner_watch = watch_owners(Arc::clone(&discovery), connection.clone());
 
         Self {
             connection,
@@ -196,11 +202,13 @@ impl Daemon {
             discovery,
             objects,
             store,
+            owner_watch,
         }
     }
 
     /// Stops the discovery session and unexports the tree.
     pub async fn shutdown(&self) {
+        self.owner_watch.abort();
         self.discovery.stop().await;
         self.objects.shutdown().await;
     }
