@@ -32,6 +32,7 @@ use std::fmt;
 
 use crate::connect::BUS_NAME;
 use crate::convert::DecodeError;
+use crate::select::{ObjectKind, SelectError};
 
 /// A refusal from the daemon, named the way §8 names it.
 ///
@@ -202,6 +203,29 @@ pub enum Error {
     /// the bus.
     #[error("{BUS_NAME} has no owner and activation was disabled")]
     NotRunning,
+
+    /// A selector that named no object, or more than one ([`crate::select`]).
+    ///
+    /// Its own variant, and not an [`Error::Call`], because nothing was called: the
+    /// daemon answered `GetManagedObjects` and the refusal is this client's. §8 gives it
+    /// exit 4 for the same reason — "you named something that does not exist" is a
+    /// different fact from "the daemon said no".
+    #[error(transparent)]
+    Select(#[from] SelectError),
+
+    /// An object that resolved, and had left the bus by the time the call reached it.
+    ///
+    /// Built by [`Scanner::gone`](crate::select::Scanner::gone) and its siblings out of
+    /// the `UnknownObject` the bus answers with, because that name on its own tells a
+    /// user nothing: the object they named is *supposed* to be transient, and the message
+    /// has to say which one went and why that is normal.
+    #[error("{kind} {name} disappeared between resolving it and calling it{}", kind.hint())]
+    Vanished {
+        /// What kind of object went.
+        kind: ObjectKind,
+        /// Which one — an id, or an index and the scanner it belonged to.
+        name: String,
+    },
 }
 
 impl From<zbus::Error> for Error {

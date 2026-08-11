@@ -48,6 +48,21 @@ use zbus::zvariant::ObjectPath;
 use crate::connect::BUS_NAME;
 use crate::error::{Error, Result};
 
+/// The `org.scanbus.Scanner1` interface name.
+///
+/// The three names below are what an `InterfacesAdded` and a `GetManagedObjects` reply
+/// are keyed by, so they are needed as *strings* by everything that reads the object
+/// tree ([`crate::select`], [`crate::watch`]) rather than as a proxy. Spelled once,
+/// here, beside the `#[proxy]` declarations that are the other half of each name — a
+/// second spelling is a typo that compiles and then quietly matches nothing.
+pub const SCANNER_INTERFACE: &str = "org.scanbus.Scanner1";
+
+/// The `org.scanbus.Button1` interface name.
+pub const BUTTON_INTERFACE: &str = "org.scanbus.Button1";
+
+/// The `org.scanbus.Job1` interface name.
+pub const JOB_INTERFACE: &str = "org.scanbus.Job1";
+
 /// The `org.freedesktop.DBus.ObjectManager` on `/org/scanbus`.
 ///
 /// §2 is explicit that there is no `ScannerFound` signal because this is one: every

@@ -50,12 +50,17 @@ pub mod convert;
 pub mod error;
 pub mod proxy;
 pub mod scanner;
+pub mod select;
 pub mod watch;
 
 pub use connect::{BUS_NAME, Bus, Presence, connect, owner, presence};
 pub use convert::DecodeError;
 pub use error::{Error, Result, ScanbusError};
 pub use scanner::ScannerState;
+pub use select::{
+    Button, Job, Match, ObjectKind, Objects, Scanner, SelectError, resolve_button, resolve_job,
+    resolve_scanner,
+};
 pub use watch::{PropertyChanges, PropertyWatch, ScannerStates, ScannerWatch};
 /// The bus connection every proxy here is built on.
 ///

@@ -43,8 +43,8 @@ use crate::convert::Dict;
 use crate::error::{Error, Result};
 use crate::scanner::ScannerState;
 
-/// The `org.scanbus.Scanner1` interface name, spelled once.
-pub const SCANNER_INTERFACE: &str = "org.scanbus.Scanner1";
+/// The `org.scanbus.Scanner1` interface name, spelled once — beside the proxies.
+pub use crate::proxy::SCANNER_INTERFACE;
 
 /// A subscription to one object's `PropertiesChanged`, before anything has been read.
 ///

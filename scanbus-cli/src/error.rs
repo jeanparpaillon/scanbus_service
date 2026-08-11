@@ -9,6 +9,11 @@
 //! - **the sentence a user reads**, which §6 fixes as
 //!   `scanbus: <what failed>: <D-Bus error name>: <message>`. "What failed" is context
 //!   only the call site has, so every error carries it;
+//! - **a selector, which never reached the daemon**. [`ScanbusError`] cannot describe
+//!   "you named something that does not exist", because nothing was called: the daemon
+//!   answered `GetManagedObjects` and it is this client that then refused. §8 gives that
+//!   exit 4, along with the object that resolved and was gone by the time the call
+//!   reached it — same fact, later.
 //! - **activation, which is not a refusal**. `org.freedesktop.DBus.Error.ServiceUnknown`
 //!   and the `…Error.Spawn.*` family arrive as ordinary named errors and would map to
 //!   exit 1, but §8 gives "daemon unavailable, or activation failed" its own code (3),
@@ -100,6 +105,10 @@ impl Error {
             Kind::Client(ClientError::NotRunning) => 3,
             Kind::Client(ClientError::Call(error)) if is_activation_failure(error) => 3,
             Kind::Client(ClientError::Call(error)) => error.exit_code(),
+            // §8 code 4. `Vanished` shares it with `Select` because it is the same fact
+            // arriving later: the object the user named is not there. A script retrying
+            // after a `discover` wants both cases, and neither is the daemon refusing.
+            Kind::Client(ClientError::Select(_) | ClientError::Vanished { .. }) => 4,
             Kind::Client(_) | Kind::Timeout(_) | Kind::NotImplemented(_) | Kind::Write(_) => 1,
         }
     }
@@ -153,6 +162,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(test)]
 mod tests {
+    use scanbus_client::{ObjectKind, SelectError};
+
     use super::*;
 
     fn refusal(name: &str) -> Error {
@@ -213,6 +224,53 @@ mod tests {
         let error = Error::call("listing the scanners", ClientError::NotRunning);
         assert_eq!(error.exit_code(), 3);
         assert!(error.to_string().contains("org.scanbus"), "{error}");
+    }
+
+    /// A selector that named nothing, or too much, is exit 4 — and the sentence carries
+    /// the candidates, because an ambiguity report without them is a riddle.
+    #[test]
+    fn a_selector_that_did_not_resolve_is_exit_four() {
+        let ambiguous = SelectError::Ambiguous {
+            kind: ObjectKind::Scanner,
+            selector: "MFC".to_owned(),
+            candidates: vec!["brother_a (MFC-L2710DW)".to_owned(), "brother_b".to_owned()],
+        };
+        let error = Error::call("finding the scanner", ClientError::from(ambiguous));
+
+        assert_eq!(error.exit_code(), 4);
+        let printed = error.to_string();
+        assert!(printed.starts_with("finding the scanner: "), "{printed}");
+        assert!(printed.contains("brother_a (MFC-L2710DW)"), "{printed}");
+        assert!(printed.contains("brother_b"), "{printed}");
+
+        let missing = SelectError::NotFound {
+            kind: ObjectKind::Job,
+            selector: "4f2a".to_owned(),
+            known: Vec::new(),
+        };
+        assert_eq!(
+            Error::call("finding the job", ClientError::from(missing)).exit_code(),
+            4
+        );
+    }
+
+    /// An object that resolved and then left the bus is the same exit code: it is still
+    /// "the thing you named is not there", and it must not read as a `zbus` failure.
+    #[test]
+    fn an_object_that_vanished_is_exit_four_and_names_itself() {
+        let error = Error::call(
+            "pairing the scanner",
+            ClientError::Vanished {
+                kind: ObjectKind::Scanner,
+                name: "brother_net_192_2E168_2E1_2E23".to_owned(),
+            },
+        );
+
+        assert_eq!(error.exit_code(), 4);
+        assert!(
+            error.to_string().contains("brother_net_192_2E168_2E1_2E23"),
+            "{error}"
+        );
     }
 
     /// A call that never came back is not the wait timeout of exit 12.

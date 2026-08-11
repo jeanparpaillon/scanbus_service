@@ -13,12 +13,20 @@
 //! second being the one everybody types. `global = true` on each argument propagates it
 //! to every subcommand, which is what makes the two spellings the same command.
 //!
+//! # `--id` is not one of them
+//!
+//! §3's table of global options does not list `--id`, and it is not made one here even
+//! though every command that takes a scanner accepts it. A truly global flag would appear
+//! in the help of `status` and `profile list`, which take no selector and would silently
+//! ignore it. It rides on [`ScannerArg`] instead — flattened into each command that names
+//! a scanner — so the help offers it where it means something and nowhere else.
+//!
 //! [`scanbus-cli.md`]: https://github.com/jeanparpaillon/scanbus_service/blob/master/docs/scanbus-cli.md
 
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
-use scanbus_client::Bus;
+use scanbus_client::{Bus, Match};
 
 use crate::duration::parse_duration;
 
@@ -78,6 +86,54 @@ pub struct Global {
     pub no_activate: bool,
 }
 
+/// A scanner, and the flag that pins how it is read (§5).
+///
+/// Flattened into every command that names one, so that the four spellings and the one
+/// way to refuse three of them are declared once. `--id` is what a script uses: a `Name`
+/// is a human label the device is free to change, an `Id` is contractual ([1.2]), and a
+/// script matching on a name works until the day it silently selects a different scanner.
+///
+/// [1.2]: https://github.com/jeanparpaillon/scanbus_service/issues/2
+#[derive(Debug, Args)]
+pub struct ScannerArg {
+    /// Object path, exact id, unique id prefix, or unique substring of a name
+    pub scanner: String,
+
+    /// Read SCANNER as an exact Id: no path, no prefix, no name. What scripts should use
+    #[arg(long)]
+    pub id: bool,
+}
+
+impl ScannerArg {
+    /// How §5's ladder is to be climbed for this argument.
+    pub const fn matching(&self) -> Match {
+        if self.id { Match::ExactId } else { Match::Any }
+    }
+}
+
+/// The optional `--scanner` of the `job` listings, with the same `--id`.
+///
+/// A separate type from [`ScannerArg`] because the selector is optional here — `job list`
+/// with no scanner is every job — and `--id` without it would be a flag qualifying
+/// nothing, which `requires` turns into a usage error rather than a silent no-op.
+#[derive(Debug, Args)]
+pub struct ScannerFilter {
+    /// Only jobs from this scanner
+    #[arg(long, value_name = "SCANNER")]
+    pub scanner: Option<String>,
+
+    /// Read --scanner as an exact Id: no path, no prefix, no name
+    #[arg(long, requires = "scanner")]
+    pub id: bool,
+}
+
+impl ScannerFilter {
+    /// How §5's ladder is to be climbed for `--scanner`, when there is one.
+    pub const fn matching(&self) -> Match {
+        if self.id { Match::ExactId } else { Match::Any }
+    }
+}
+
 /// The commands of §3.
 #[derive(Debug, Subcommand)]
 pub enum Command {
@@ -108,8 +164,8 @@ pub enum Command {
 
     /// Every property of one scanner, plus its buttons
     Show {
-        /// Object path, exact id, unique id prefix, or unique substring of a name
-        scanner: String,
+        #[command(flatten)]
+        scanner: ScannerArg,
     },
 
     /// Start a discovery session and stream what appears
@@ -150,8 +206,8 @@ pub enum Command {
     /// what the D-Bus API itself does. Interrupting a wait does not cancel the pairing:
     /// the daemon owns it, and `scanbus cancel-pairing` is what stops it.
     Pair {
-        /// Object path, exact id, unique id prefix, or unique substring of a name
-        scanner: String,
+        #[command(flatten)]
+        scanner: ScannerArg,
 
         /// Return as soon as Pair() returns, without waiting for the verdict
         #[arg(long)]
@@ -160,14 +216,14 @@ pub enum Command {
 
     /// Cancel a pairing in progress
     CancelPairing {
-        /// Object path, exact id, unique id prefix, or unique substring of a name
-        scanner: String,
+        #[command(flatten)]
+        scanner: ScannerArg,
     },
 
     /// Remove a pairing, and the persisted state that goes with it
     Unpair {
-        /// Object path, exact id, unique id prefix, or unique substring of a name
-        scanner: String,
+        #[command(flatten)]
+        scanner: ScannerArg,
 
         /// Do not prompt for confirmation
         #[arg(long)]
@@ -176,8 +232,8 @@ pub enum Command {
 
     /// Declare this host ready to receive from a scanner
     Connect {
-        /// Object path, exact id, unique id prefix, or unique substring of a name
-        scanner: String,
+        #[command(flatten)]
+        scanner: ScannerArg,
 
         /// Session profile, one of the values `scanbus profile list` reports
         #[arg(long, value_name = "PROFILE")]
@@ -186,8 +242,8 @@ pub enum Command {
 
     /// Stop listening for a scanner's events
     Disconnect {
-        /// Object path, exact id, unique id prefix, or unique substring of a name
-        scanner: String,
+        #[command(flatten)]
+        scanner: ScannerArg,
     },
 
     /// Host-driven scan
@@ -196,8 +252,8 @@ pub enum Command {
     /// org.freedesktop.DBus.Error.UnknownMethod, and this command says so rather than
     /// failing obscurely.
     Scan {
-        /// Object path, exact id, unique id prefix, or unique substring of a name
-        scanner: String,
+        #[command(flatten)]
+        scanner: ScannerArg,
 
         /// Profile to apply to this scan
         #[arg(long, value_name = "PROFILE")]
@@ -243,8 +299,8 @@ pub enum Command {
 pub enum ButtonCommand {
     /// The physical menu, with what each entry is assigned
     List {
-        /// Object path, exact id, unique id prefix, or unique substring of a name
-        scanner: String,
+        #[command(flatten)]
+        scanner: ScannerArg,
     },
 
     /// Assign a profile, a label or options to one key
@@ -254,8 +310,8 @@ pub enum ButtonCommand {
     /// The engraved label is the firmware's and is read-only on most devices; --label
     /// only works where the device says it is configurable.
     Set {
-        /// Object path, exact id, unique id prefix, or unique substring of a name
-        scanner: String,
+        #[command(flatten)]
+        scanner: ScannerArg,
 
         /// Key index, or a unique substring of its device label
         button: String,
@@ -275,8 +331,8 @@ pub enum ButtonCommand {
 
     /// Unassign a key
     Clear {
-        /// Object path, exact id, unique id prefix, or unique substring of a name
-        scanner: String,
+        #[command(flatten)]
+        scanner: ScannerArg,
 
         /// Key index, or a unique substring of its device label
         button: String,
@@ -288,9 +344,8 @@ pub enum ButtonCommand {
 pub enum JobCommand {
     /// Jobs the daemon is holding right now
     List {
-        /// Only jobs from this scanner
-        #[arg(long, value_name = "SCANNER")]
-        scanner: Option<String>,
+        #[command(flatten)]
+        filter: ScannerFilter,
     },
 
     /// Everything about one job
@@ -301,9 +356,8 @@ pub enum JobCommand {
 
     /// Follow jobs as they progress
     Watch {
-        /// Only jobs from this scanner
-        #[arg(long, value_name = "SCANNER")]
-        scanner: Option<String>,
+        #[command(flatten)]
+        filter: ScannerFilter,
 
         /// Exit when the first job followed reaches a terminal state
         #[arg(long)]
