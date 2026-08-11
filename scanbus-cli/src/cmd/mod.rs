@@ -24,6 +24,7 @@ pub mod status;
 
 mod discover;
 mod list;
+mod pair;
 mod scanner_view;
 mod show;
 
@@ -55,6 +56,9 @@ pub async fn dispatch(context: &Context, command: &Command) -> Result<u8> {
             watch,
             keep,
         } => discover::run(context, backends, *duration, *watch, *keep).await,
+        Command::Pair { scanner, no_wait } => pair::run(context, scanner, *no_wait).await,
+        Command::CancelPairing { scanner } => pair::cancel(context, scanner).await,
+        Command::Unpair { scanner, yes } => pair::unpair(context, scanner, *yes).await,
         pending => stub(context, pending).await,
     }
 }

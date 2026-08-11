@@ -53,6 +53,14 @@ enum Kind {
     /// make exit 12 unusable for the thing it names.
     Timeout(Duration),
 
+    /// A `--wait` — in practice, `pair` — whose target never reached the state being
+    /// waited for before `--timeout` elapsed.
+    ///
+    /// The daemon kept answering; the scanner just never got to `done` or `failed`, so
+    /// this is exit 12 rather than [`Kind::Timeout`]'s 1: "the daemon never told me it
+    /// finished" is a different fact from "the daemon never replied".
+    WaitTimeout(Duration),
+
     /// A command whose D-Bus surface exists but whose implementation is a later issue,
     /// named so the message is a pointer rather than a wall.
     NotImplemented(String),
@@ -75,6 +83,14 @@ impl Error {
         Self {
             what: what.into(),
             kind: Kind::Timeout(after),
+        }
+    }
+
+    /// `--timeout` elapsed while waiting for a scanner to reach the state `what` names.
+    pub fn wait_timeout(what: impl Into<String>, after: Duration) -> Self {
+        Self {
+            what: what.into(),
+            kind: Kind::WaitTimeout(after),
         }
     }
 
@@ -109,6 +125,7 @@ impl Error {
             // arriving later: the object the user named is not there. A script retrying
             // after a `discover` wants both cases, and neither is the daemon refusing.
             Kind::Client(ClientError::Select(_) | ClientError::Vanished { .. }) => 4,
+            Kind::WaitTimeout(_) => 12,
             Kind::Client(_) | Kind::Timeout(_) | Kind::NotImplemented(_) | Kind::Write(_) => 1,
         }
     }
@@ -126,6 +143,9 @@ impl fmt::Display for Error {
         match &self.kind {
             Kind::Client(error) => write!(f, "{error}"),
             Kind::Timeout(after) => write!(f, "no reply after {}", format_duration(*after)),
+            Kind::WaitTimeout(after) => {
+                write!(f, "still not done after {}", format_duration(*after))
+            }
             Kind::NotImplemented(issue) => {
                 write!(f, "not implemented yet — issue {issue} builds it")
             }
