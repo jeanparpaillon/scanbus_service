@@ -2,6 +2,10 @@ Source: scanbus
 Section: utils
 Priority: optional
 Maintainer: Jean Parpaillon <jean@parpaillon.info>
+Build-Depends: cargo,
+ rustc,
+ make,
+ dpkg-dev
 Standards-Version: 4.7.0
 
 Package: scanbus
