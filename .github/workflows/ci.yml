@@ -37,9 +37,11 @@ jobs:
 
       # Default features: neither backend is compiled into the daemon, because both
       # shell out to hardware-specific tooling no runner has.
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # `scanbus-gui` is temporarily excluded from CI builds: it pulls in a large GUI
+      # dependency stack that we do not want to provision on runners yet.
+      - run: cargo clippy --workspace --exclude scanbus-gui --all-targets --locked -- -D warnings
 
-      - run: cargo test --workspace --locked
+      - run: cargo test --workspace --exclude scanbus-gui --locked
 
   features:
     name: feature matrix
@@ -61,7 +63,9 @@ jobs:
           key: ${{ runner.os }}-features-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-features-${{ env.RUST_VERSION }}-
 
-      - run: cargo build --workspace --locked
+      # Keep the GUI out of CI for now for the same reason as above; we will add a
+      # dedicated setup once we are ready to carry its system dependencies here.
+      - run: cargo build --workspace --exclude scanbus-gui --locked
 
       # The backend crates only ever reach the daemon through these features, so this
       # is the one build that links them.
