@@ -3,13 +3,20 @@ use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Once;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt as _;
 use futures_util::stream::BoxStream;
+use image::ColorType;
+use image::ImageDecoder as _;
 use image::ImageFormat;
+use image::codecs::jpeg::JpegDecoder;
 use image::codecs::jpeg::JpegEncoder;
+use lopdf::content::{Content, Operation};
+use lopdf::{Document as LoDocument, Object, Stream, dictionary};
 use scanbus_core::{PageFormat, ProfileKind, ProfileProcessor, ProfileResult, RawPage, Value};
+use tempfile::Builder as TempDirBuilder;
 use tokio::sync::Mutex;
 
 const IMAGE_FORMAT: &str = "format";
@@ -17,6 +24,7 @@ const IMAGE_QUALITY: &str = "quality";
 const DOCUMENT_FORMAT: &str = "format";
 const DOCUMENT_MULTI_PAGE: &str = "multi_page";
 const OUTPUT_FOLDER: &str = "output_folder";
+const DOCUMENT_SPOOL_DIR: &str = "scanbus-document-spool";
 
 /// Profile defaults, persistence and processors.
 pub struct ProfileRegistry {
@@ -38,7 +46,7 @@ impl ProfileRegistry {
             store_path: None,
             options: Mutex::new(default_options()),
             image: Arc::new(ImageProcessor),
-            document: Arc::new(DocumentProcessor),
+            document: Arc::new(DocumentProcessor::new()),
         }
     }
 
@@ -49,7 +57,7 @@ impl ProfileRegistry {
             store_path: Some(store_path),
             options: Mutex::new(loaded),
             image: Arc::new(ImageProcessor),
-            document: Arc::new(DocumentProcessor),
+            document: Arc::new(DocumentProcessor::new()),
         }
     }
 
@@ -240,7 +248,44 @@ const fn image_format_from_page(format: PageFormat) -> ImageFormat {
     }
 }
 
-struct DocumentProcessor;
+struct DocumentProcessor {
+    spool_root: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PdfColorSpace {
+    DeviceGray,
+    DeviceRgb,
+}
+
+impl PdfColorSpace {
+    fn as_pdf_name(self) -> &'static str {
+        match self {
+            Self::DeviceGray => "DeviceGray",
+            Self::DeviceRgb => "DeviceRGB",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SpoolPage {
+    path: PathBuf,
+    width_px: u32,
+    height_px: u32,
+    dpi: u32,
+    color_space: PdfColorSpace,
+}
+
+impl DocumentProcessor {
+    fn new() -> Self {
+        let spool_root = std::env::temp_dir().join(DOCUMENT_SPOOL_DIR);
+        static SWEEP_ON_START: Once = Once::new();
+        SWEEP_ON_START.call_once(|| {
+            let _ = sweep_spool_root(&spool_root);
+        });
+        Self { spool_root }
+    }
+}
 
 #[async_trait::async_trait]
 impl ProfileProcessor for DocumentProcessor {
@@ -257,34 +302,239 @@ impl ProfileProcessor for DocumentProcessor {
         let output_dir = output_dir(options, ProfileKind::Document)?;
         ensure_output_dir(&output_dir)?;
 
-        let mut buffers = Vec::new();
+        fs::create_dir_all(&self.spool_root).map_err(|error| {
+            format!(
+                "cannot create document spool root {}: {error}",
+                self.spool_root.display()
+            )
+        })?;
+        let spool = TempDirBuilder::new()
+            .prefix("job-")
+            .tempdir_in(&self.spool_root)
+            .map_err(|error| {
+                format!(
+                    "cannot create per-job spool directory in {}: {error}",
+                    self.spool_root.display()
+                )
+            })?;
+
+        let mut spooled = Vec::new();
         while let Some(page) = pages.next().await {
-            buffers.push(page.data);
-            if !multi_page {
-                break;
-            }
+            let entry = spool_page_to_jpeg(spool.path(), &page)?;
+            spooled.push(entry);
         }
 
-        if buffers.is_empty() {
+        if spooled.is_empty() {
             return Err("the scan delivered no pages; nothing to write".to_owned());
         }
 
         let stamp = scan_stamp();
-        let path = unique_path(output_dir.join(format!("scan-{stamp}.pdf")));
+        let mut out_paths = Vec::new();
 
-        // Minimal placeholder payload: enough for a file the client can consume by path.
-        let mut payload = b"%PDF-1.4\n% scanbus\n".to_vec();
-        for chunk in buffers {
-            payload.extend_from_slice(&chunk);
-            payload.push(b'\n');
+        if multi_page {
+            let path = unique_path(output_dir.join(format!("scan-{stamp}.pdf")));
+            write_pdf_document(&spooled, &path)?;
+            out_paths.push(path.to_string_lossy().to_string());
+        } else {
+            for (index, page) in spooled.iter().enumerate() {
+                let path = unique_path(output_dir.join(format!("scan-{stamp}-p{:03}.pdf", index + 1)));
+                write_pdf_document(std::slice::from_ref(page), &path)?;
+                out_paths.push(path.to_string_lossy().to_string());
+            }
         }
-        fs::write(&path, payload)
-            .map_err(|error| format!("cannot write document to {}: {error}", path.display()))?;
 
-        Ok(ProfileResult::Document {
-            path: path.to_string_lossy().to_string(),
-        })
+        Ok(ProfileResult::Document { paths: out_paths })
     }
+}
+
+fn write_pdf_document(pages: &[SpoolPage], output_path: &Path) -> Result<(), String> {
+    let mut doc = LoDocument::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let mut kids = Vec::with_capacity(pages.len());
+
+    for (index, page) in pages.iter().enumerate() {
+        let image_name = format!("Im{}", index + 1);
+        let image_object_name = Object::Name(image_name.as_bytes().to_vec());
+        let image_bytes = fs::read(&page.path)
+            .map_err(|error| format!("cannot read spooled page {}: {error}", page.path.display()))?;
+
+        let image_stream = Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => i64::from(page.width_px),
+                "Height" => i64::from(page.height_px),
+                "ColorSpace" => page.color_space.as_pdf_name(),
+                "BitsPerComponent" => 8,
+                "Filter" => "DCTDecode",
+            },
+            image_bytes,
+        );
+        let image_id = doc.add_object(image_stream);
+
+        let width_pt = pixels_to_points(page.width_px, page.dpi)?;
+        let height_pt = pixels_to_points(page.height_px, page.dpi)?;
+        let content = Content {
+            operations: vec![
+                Operation::new("q", vec![]),
+                Operation::new(
+                    "cm",
+                    vec![
+                        width_pt.into(),
+                        0.into(),
+                        0.into(),
+                        height_pt.into(),
+                        0.into(),
+                        0.into(),
+                    ],
+                ),
+                Operation::new("Do", vec![image_object_name]),
+                Operation::new("Q", vec![]),
+            ],
+        };
+        let content_stream = Stream::new(dictionary! {}, content.encode().map_err(|error| {
+            format!(
+                "cannot encode PDF content stream for page {}: {error}",
+                index + 1
+            )
+        })?);
+        let content_id = doc.add_object(content_stream);
+
+        let resources = dictionary! {
+            "XObject" => dictionary! {
+                image_name.as_str() => Object::Reference(image_id),
+            }
+        };
+
+        let page_dict = dictionary! {
+            "Type" => "Page",
+            "Parent" => Object::Reference(pages_id),
+            "MediaBox" => vec![0.into(), 0.into(), width_pt.into(), height_pt.into()],
+            "Resources" => resources,
+            "Contents" => Object::Reference(content_id),
+        };
+
+        let page_id = doc.add_object(page_dict);
+        kids.push(Object::Reference(page_id));
+    }
+
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => Object::Array(kids),
+            "Count" => i64::try_from(pages.len()).unwrap_or(i64::MAX),
+        }),
+    );
+
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => Object::Reference(pages_id),
+    });
+    doc.trailer.set("Root", Object::Reference(catalog_id));
+
+    doc.save(output_path)
+        .map_err(|error| format!("cannot write document to {}: {error}", output_path.display()))?;
+
+    Ok(())
+}
+
+fn spool_page_to_jpeg(spool_dir: &Path, page: &RawPage) -> Result<SpoolPage, String> {
+    let path = spool_dir.join(format!("p{:06}.jpg", page.index + 1));
+    let (jpeg, width_px, height_px, color_space) = page_to_pdf_jpeg(page)?;
+
+    fs::write(&path, jpeg)
+        .map_err(|error| format!("cannot write spooled page {}: {error}", path.display()))?;
+
+    Ok(SpoolPage {
+        path,
+        width_px,
+        height_px,
+        dpi: page.resolution_dpi,
+        color_space,
+    })
+}
+
+fn page_to_pdf_jpeg(page: &RawPage) -> Result<(Vec<u8>, u32, u32, PdfColorSpace), String> {
+    if page.resolution_dpi == 0 {
+        return Err(format!(
+            "page {} has invalid resolution 0 dpi",
+            page.index + 1
+        ));
+    }
+
+    if page.format == PageFormat::Jpeg {
+        let cursor = Cursor::new(page.data.as_slice());
+        let decoder = JpegDecoder::new(cursor)
+            .map_err(|error| format!("cannot parse JPEG page {}: {error}", page.index + 1))?;
+        let (width_px, height_px) = decoder.dimensions();
+        let color_space = pdf_color_space_for_jpeg(decoder.color_type()).ok_or_else(|| {
+            format!(
+                "unsupported JPEG color model on page {}: {:?}",
+                page.index + 1,
+                decoder.color_type()
+            )
+        })?;
+        return Ok((page.data.clone(), width_px, height_px, color_space));
+    }
+
+    let decoded = decode_page(page)?;
+    let width_px = decoded.width();
+    let height_px = decoded.height();
+    let rgb = decoded.to_rgb8();
+
+    let mut out = Vec::new();
+    let mut encoder = JpegEncoder::new_with_quality(&mut out, 90);
+    encoder
+        .encode(
+            rgb.as_raw(),
+            width_px,
+            height_px,
+            image::ExtendedColorType::Rgb8,
+        )
+        .map_err(|error| format!("cannot encode page {} to JPEG: {error}", page.index + 1))?;
+
+    Ok((out, width_px, height_px, PdfColorSpace::DeviceRgb))
+}
+
+fn pdf_color_space_for_jpeg(color_type: ColorType) -> Option<PdfColorSpace> {
+    match color_type {
+        ColorType::L8 | ColorType::L16 => Some(PdfColorSpace::DeviceGray),
+        ColorType::Rgb8 | ColorType::Rgb16 => Some(PdfColorSpace::DeviceRgb),
+        _ => None,
+    }
+}
+
+fn pixels_to_points(pixels: u32, dpi: u32) -> Result<f32, String> {
+    if dpi == 0 {
+        return Err("dpi must be greater than zero".to_owned());
+    }
+
+    Ok((pixels as f32 * 72.0) / dpi as f32)
+}
+
+fn sweep_spool_root(root: &Path) -> Result<(), String> {
+    if !root.exists() {
+        return Ok(());
+    }
+
+    let entries = fs::read_dir(root)
+        .map_err(|error| format!("cannot list spool root {}: {error}", root.display()))?;
+
+    for entry in entries {
+        let entry = entry
+            .map_err(|error| format!("cannot read spool root entry {}: {error}", root.display()))?;
+        let path = entry.path();
+        if path.is_dir() {
+            fs::remove_dir_all(&path)
+                .map_err(|error| format!("cannot remove stale spool {}: {error}", path.display()))?;
+        } else {
+            fs::remove_file(&path)
+                .map_err(|error| format!("cannot remove stale spool file {}: {error}", path.display()))?;
+        }
+    }
+
+    Ok(())
 }
 
 fn validate_options(kind: ProfileKind, options: &BTreeMap<String, Value>) -> Result<(), String> {
@@ -570,6 +820,7 @@ mod tests {
     use super::*;
     use futures_util::stream;
     use image::{ImageBuffer, Rgba};
+    use lopdf::Object as PdfObject;
     use scanbus_core::ProfileProcessor;
 
     #[test]
@@ -769,5 +1020,190 @@ mod tests {
         assert!(names[9].contains("p010"));
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    fn jpeg_with_dimensions(width: u32, height: u32, color: [u8; 4]) -> Vec<u8> {
+        let pixels: ImageBuffer<Rgba<u8>, Vec<u8>> =
+            ImageBuffer::from_pixel(width, height, Rgba(color));
+        let mut out = Vec::new();
+        let mut encoder = JpegEncoder::new_with_quality(&mut out, 85);
+        encoder
+            .encode_image(&image::DynamicImage::ImageRgba8(pixels))
+            .unwrap();
+        out
+    }
+
+    fn as_f32(value: &PdfObject) -> Option<f32> {
+        match value {
+            PdfObject::Integer(v) => Some(*v as f32),
+            PdfObject::Real(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn document_profile_writes_a_real_pdf_with_expected_page_size() {
+        let dir = std::env::temp_dir().join(format!(
+            "scanbus-document-pdf-{}-{}",
+            std::process::id(),
+            scan_stamp()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+
+        let options = BTreeMap::from([(
+            OUTPUT_FOLDER.to_owned(),
+            Value::Str(dir.to_string_lossy().to_string()),
+        )]);
+        let page = RawPage {
+            index: 0,
+            format: PageFormat::Jpeg,
+            resolution_dpi: 300,
+            data: jpeg_with_dimensions(300, 600, [60, 100, 200, 255]),
+        };
+
+        let result = DocumentProcessor::new()
+            .process(Box::pin(stream::iter([page])), &options)
+            .await
+            .unwrap();
+        let ProfileResult::Document { paths } = result else {
+            panic!("unexpected profile result");
+        };
+        assert_eq!(paths.len(), 1);
+
+        let pdf = LoDocument::load(&paths[0]).unwrap();
+        let pages = pdf.get_pages();
+        assert_eq!(pages.len(), 1);
+
+        let page_id = pages[&1];
+        let page_dict = pdf.get_object(page_id).unwrap().as_dict().unwrap();
+        let media_box = page_dict.get(b"MediaBox").unwrap().as_array().unwrap();
+
+        let width_pt = as_f32(&media_box[2]).unwrap();
+        let height_pt = as_f32(&media_box[3]).unwrap();
+        assert!((width_pt - 72.0).abs() < 0.2, "unexpected width: {width_pt}");
+        assert!(
+            (height_pt - 144.0).abs() < 0.2,
+            "unexpected height: {height_pt}"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn document_profile_embeds_jpeg_input_without_reencoding() {
+        let dir = std::env::temp_dir().join(format!(
+            "scanbus-document-jpeg-pass-through-{}-{}",
+            std::process::id(),
+            scan_stamp()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+
+        let jpeg = jpeg_with_dimensions(64, 64, [10, 40, 90, 255]);
+        let page = RawPage {
+            index: 0,
+            format: PageFormat::Jpeg,
+            resolution_dpi: 300,
+            data: jpeg.clone(),
+        };
+        let options = BTreeMap::from([(
+            OUTPUT_FOLDER.to_owned(),
+            Value::Str(dir.to_string_lossy().to_string()),
+        )]);
+
+        let result = DocumentProcessor::new()
+            .process(Box::pin(stream::iter([page])), &options)
+            .await
+            .unwrap();
+        let ProfileResult::Document { paths } = result else {
+            panic!("unexpected profile result");
+        };
+
+        let pdf = LoDocument::load(&paths[0]).unwrap();
+        let mut found = false;
+        for object in pdf.objects.values() {
+            let PdfObject::Stream(stream) = object else {
+                continue;
+            };
+
+            let Ok(PdfObject::Name(subtype)) = stream.dict.get(b"Subtype") else {
+                continue;
+            };
+            if subtype.as_slice() != b"Image" {
+                continue;
+            }
+
+            let Ok(PdfObject::Name(filter)) = stream.dict.get(b"Filter") else {
+                continue;
+            };
+            if filter.as_slice() != b"DCTDecode" {
+                continue;
+            }
+
+            if stream.content == jpeg {
+                found = true;
+                break;
+            }
+        }
+
+        assert!(found, "could not find the original JPEG stream in the PDF");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn document_profile_multi_page_false_writes_one_pdf_per_page() {
+        let dir = std::env::temp_dir().join(format!(
+            "scanbus-document-single-per-page-{}-{}",
+            std::process::id(),
+            scan_stamp()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+
+        let options = BTreeMap::from([
+            (DOCUMENT_MULTI_PAGE.to_owned(), Value::Bool(false)),
+            (
+                OUTPUT_FOLDER.to_owned(),
+                Value::Str(dir.to_string_lossy().to_string()),
+            ),
+        ]);
+        let pages = (0..3).map(|index| RawPage {
+            index,
+            format: PageFormat::Jpeg,
+            resolution_dpi: 300,
+            data: jpeg_with_dimensions(32, 48, [20 + index as u8, 80, 140, 255]),
+        });
+
+        let result = DocumentProcessor::new()
+            .process(Box::pin(stream::iter(pages)), &options)
+            .await
+            .unwrap();
+        let ProfileResult::Document { paths } = result else {
+            panic!("unexpected profile result");
+        };
+
+        assert_eq!(paths.len(), 3);
+        for path in &paths {
+            let doc = LoDocument::load(path).unwrap();
+            assert_eq!(doc.get_pages().len(), 1);
+        }
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sweep_spool_root_removes_stale_entries() {
+        let root = std::env::temp_dir().join(format!(
+            "scanbus-document-sweep-{}-{}",
+            std::process::id(),
+            scan_stamp()
+        ));
+        fs::create_dir_all(root.join("orphan-a")).unwrap();
+        fs::create_dir_all(root.join("orphan-b")).unwrap();
+        fs::write(root.join("orphan-file"), b"x").unwrap();
+
+        sweep_spool_root(&root).unwrap();
+        let remaining = fs::read_dir(&root).unwrap().count();
+        assert_eq!(remaining, 0);
+
+        let _ = fs::remove_dir_all(root);
     }
 }

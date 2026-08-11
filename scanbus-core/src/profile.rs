@@ -16,8 +16,8 @@ use crate::model::{RawPage, Value};
 pub enum ProfileResult {
     /// One output file per page.
     Image { paths: Vec<String> },
-    /// One output file for the whole scan.
-    Document { path: String },
+    /// One output file for the whole scan, or one per page when explicitly requested.
+    Document { paths: Vec<String> },
 }
 
 impl ProfileResult {
@@ -28,8 +28,14 @@ impl ProfileResult {
                 "paths".to_owned(),
                 Value::Array(paths.iter().cloned().map(Value::Str).collect()),
             )]),
-            Self::Document { path } => {
-                BTreeMap::from([("path".to_owned(), Value::Str(path.clone()))])
+            Self::Document { paths } if paths.len() == 1 => {
+                BTreeMap::from([("path".to_owned(), Value::Str(paths[0].clone()))])
+            }
+            Self::Document { paths } => {
+                BTreeMap::from([(
+                    "paths".to_owned(),
+                    Value::Array(paths.iter().cloned().map(Value::Str).collect()),
+                )])
             }
         }
     }

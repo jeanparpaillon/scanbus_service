@@ -42,7 +42,7 @@ Keeping `scanbus-core` separate from the rest makes it possible to test the busi
 | `serde` / `serde_json` | Config serialisation + pairing persistence |
 | `thiserror` | Typed errors per crate, then mapped to `zbus::fdo::Error` |
 | `tracing` + `tracing-subscriber` | Structured logs (essential for debugging proprietary backends) |
-| `printpdf` or `lopdf` | Multi-page PDF assembly (`document` profile) |
+| `lopdf` | Multi-page PDF assembly (`document` profile), with direct JPEG embedding |
 | `image` | Format conversion/normalisation (`image` profile) |
 | `notify` | Watching config files in case of external edits (optional) |
 | `rusqlite` (or JSON files through `serde`) | Persisting pairings across restarts |
@@ -139,7 +139,7 @@ trait ProfileProcessor {
 ```
 
 - `ImageProcessor`: writes each received page straight to a file (jpeg/png), returns the list of paths.
-- `DocumentProcessor`: accumulates the pages (buffering as long as the backend reports more — ADF), assembles them into a PDF through `printpdf`/`lopdf` at the end, returns a single path.
+- `DocumentProcessor`: spools pages to a per-job temp directory while capture is running (ADF-safe memory profile), then assembles the PDF with `lopdf` and returns a path result. `lopdf` was chosen because it allows embedding backend-provided JPEG bytes directly (`DCTDecode`) without re-encoding, preserving quality and file size.
 `Job1` ties it together: `State` moves to `"processing"` once every page has been received, the `ProfileProcessor` matching `Job.Profile` is invoked, and the result is stored in `Job1.Result`.
 
 ## 7. Suggested development order

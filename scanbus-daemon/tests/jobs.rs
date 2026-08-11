@@ -475,6 +475,76 @@ async fn a_press_publishes_a_job_stamped_with_its_key_and_profile() {
     daemon.shutdown().await;
 }
 
+/// Acceptance: `document` with `multi_page=false` writes one single-page PDF per incoming
+/// page, and reports them as `Result.paths`.
+#[tokio::test]
+async fn document_profile_multi_page_false_reports_paths() {
+    let Some(bus) = PrivateBus::start().await else {
+        return skipped("document_profile_multi_page_false_reports_paths");
+    };
+    let info = brother();
+    let daemon = Daemon::start(&bus, [info.clone()]).await;
+    let client = bus.connect().await;
+    daemon.ready(&info).await;
+
+    let out = std::env::temp_dir().join(format!(
+        "scanbus-document-multi-false-{}-{}",
+        std::process::id(),
+        JobRegistry::FIRST_ID
+    ));
+    fs::create_dir_all(&out).unwrap();
+
+    let document = profile_proxy(&client, scanbus_core::ProfileKind::Document).await;
+    document
+        .set_options(HashMap::from([
+            (
+                "format".to_owned(),
+                OwnedValue::try_from(ZValue::from("pdf")).unwrap(),
+            ),
+            (
+                "multi_page".to_owned(),
+                OwnedValue::try_from(ZValue::from(false)).unwrap(),
+            ),
+            (
+                "output_folder".to_owned(),
+                OwnedValue::try_from(ZValue::from(out.to_string_lossy().to_string())).unwrap(),
+            ),
+        ]))
+        .await
+        .unwrap();
+
+    let key = button_proxy(&client, &info.id, 2).await;
+    key.set_profile("document").await.unwrap();
+
+    let feed = open_next_job(&daemon.handle(), JobRegistry::FIRST_ID);
+    daemon.press(&info.id, 2);
+    for index in 0..3 {
+        feed.page(jpeg_page(index, 20 + (index as u8) * 50)).unwrap();
+    }
+    let path = await_job(&client, &info.id, JobRegistry::FIRST_ID).await;
+    let job = job_proxy(&client, &info.id, JobRegistry::FIRST_ID).await;
+    let mut announced = changes(&client, path.clone()).await;
+    feed.end();
+
+    assert_eq!(next_string(&mut announced, "State").await, "processing");
+    assert_eq!(next_string(&mut announced, "State").await, "done");
+
+    let result = job.result().await.unwrap();
+    let paths = result
+        .get("paths")
+        .and_then(|value| Vec::<String>::try_from(value.clone()).ok())
+        .unwrap();
+    assert_eq!(paths.len(), 3);
+    for pdf in &paths {
+        assert!(pdf.ends_with(".pdf"));
+        assert!(std::path::Path::new(pdf).exists(), "missing output: {pdf}");
+    }
+
+    await_removed(&client, &path).await;
+    let _ = fs::remove_dir_all(out);
+    daemon.shutdown().await;
+}
+
 /// Acceptance: feeding three pages moves `PageCount` 1→2→3 with `State="receiving"`, then
 /// `processing` once the stream ends — §9's rule for an ADF batch.
 #[tokio::test]
@@ -705,6 +775,66 @@ async fn image_profile_failure_keeps_written_paths_in_result() {
 
     await_removed(&client, &path).await;
     let _ = fs::remove_dir_all(&out);
+    daemon.shutdown().await;
+}
+
+/// Acceptance: if the transfer fails mid-run while `document` is assigned, the job still
+/// reports a partial PDF path in `Result` and carries the backend error in `Error`.
+#[tokio::test]
+async fn document_profile_failure_keeps_partial_pdf_in_result() {
+    let Some(bus) = PrivateBus::start().await else {
+        return skipped("document_profile_failure_keeps_partial_pdf_in_result");
+    };
+    let info = brother();
+    let daemon = Daemon::start(&bus, [info.clone()]).await;
+    let client = bus.connect().await;
+    daemon.ready(&info).await;
+
+    let out = std::env::temp_dir().join(format!(
+        "scanbus-document-error-result-{}-{}",
+        std::process::id(),
+        JobRegistry::FIRST_ID
+    ));
+    fs::create_dir_all(&out).unwrap();
+
+    let document = profile_proxy(&client, scanbus_core::ProfileKind::Document).await;
+    document
+        .set_options(HashMap::from([(
+            "output_folder".to_owned(),
+            OwnedValue::try_from(ZValue::from(out.to_string_lossy().to_string())).unwrap(),
+        )]))
+        .await
+        .unwrap();
+
+    let button = button_proxy(&client, &info.id, 2).await;
+    button.set_profile("document").await.unwrap();
+
+    let feed = open_next_job(&daemon.handle(), JobRegistry::FIRST_ID);
+    daemon.press(&info.id, 2);
+    feed.page(jpeg_page(0, 30)).unwrap();
+    feed.page(jpeg_page(1, 90)).unwrap();
+    let path = await_job(&client, &info.id, JobRegistry::FIRST_ID).await;
+    let job = job_proxy(&client, &info.id, JobRegistry::FIRST_ID).await;
+    let mut announced = changes(&client, path.clone()).await;
+
+    feed.fail(BackendError::NotReachable {
+        scanner: info.id.clone(),
+        detail: "dropped while feeding ADF".to_owned(),
+    })
+    .unwrap();
+    feed.end();
+
+    assert_eq!(next_string(&mut announced, "State").await, "error");
+    let message = job.error().await.unwrap();
+    assert!(message.contains("dropped while feeding ADF"), "{message}");
+
+    let result = job.result().await.unwrap();
+    let pdf = String::try_from(result["path"].clone()).unwrap();
+    assert!(pdf.ends_with(".pdf"));
+    assert!(std::path::Path::new(&pdf).exists(), "missing output: {pdf}");
+
+    await_removed(&client, &path).await;
+    let _ = fs::remove_dir_all(out);
     daemon.shutdown().await;
 }
 

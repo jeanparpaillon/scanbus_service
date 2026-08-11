@@ -52,6 +52,7 @@ futures-core = "0.3"
 # futures-core, which is the one that only defines `Stream`.
 futures-util = "0.3"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "pnm", "tiff"] }
+lopdf = "0.38"
 serde = { version = "1", features = ["derive"] }
 # Test-only in scanbus-core: the model's serde impls are only worth asserting against a
 # real self-describing format, and JSON is also what the pairing store will use (4.1).
@@ -62,6 +63,7 @@ thiserror = "2"
 # runtime — see scanbus-daemon/Cargo.toml — so core does not drag mio and the signal
 # handling into its tree just by using a channel.
 tokio = { version = "1", features = ["sync"] }
+tempfile = "3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # For the daemon and the client crate, and deliberately not in scanbus-core's tree — the
