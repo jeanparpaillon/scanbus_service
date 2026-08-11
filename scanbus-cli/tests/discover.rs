@@ -90,6 +90,11 @@ impl Scanner {
     fn pairing_error(&self) -> String {
         String::new()
     }
+
+    #[zbus(property)]
+    fn pairing_info(&self) -> HashMap<String, OwnedValue> {
+        HashMap::new()
+    }
 }
 
 /// A `Button1` of the paired scanner, for `show`'s button table.

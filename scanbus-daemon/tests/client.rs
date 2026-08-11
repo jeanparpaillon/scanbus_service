@@ -51,6 +51,7 @@ fn brother() -> ScannerInfo {
                 count: 4,
                 label_configurable: false,
             },
+            profiles: Vec::new(),
             // The key this version of the client has no field for: it has to survive the
             // trip out through the daemon's renderer and back through the client's.
             extra: [(

@@ -262,6 +262,18 @@ pub fn capabilities(dict: &Dict) -> Result<Capabilities, DecodeError> {
             }
         }
     };
+    let profiles = match extra.remove("profiles") {
+        None => Vec::new(),
+        Some(value) => string_array(&value, "profiles")?
+            .iter()
+            .map(|profile| profile.parse())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| DecodeError::Member {
+                key: "profiles".to_owned(),
+                value: "<invalid>".to_owned(),
+                expected: "image, document, email, ocr",
+            })?,
+    };
 
     // Whatever is left is a key this version has no field for — kept, not dropped.
     Ok(Capabilities {
@@ -270,6 +282,7 @@ pub fn capabilities(dict: &Dict) -> Result<Capabilities, DecodeError> {
         sources,
         duplex,
         buttons,
+        profiles,
         extra,
     })
 }

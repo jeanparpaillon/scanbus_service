@@ -117,6 +117,8 @@ pub enum MockCall {
         /// `false` when nothing was listening — the no-op case the trait requires.
         was_listening: bool,
     },
+    /// [`ScannerBackend::forget`].
+    Forget(ScannerId),
     /// [`ScannerBackend::set_button_mapping`]; `profile: None` is a cleared key.
     SetButtonMapping {
         /// The scanner.
@@ -599,6 +601,12 @@ impl ScannerBackend for MockBackend {
             scanner: scanner_id.clone(),
             was_listening,
         });
+        Ok(())
+    }
+
+    async fn forget(&self, scanner_id: &ScannerId) -> Result<(), BackendError> {
+        let mut state = self.state();
+        state.calls.push(MockCall::Forget(scanner_id.clone()));
         Ok(())
     }
 

@@ -79,6 +79,13 @@ pub enum PairingProgress {
     /// machine reaches `"done"`, which is why this maps to no state of its own.
     Ready,
 
+    /// Waiting for a human to confirm on the device — a code to compare, a PIN to enter,
+    /// a physical button. Deliberately generic: nothing here says "mobile".
+    AwaitingConfirmation {
+        /// What a client shows next to the device's name, e.g. a six-digit code.
+        code: String,
+    },
+
     /// The attempt failed. Carries the same message as the [`BackendError`] the call is
     /// about to return, so a client watching `PairingError` and a caller reading the
     /// `Err` see one story.
@@ -101,6 +108,9 @@ impl PairingProgress {
             Self::Checking { .. } => Some(PairingState::Pairing),
             Self::Installing { .. } => Some(PairingState::InstallingBackend),
             Self::Ready => None,
+            Self::AwaitingConfirmation { code } => {
+                Some(PairingState::AwaitingConfirmation(code.clone()))
+            }
             Self::Failed { message } => Some(PairingState::Failed(message.clone())),
         }
     }

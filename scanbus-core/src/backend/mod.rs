@@ -131,6 +131,25 @@ pub trait ScannerBackend: Send + Sync {
     /// that refused to stop.
     async fn stop_listening(&self, scanner_id: &ScannerId) -> Result<(), BackendError>;
 
+    /// Revokes whatever backend-side state pairing created — a token, a
+    /// `brscan-skey.config` entry — so the device is no longer recognised.
+    ///
+    /// Called by `Unpair()` (§3) before the pairing store entry is dropped. Distinct
+    /// from [`stop_listening`](ScannerBackend::stop_listening): a paired device whose
+    /// listener has stopped must still be recognised when it reconnects, but a
+    /// *forgotten* one must not be. The default no-op is correct for a backend with no
+    /// such state to revoke, e.g. one that only ever identifies a device by its
+    /// physical address.
+    ///
+    /// # Errors
+    ///
+    /// [`BackendError::Other`] when the revocation itself failed. `Unpair()` reports
+    /// this without leaving the scanner paired: forgetting the pairing store entry
+    /// still goes ahead, on the same reasoning as a listener that will not stop.
+    async fn forget(&self, _scanner_id: &ScannerId) -> Result<(), BackendError> {
+        Ok(())
+    }
+
     /// Writes the key→profile mapping into the backend's own configuration, e.g.
     /// `brscan-skey.conf`, and reloads it.
     ///

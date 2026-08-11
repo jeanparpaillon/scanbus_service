@@ -316,7 +316,7 @@ impl Scanner1 {
     }
 
     /// Where the pairing process is — `"none"`, `"pairing"`, `"installing_backend"`,
-    /// `"done"`, `"failed"`.
+    /// `"awaiting_confirmation"`, `"done"`, `"failed"`.
     #[zbus(property)]
     fn pairing_state(&self) -> String {
         self.state().as_str().to_owned()
@@ -326,6 +326,19 @@ impl Scanner1 {
     #[zbus(property)]
     fn pairing_error(&self) -> String {
         self.state().pairing_error().to_owned()
+    }
+
+    /// `{"code": s}` for `PairingState="awaiting_confirmation"`, empty otherwise — so a
+    /// code never outlives its nonce.
+    #[zbus(property)]
+    fn pairing_info(&self) -> Dict {
+        let state = self.state();
+        let code = state.pairing_info();
+        if code.is_empty() {
+            Dict::new()
+        } else {
+            convert::str_map(&[("code", code)])
+        }
     }
 
     /// Starts pairing and returns — the asynchronous contract of §9.
@@ -874,6 +887,19 @@ async fn emit(
     if previous.pairing_error() != state.pairing_error() {
         changed.insert("PairingError", Value::from(state.pairing_error()));
     }
+    // Same reasoning for `PairingInfo`: it must clear when the state leaves
+    // `awaiting_confirmation`, including into `failed`, so a code never outlives its
+    // nonce.
+    if previous.pairing_info() != state.pairing_info() {
+        changed.insert(
+            "PairingInfo",
+            Value::from(if state.pairing_info().is_empty() {
+                convert::str_map(&[])
+            } else {
+                convert::str_map(&[("code", state.pairing_info())])
+            }),
+        );
+    }
 
     // Derived from the transition, not read back off the machine: an `Unpair()` landing
     // between the `Done` transition and this would otherwise make both signals agree
@@ -881,7 +907,10 @@ async fn emit(
     let now = match state {
         PairingState::Done => Some(true),
         PairingState::None => Some(false),
-        PairingState::Pairing | PairingState::InstallingBackend | PairingState::Failed(_) => None,
+        PairingState::Pairing
+        | PairingState::InstallingBackend
+        | PairingState::AwaitingConfirmation(_)
+        | PairingState::Failed(_) => None,
     };
     if let Some(now) = now
         && now != *paired

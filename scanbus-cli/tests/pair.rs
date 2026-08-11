@@ -121,6 +121,11 @@ impl Scanner {
         self.pairing_error.lock().unwrap().clone()
     }
 
+    #[zbus(property)]
+    fn pairing_info(&self) -> HashMap<String, OwnedValue> {
+        HashMap::new()
+    }
+
     async fn pair(
         &self,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,

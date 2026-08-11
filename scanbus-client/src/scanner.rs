@@ -94,6 +94,7 @@ impl ScannerState {
     pub fn from_properties(properties: &Dict) -> Result<Self, DecodeError> {
         let pairing_state = string(properties, "PairingState")?;
         let pairing_error = string(properties, "PairingError")?;
+        let pairing_info = pairing_info_code(&dict(properties, "PairingInfo")?)?;
 
         Ok(Self {
             id: ScannerId::new(string(properties, "Id")?)?,
@@ -109,7 +110,7 @@ impl ScannerState {
             connected: flag(properties, "Connected")?,
             status: string(properties, "Status")?.parse()?,
             default_profile: ProfileKind::parse_optional(&string(properties, "DefaultProfile")?)?,
-            pairing: PairingState::from_dbus(&pairing_state, &pairing_error)?,
+            pairing: PairingState::from_dbus(&pairing_state, &pairing_error, &pairing_info)?,
         })
     }
 
@@ -127,9 +128,10 @@ impl ScannerState {
     /// moved is a different object and following it silently would attach this state to
     /// the wrong scanner.
     pub fn apply(&mut self, changed: &HashMap<&str, ZValue<'_>>) -> Result<(), DecodeError> {
-        // Rebuilt from the pair, since either half may arrive alone.
+        // Rebuilt from the three, since any subset may arrive alone.
         let mut state = self.pairing.as_str().to_owned();
         let mut error = self.pairing.pairing_error().to_owned();
+        let mut info = self.pairing.pairing_info().to_owned();
 
         for (property, value) in changed {
             match *property {
@@ -161,11 +163,12 @@ impl ScannerState {
                 }
                 "PairingState" => state = as_string(value, "PairingState")?,
                 "PairingError" => error = as_string(value, "PairingError")?,
+                "PairingInfo" => info = pairing_info_code(&as_dict(value, "PairingInfo")?)?,
                 _ => {}
             }
         }
 
-        self.pairing = PairingState::from_dbus(&state, &error)?;
+        self.pairing = PairingState::from_dbus(&state, &error, &info)?;
         Ok(())
     }
 }
@@ -235,6 +238,15 @@ fn as_dict(value: &ZValue<'_>, key: &str) -> Result<Dict, DecodeError> {
     }
 }
 
+/// `PairingInfo`'s one documented key, `""` when absent — empty is what every state but
+/// `awaiting_confirmation` renders.
+fn pairing_info_code(info: &Dict) -> Result<String, DecodeError> {
+    match info.get("code") {
+        Some(value) => as_string(&**value, "PairingInfo.code"),
+        None => Ok(String::new()),
+    }
+}
+
 fn wrong_type(key: &str, expected: &'static str, got: &ZValue<'_>) -> DecodeError {
     DecodeError::Type {
         key: key.to_owned(),
@@ -301,6 +313,10 @@ mod tests {
             ("DefaultProfile".to_owned(), owned(ZValue::from("document"))),
             ("PairingState".to_owned(), owned(ZValue::from("done"))),
             ("PairingError".to_owned(), owned(ZValue::from(""))),
+            (
+                "PairingInfo".to_owned(),
+                owned(ZValue::from(HashMap::<String, OwnedValue>::new())),
+            ),
         ])
     }
 

@@ -2,19 +2,23 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use flume::RecvTimeoutError;
 use futures_core::stream::BoxStream;
 use mdns_sd::{ServiceDaemon, ServiceEvent};
+use rand::Rng;
 use scanbus_core::{
 	BackendError, ButtonsCapability, Capabilities as ScannerCapabilities, ProfileKind, RawPage,
 	ScannerBackend, ScannerId, ScannerInfo, Status, Value,
 };
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use tokio::time::timeout;
 use tracing::{debug, warn};
 
 /// Backend identifier, as reported by `ScannerBackend::id`.
@@ -38,23 +42,307 @@ pub const SERVICE_TYPE: &str = "_scanbus-mobile._tcp.local.";
 /// How long one `discover()` call browses mDNS before returning.
 pub const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How long the TCP connect for a pairing handshake may take (mobile-backend.md §4.2).
+pub const PAIR_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long the host waits for `pair_response` after showing the code — long enough for
+/// someone to pick up a phone and read a screen (mobile-backend.md §4.2).
+pub const PAIR_CONFIRM_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How long a sighting stays dialable after the round that made it.
+///
+/// §4.2 forbids dialling a *remembered* address: the record has to come from a phone
+/// that is advertising itself now, so that `NotReachable` is the answer once the
+/// discovery session that saw it has ended. It is deliberately a few probe intervals
+/// (2.9 re-probes every 5 s) rather than one round: a single mDNS browse that misses a
+/// phone present on the network is packet loss, and turning that into a failed pairing
+/// would be inventing an outage. A record older than this is not evidence of anything.
+pub const DISCOVERY_RECORD_TTL: Duration = Duration::from_secs(30);
+
+/// What one sighting of a phone is worth to a pairing: an address to dial, and the TXT
+/// `id` that `pair_response.device_id` has to match.
+///
+/// The `device_id` is kept verbatim rather than recovered from the [`ScannerId`],
+/// because the comparison in §4.2 step 6 is the whole mitigation and it has to be
+/// against what was actually advertised, not against a round trip through escaping.
+#[derive(Debug, Clone)]
+struct DiscoveryRecord {
+	device_id: String,
+	address: String,
+	seen_at: Instant,
+}
+
+/// What a completed handshake left behind for a scanner.
+///
+/// Provisional storage: the durable, cross-restart device table is [`9.4`]'s, and it
+/// also owns the upload port. This map is what makes [`ScannerBackend::forget`] have
+/// something to revoke in the meantime, and it is small enough for 9.4 to replace
+/// outright rather than to build alongside.
+///
+/// [`9.4`]: https://github.com/jeanparpaillon/scanbus_service/issues/43
+#[derive(Clone)]
+struct PairedDevice {
+	device_id: String,
+	/// The phone's upload credential. Never logged and never rendered by [`fmt::Debug`]
+	/// — see [`PairedDevice`]'s manual impl.
+	token: String,
+	profiles: Vec<ProfileKind>,
+}
+
+/// Redacted on purpose: the token must not reach a log through a `?device` that seemed
+/// harmless at the call site.
+impl fmt::Debug for PairedDevice {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.debug_struct("PairedDevice")
+			.field("device_id", &self.device_id)
+			.field("token", &"<redacted>")
+			.field("profiles", &self.profiles)
+			.finish()
+	}
+}
+
 /// Backend implementation for mobile scanners.
 #[derive(Debug, Clone)]
 pub struct MobileBackend {
 	discovery_timeout: Duration,
+	/// §4.2 step 2's 5 s, overridable so a test does not have to wait one out.
+	connect_timeout: Duration,
+	/// §4.2 step 4's 120 s, overridable for the same reason.
+	confirm_timeout: Duration,
+	/// What `pair_request.upload_port` carries: where the phone uploads from now on.
+	///
+	/// Zero until [`9.4`](PairedDevice) binds the shared listener and hands its port
+	/// here — a phone paired against a zero is paired but has nowhere to send, which is
+	/// exactly as far as this issue goes.
+	upload_port: u16,
+	/// What `pair_request.host_id` carries. Generated once per process, not persisted:
+	/// nothing on the wire needs it to survive a restart, only to be stable for the
+	/// duration of one handshake.
+	host_id: String,
+	/// What `pair_request.host_name` carries — shown on the phone next to the code.
+	host_name: String,
+	/// What the last discovery rounds saw, keyed by scanner. The only source of an
+	/// address for [`MobileBackend::pair`].
+	discovered: Arc<Mutex<BTreeMap<ScannerId, DiscoveryRecord>>>,
+	/// What pairing issued, keyed by the scanner it belongs to.
+	paired: Arc<Mutex<BTreeMap<ScannerId, PairedDevice>>>,
 }
 
 impl Default for MobileBackend {
 	fn default() -> Self {
-		Self {
-			discovery_timeout: DISCOVERY_TIMEOUT,
-		}
+		Self::new(DISCOVERY_TIMEOUT)
 	}
 }
 
 impl MobileBackend {
 	pub fn new(discovery_timeout: Duration) -> Self {
-		Self { discovery_timeout }
+		Self {
+			discovery_timeout,
+			connect_timeout: PAIR_CONNECT_TIMEOUT,
+			confirm_timeout: PAIR_CONFIRM_TIMEOUT,
+			upload_port: 0,
+			host_id: generate_host_id(),
+			host_name: host_name(),
+			discovered: Arc::new(Mutex::new(BTreeMap::new())),
+			paired: Arc::new(Mutex::new(BTreeMap::new())),
+		}
+	}
+
+	/// The port `pair_request` advertises for uploads — [`9.4`](PairedDevice)'s listener.
+	pub fn with_upload_port(mut self, upload_port: u16) -> Self {
+		self.upload_port = upload_port;
+		self
+	}
+
+	/// Shortens the two handshake deadlines, for a test or a simulator run that should
+	/// not take two minutes to observe a timeout ([`9.6`]).
+	///
+	/// [`9.6`]: https://github.com/jeanparpaillon/scanbus_service/issues/45
+	pub fn with_pairing_timeouts(mut self, connect: Duration, confirm: Duration) -> Self {
+		self.connect_timeout = connect;
+		self.confirm_timeout = confirm;
+		self
+	}
+
+	/// Whether an upload bearing `device_id` and `token` is from a phone this backend
+	/// paired — the check [`9.4`](PairedDevice)'s listener answers `unauthorized` on.
+	///
+	/// After [`ScannerBackend::forget`] this is `false` for that phone, which is the
+	/// whole of what `Unpair()` does to a device that is switched off.
+	pub fn is_authorized(&self, device_id: &str, token: &str) -> bool {
+		self.lock_paired().values().any(|device| {
+			device.device_id == device_id && constant_time_eq(&device.token, token)
+		})
+	}
+
+	/// The handshake of mobile-backend.md §4.2.
+	///
+	/// Everything it opens lives on this future's own stack, which is what makes
+	/// `CancelPairing()` work: 1.4 cancels by aborting the task, the future is dropped,
+	/// and the socket closes with it — §4.2's "the app sees the connection drop", with
+	/// no cancel message to invent.
+	async fn pair(
+		&self,
+		scanner: &ScannerInfo,
+		progress: &mpsc::Sender<scanbus_core::PairingProgress>,
+	) -> Result<(), BackendError> {
+		let record = self.live_record(&scanner.id).ok_or_else(|| BackendError::NotReachable {
+			scanner: scanner.id.clone(),
+			detail: "no live discovery record: pairing is the one moment the host dials, \
+			         and it dials the address a phone is advertising now, never a \
+			         remembered one"
+				.to_owned(),
+		})?;
+
+		let mut socket = timeout(self.connect_timeout, TcpStream::connect(&record.address))
+			.await
+			.map_err(|_| BackendError::NotReachable {
+				scanner: scanner.id.clone(),
+				detail: format!(
+					"{} did not accept a connection within {:?}",
+					record.address, self.connect_timeout
+				),
+			})?
+			.map_err(|error| BackendError::NotReachable {
+				scanner: scanner.id.clone(),
+				detail: format!("could not connect to {}: {error}", record.address),
+			})?;
+
+		// Nothing below ever logs `nonce`: it is the whole security value of the
+		// comparison, and a code sitting in a log is a code an attacker can replay.
+		let nonce = generate_nonce();
+		let request = Message::PairRequest(PairRequest {
+			v: PROTOCOL_VERSION,
+			host_id: self.host_id.clone(),
+			host_name: self.host_name.clone(),
+			upload_port: self.upload_port,
+			nonce: nonce.clone(),
+		});
+		let payload = serialize_control_message(&request).map_err(|error| {
+			BackendError::Other(format!("could not encode pair_request: {error}"))
+		})?;
+		write_frame(
+			&mut socket,
+			FrameKind::Control,
+			&payload,
+			DEFAULT_CONTROL_MAX_BYTES,
+		)
+		.await
+		.map_err(|error| BackendError::NotReachable {
+			scanner: scanner.id.clone(),
+			detail: format!("could not send pair_request to {}: {error}", record.address),
+		})?;
+
+		// Announced only once the request is on the wire, so a client cannot be showing
+		// a code the phone was never sent.
+		progress
+			.send(scanbus_core::PairingProgress::AwaitingConfirmation { code: nonce })
+			.await
+			.map_err(|_| {
+				BackendError::Other(
+					"the pairing was abandoned before the code could be shown".to_owned(),
+				)
+			})?;
+		debug!(scanner_id = %scanner.id, "waiting for the phone to confirm");
+
+		let frame = timeout(
+			self.confirm_timeout,
+			read_frame(&mut socket, FrameKind::Control, DEFAULT_CONTROL_MAX_BYTES),
+		)
+		.await
+		.map_err(|_| {
+			BackendError::Other(format!(
+				"the phone did not confirm within {:?}",
+				self.confirm_timeout
+			))
+		})?
+		.map_err(|error| BackendError::Other(format!("no usable pair_response: {error}")))?;
+
+		let message = parse_control_message(&frame)
+			.map_err(|error| BackendError::Other(format!("no usable pair_response: {error}")))?;
+		let Message::PairResponse(response) = message else {
+			return Err(BackendError::Other(
+				"the phone answered the pairing with something other than a pair_response"
+					.to_owned(),
+			));
+		};
+
+		if !response.accepted {
+			return Err(BackendError::Other("rejected on the device".to_owned()));
+		}
+
+		// §4.2 step 6. The TXT record and the response arrive over different paths, so a
+		// mismatch means the thing that answered is not the thing that advertised —
+		// without this, a phone on the same network could answer a pairing meant for
+		// another and take over its ScannerId, and with it its token slot.
+		if response.device_id != record.device_id {
+			return Err(BackendError::Other(format!(
+				"pair_response came back with device_id {:?}, but {:?} is what the mDNS \
+				 TXT record advertised; the device that answered is not the device that \
+				 was dialled",
+				response.device_id, record.device_id
+			)));
+		}
+
+		if response.token.is_empty() {
+			return Err(BackendError::Other(
+				"the phone accepted the pairing without issuing a token, so no upload \
+				 from it could ever be recognised"
+					.to_owned(),
+			));
+		}
+
+		self.lock_paired().insert(
+			scanner.id.clone(),
+			PairedDevice {
+				device_id: response.device_id,
+				token: response.token,
+				profiles: response.capabilities.profiles,
+			},
+		);
+
+		Ok(())
+	}
+
+	/// The most recent sighting of `scanner`, if one is still live.
+	///
+	/// Expiry is applied here rather than only on the way in, so a session that ended
+	/// silently — no round to overwrite the map — stops being an address to dial.
+	fn live_record(&self, scanner: &ScannerId) -> Option<DiscoveryRecord> {
+		let mut discovered = self.lock_discovered();
+		discovered.retain(|_, record| record.seen_at.elapsed() < DISCOVERY_RECORD_TTL);
+		discovered.get(scanner).cloned()
+	}
+
+	/// Records what a round found, and drops what has gone quiet.
+	fn remember(&self, records: Vec<(ScannerId, DiscoveryRecord)>) {
+		let mut discovered = self.lock_discovered();
+		discovered.retain(|_, record| record.seen_at.elapsed() < DISCOVERY_RECORD_TTL);
+		discovered.extend(records);
+	}
+
+	/// What the phone advertised when it paired, for a scanner that is paired.
+	///
+	/// Read back into every [`ScannerInfo`] this backend reports, so `SupportedProfiles`
+	/// keeps saying what the phone can do rather than reverting to the daemon's full
+	/// list at the next discovery round.
+	fn advertised_profiles(&self, scanner: &ScannerId) -> Vec<ProfileKind> {
+		self.lock_paired()
+			.get(scanner)
+			.map(|device| device.profiles.clone())
+			.unwrap_or_default()
+	}
+
+	fn lock_discovered(&self) -> std::sync::MutexGuard<'_, BTreeMap<ScannerId, DiscoveryRecord>> {
+		self.discovered
+			.lock()
+			.expect("mobile discovery cache lock poisoned")
+	}
+
+	fn lock_paired(&self) -> std::sync::MutexGuard<'_, BTreeMap<ScannerId, PairedDevice>> {
+		self.paired
+			.lock()
+			.expect("mobile paired device lock poisoned")
 	}
 }
 
@@ -66,37 +354,78 @@ impl ScannerBackend for MobileBackend {
 
 	async fn discover(&self) -> Result<Vec<ScannerInfo>, BackendError> {
 		let timeout = self.discovery_timeout;
-		tokio::task::spawn_blocking(move || discover_once(timeout))
+		let found = tokio::task::spawn_blocking(move || discover_once(timeout))
 			.await
-			.map_err(|error| BackendError::Other(format!("mobile discover task failed: {error}")))?
+			.map_err(|error| {
+				BackendError::Other(format!("mobile discover task failed: {error}"))
+			})??;
+
+		let mut scanners = Vec::with_capacity(found.len());
+		let mut records = Vec::with_capacity(found.len());
+		for (mut info, record) in found {
+			// A phone that has already paired keeps saying what it can produce: the
+			// TXT record has no room for `profiles`, and reverting `SupportedProfiles`
+			// to the daemon's full list at the next round would advertise a profile
+			// the app told us it cannot do.
+			info.capabilities.profiles = self.advertised_profiles(&info.id);
+			records.push((info.id.clone(), record));
+			scanners.push(info);
+		}
+		self.remember(records);
+
+		Ok(scanners)
 	}
 
+	/// The handshake of mobile-backend.md §4.2, run inline: there is nothing to
+	/// *install* for a mobile scanner, so this is where pairing's "slow part" — a human
+	/// reading a code off a phone — lives instead.
+	///
+	/// It sends no `Ready` and no `Failed`: 1.4's driver already turns the returned
+	/// `Err` into `PairingState="failed"` with this error's message, and `Ready` maps to
+	/// no state at all. Sending either would only duplicate a transition.
 	async fn ensure_installed(
 		&self,
-		_scanner: &ScannerInfo,
-		_progress: mpsc::Sender<scanbus_core::PairingProgress>,
+		scanner: &ScannerInfo,
+		progress: mpsc::Sender<scanbus_core::PairingProgress>,
 	) -> Result<(), BackendError> {
-		Err(BackendError::Unsupported {
-			backend: ID,
-			operation: "ensure_installed",
-		})
+		self.pair(scanner, &progress).await
 	}
 
+	/// A phone has no buttons to listen for, so this is an empty stream rather than a
+	/// refusal.
+	///
+	/// It has to succeed: 1.4's sequence is `ensure_installed` → `start_listening` →
+	/// `Done`, so a backend that refuses here can never reach `Paired=true`, however
+	/// well the handshake went. What a phone triggers a job with is an *upload*, not a
+	/// button press ([`9.5`]), and the listener that receives one is a single shared
+	/// socket ([`9.4`]) — neither belongs on this per-scanner button stream, and
+	/// `buttons.count` is already 0 for every phone this backend discovers.
+	///
+	/// [`9.4`]: https://github.com/jeanparpaillon/scanbus_service/issues/43
+	/// [`9.5`]: https://github.com/jeanparpaillon/scanbus_service/issues/44
 	async fn start_listening(
 		&self,
 		_scanner: &ScannerInfo,
 	) -> Result<BoxStream<'static, scanbus_core::ButtonPressedEvent>, BackendError> {
-		Err(BackendError::Unsupported {
-			backend: ID,
-			operation: "start_listening",
-		})
+		Ok(Box::pin(futures_util::stream::empty()))
 	}
 
+	/// Nothing per-scanner is listening, so there is nothing to stop — and the trait
+	/// requires the no-op case to be `Ok(())`, not an error.
 	async fn stop_listening(&self, _scanner_id: &ScannerId) -> Result<(), BackendError> {
-		Err(BackendError::Unsupported {
-			backend: ID,
-			operation: "stop_listening",
-		})
+		Ok(())
+	}
+
+	/// Revokes the token a pairing issued, so an upload bearing it comes back
+	/// `unauthorized` — the trait method mobile-backend.md §4.4 adds for `Unpair()`.
+	///
+	/// The phone is not told: there is no channel to tell it on, and `Unpair()` has to
+	/// work with the phone switched off. It learns at its next upload.
+	async fn forget(&self, scanner_id: &ScannerId) -> Result<(), BackendError> {
+		if self.lock_paired().remove(scanner_id).is_some() {
+			debug!(scanner_id = %scanner_id, "mobile pairing revoked");
+		}
+		Ok(())
 	}
 
 	async fn set_button_mapping(
@@ -124,7 +453,57 @@ impl ScannerBackend for MobileBackend {
 	}
 }
 
-fn discover_once(timeout: Duration) -> Result<Vec<ScannerInfo>, BackendError> {
+/// Compares two secrets without returning early on the first differing byte.
+///
+/// The length is allowed to leak — it is not the secret — but the prefix is not: an
+/// upload path that answers faster the sooner a token diverges hands an attacker on the
+/// LAN a way to guess it one byte at a time.
+fn constant_time_eq(left: &str, right: &str) -> bool {
+	let (left, right) = (left.as_bytes(), right.as_bytes());
+	left.len() == right.len()
+		&& left
+			.iter()
+			.zip(right)
+			.fold(0_u8, |acc, (a, b)| acc | (a ^ b))
+			== 0
+}
+
+/// A CSPRNG-drawn host identifier for `pair_request.host_id`.
+fn generate_host_id() -> String {
+	use fmt::Write as _;
+
+	let bytes: [u8; 16] = rand::rng().random();
+	bytes.iter().fold(String::with_capacity(32), |mut out, byte| {
+		// Infallible: writing into a String.
+		let _ = write!(out, "{byte:02x}");
+		out
+	})
+}
+
+/// What the phone shows next to the code, so the user knows which machine is asking.
+///
+/// `/proc/sys/kernel/hostname` rather than a crate: this daemon is a systemd user
+/// service on Linux and the file is always there. A host with no readable hostname gets
+/// a constant rather than an empty line on a phone screen.
+fn host_name() -> String {
+	std::fs::read_to_string("/proc/sys/kernel/hostname")
+		.ok()
+		.map(|value| value.trim().to_owned())
+		.filter(|value| !value.is_empty())
+		.unwrap_or_else(|| "scanbus".to_owned())
+}
+
+/// The six digits of §4.2 step 2: uniform over `000000`–`999999`, zero-padded.
+///
+/// `random_range` over the full range and then formatting is what keeps `000042` as
+/// likely as `482913` — sampling six digits from a character set, or formatting a
+/// number without the padding, would either bias the draw or silently shorten a code
+/// the user has to compare character by character.
+fn generate_nonce() -> String {
+	format!("{:06}", rand::rng().random_range(0..1_000_000_u32))
+}
+
+fn discover_once(timeout: Duration) -> Result<Vec<(ScannerInfo, DiscoveryRecord)>, BackendError> {
 	let daemon = ServiceDaemon::new().map_err(|error| BackendError::NotReachable {
 		scanner: ScannerId::from_backend(ID, "discovery").expect("static discovery id is valid"),
 		detail: format!("failed to start mDNS browser: {error}"),
@@ -133,7 +512,7 @@ fn discover_once(timeout: Duration) -> Result<Vec<ScannerInfo>, BackendError> {
 		.browse(SERVICE_TYPE)
 		.map_err(|error| BackendError::Other(format!("failed to browse {SERVICE_TYPE}: {error}")))?;
 
-	let mut seen = BTreeMap::<ScannerId, ScannerInfo>::new();
+	let mut seen = BTreeMap::<ScannerId, (ScannerInfo, DiscoveryRecord)>::new();
 	let started = Instant::now();
 	loop {
 		let elapsed = started.elapsed();
@@ -143,7 +522,7 @@ fn discover_once(timeout: Duration) -> Result<Vec<ScannerInfo>, BackendError> {
 		let remaining = timeout - elapsed;
 		match receiver.recv_timeout(remaining) {
 			Ok(ServiceEvent::ServiceResolved(service)) => {
-				if let Some(scanner) = scanner_from_service(&service) {
+				if let Some((scanner, record)) = scanner_from_service(&service) {
 					if seen.contains_key(&scanner.id) {
 						warn!(
 							scanner_id = %scanner.id,
@@ -152,7 +531,7 @@ fn discover_once(timeout: Duration) -> Result<Vec<ScannerInfo>, BackendError> {
 						);
 						continue;
 					}
-					seen.insert(scanner.id.clone(), scanner);
+					seen.insert(scanner.id.clone(), (scanner, record));
 				}
 			}
 			Ok(
@@ -179,7 +558,9 @@ fn discover_once(timeout: Duration) -> Result<Vec<ScannerInfo>, BackendError> {
 	Ok(seen.into_values().collect())
 }
 
-fn scanner_from_service(service: &mdns_sd::ServiceInfo) -> Option<ScannerInfo> {
+fn scanner_from_service(
+	service: &mdns_sd::ServiceInfo,
+) -> Option<(ScannerInfo, DiscoveryRecord)> {
 	let instance = service.get_fullname().to_owned();
 	let properties = service.get_properties();
 
@@ -225,20 +606,29 @@ fn scanner_from_service(service: &mdns_sd::ServiceInfo) -> Option<ScannerInfo> {
 		return None;
 	};
 
-	Some(ScannerInfo {
-		id: scanner_id,
-		name: instance_name(&instance),
-		backend: ID.to_owned(),
-		address: format!("{}:{}", ip, service.get_port()),
-		capabilities: ScannerCapabilities {
-			buttons: ButtonsCapability {
-				count: 0,
-				label_configurable: false,
+	let address = format!("{}:{}", ip, service.get_port());
+
+	Some((
+		ScannerInfo {
+			id: scanner_id,
+			name: instance_name(&instance),
+			backend: ID.to_owned(),
+			address: address.clone(),
+			capabilities: ScannerCapabilities {
+				buttons: ButtonsCapability {
+					count: 0,
+					label_configurable: false,
+				},
+				..ScannerCapabilities::default()
 			},
-			..ScannerCapabilities::default()
+			status: Status::Online,
 		},
-		status: Status::Online,
-	})
+		DiscoveryRecord {
+			device_id: id.to_owned(),
+			address,
+			seen_at: Instant::now(),
+		},
+	))
 }
 
 fn instance_name(fullname: &str) -> String {
@@ -321,23 +711,54 @@ fn validate_version(v: u32) -> Result<(), ProtocolError> {
 	}
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PairRequest {
 	pub v: u32,
 	pub host_id: String,
 	pub host_name: String,
 	pub upload_port: u16,
+	/// The six digits the user compares. **Never logged**, at any level — see this
+	/// type's [`fmt::Debug`].
 	pub nonce: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// The nonce is redacted, and it is redacted *here* rather than at each call site: a
+/// `debug!(?request)` added later is exactly how a code that is only meaningful because
+/// nobody else has seen it ends up in a log file.
+impl fmt::Debug for PairRequest {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.debug_struct("PairRequest")
+			.field("v", &self.v)
+			.field("host_id", &self.host_id)
+			.field("host_name", &self.host_name)
+			.field("upload_port", &self.upload_port)
+			.field("nonce", &"<redacted>")
+			.finish()
+	}
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PairResponse {
 	pub accepted: bool,
 	pub device_id: String,
 	#[serde(default)]
 	pub capabilities: Capabilities,
+	/// The upload credential. **Never logged**, at any level — see this type's
+	/// [`fmt::Debug`].
 	#[serde(default)]
 	pub token: String,
+}
+
+/// Same reasoning as [`PairRequest`]'s: the token is redacted at the type.
+impl fmt::Debug for PairResponse {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.debug_struct("PairResponse")
+			.field("accepted", &self.accepted)
+			.field("device_id", &self.device_id)
+			.field("capabilities", &self.capabilities)
+			.field("token", &"<redacted>")
+			.finish()
+	}
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -360,15 +781,32 @@ where
 	Ok(parsed)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Upload {
 	pub v: u32,
 	pub device_id: String,
+	/// The credential the phone got when it paired. **Never logged**, at any level.
 	pub token: String,
 	pub profile: ProfileKind,
 	pub page: u32,
 	pub of: u32,
 	pub format: String,
+}
+
+/// An upload header is the one message the daemon will want to trace per page (9.5), so
+/// its token is redacted at the type for the same reason [`PairRequest`]'s nonce is.
+impl fmt::Debug for Upload {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.debug_struct("Upload")
+			.field("v", &self.v)
+			.field("device_id", &self.device_id)
+			.field("token", &"<redacted>")
+			.field("profile", &self.profile)
+			.field("page", &self.page)
+			.field("of", &self.of)
+			.field("format", &self.format)
+			.finish()
+	}
 }
 
 impl Upload {
@@ -545,8 +983,441 @@ mod tests {
 	use std::{io, pin::Pin, task::Poll};
 
 	use tokio::io::{AsyncRead, ReadBuf, duplex};
+	use tokio::net::TcpListener;
 
 	use super::*;
+
+	/// A phone that answers one pairing, and what it did while doing so.
+	///
+	/// Stands in for the simulator of [9.6] until that exists: the acceptance cases of
+	/// 9.3 are all about what the *host* does with a given answer, and a `TcpListener`
+	/// that speaks the four framing rules is the whole of what is needed to produce one.
+	///
+	/// [9.6]: https://github.com/jeanparpaillon/scanbus_service/issues/45
+	struct FakePhone {
+		address: String,
+		/// What the phone read out of `pair_request`, once it has.
+		request: Arc<Mutex<Option<PairRequest>>>,
+		/// Set when the connection reached end-of-file — what `CancelPairing()` looks
+		/// like from the app's side.
+		disconnected: Arc<Mutex<bool>>,
+	}
+
+	/// How the phone answers, once it has read the request.
+	enum Answer {
+		/// Accept, with this `device_id` — the same one it advertised, or another.
+		Accept { device_id: &'static str },
+		/// The user tapped reject.
+		Reject,
+		/// Stay connected and say nothing, ever.
+		Silence,
+	}
+
+	impl FakePhone {
+		async fn listen(answer: Answer) -> Self {
+			let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+			let address = listener.local_addr().unwrap().to_string();
+			let request = Arc::new(Mutex::new(None));
+			let disconnected = Arc::new(Mutex::new(false));
+
+			let seen = Arc::clone(&request);
+			let closed = Arc::clone(&disconnected);
+			tokio::spawn(async move {
+				let (mut socket, _) = listener.accept().await.unwrap();
+				let frame = read_frame(&mut socket, FrameKind::Control, DEFAULT_CONTROL_MAX_BYTES)
+					.await
+					.unwrap();
+				let Message::PairRequest(pair_request) = parse_control_message(&frame).unwrap()
+				else {
+					panic!("the host sent something that is not a pair_request");
+				};
+				*seen.lock().unwrap() = Some(pair_request);
+
+				let response = match answer {
+					Answer::Accept { device_id } => PairResponse {
+						accepted: true,
+						device_id: device_id.to_owned(),
+						capabilities: Capabilities {
+							profiles: vec![ProfileKind::Image],
+						},
+						token: "phone-token".to_owned(),
+					},
+					Answer::Reject => PairResponse {
+						accepted: false,
+						device_id: DEVICE_ID.to_owned(),
+						capabilities: Capabilities::default(),
+						token: String::new(),
+					},
+					Answer::Silence => {
+						// Nothing is sent, and the socket is held open: the host has to
+						// be the one that gives up. Reading is how the app notices the
+						// host closing it, which is what `CancelPairing()` does.
+						let mut byte = [0_u8; 1];
+						if socket.read(&mut byte).await.unwrap_or(0) == 0 {
+							*closed.lock().unwrap() = true;
+						}
+						return;
+					}
+				};
+
+				let payload =
+					serialize_control_message(&Message::PairResponse(response)).unwrap();
+				write_frame(
+					&mut socket,
+					FrameKind::Control,
+					&payload,
+					DEFAULT_CONTROL_MAX_BYTES,
+				)
+				.await
+				.unwrap();
+			});
+
+			Self {
+				address,
+				request,
+				disconnected,
+			}
+		}
+
+		fn nonce_shown(&self) -> Option<String> {
+			self.request
+				.lock()
+				.unwrap()
+				.as_ref()
+				.map(|request| request.nonce.clone())
+		}
+	}
+
+	/// What the fake phone puts in its TXT `id`.
+	const DEVICE_ID: &str = "phone_a1b2c3";
+
+	fn scanner_id() -> ScannerId {
+		ScannerId::from_backend(ID, DEVICE_ID).unwrap()
+	}
+
+	fn scanner_info() -> ScannerInfo {
+		ScannerInfo {
+			id: scanner_id(),
+			name: "Pixel 7".to_owned(),
+			backend: ID.to_owned(),
+			address: "127.0.0.1:1".to_owned(),
+			capabilities: ScannerCapabilities::default(),
+			status: Status::Online,
+		}
+	}
+
+	/// A backend that has just seen `address`, with the handshake deadlines shortened so
+	/// a timeout is observable inside a test.
+	fn backend_that_saw(address: &str) -> MobileBackend {
+		let backend = MobileBackend::default()
+			.with_upload_port(4242)
+			.with_pairing_timeouts(Duration::from_millis(200), Duration::from_millis(200));
+		backend.remember(vec![(
+			scanner_id(),
+			DiscoveryRecord {
+				device_id: DEVICE_ID.to_owned(),
+				address: address.to_owned(),
+				seen_at: Instant::now(),
+			},
+		)]);
+		backend
+	}
+
+	/// Runs one pairing and returns its outcome along with every progress step it sent.
+	async fn pair_with(
+		backend: &MobileBackend,
+	) -> (
+		Result<(), BackendError>,
+		Vec<scanbus_core::PairingProgress>,
+	) {
+		let (tx, mut rx) = mpsc::channel(8);
+		let outcome = backend.ensure_installed(&scanner_info(), tx).await;
+
+		let mut steps = Vec::new();
+		while let Ok(step) = rx.try_recv() {
+			steps.push(step);
+		}
+		(outcome, steps)
+	}
+
+	/// The happy path of §4.2: the code reaches the client, the phone gets the same one,
+	/// and what it answers with is what the backend remembers.
+	#[tokio::test]
+	async fn a_confirmed_pairing_shows_the_code_and_keeps_what_the_phone_returned() {
+		let phone = FakePhone::listen(Answer::Accept {
+			device_id: DEVICE_ID,
+		})
+		.await;
+		let backend = backend_that_saw(&phone.address);
+
+		let (outcome, steps) = pair_with(&backend).await;
+		outcome.unwrap();
+
+		// Exactly one transition, and it is the one that puts a code on screen.
+		let [scanbus_core::PairingProgress::AwaitingConfirmation { code }] = steps.as_slice()
+		else {
+			panic!("expected one AwaitingConfirmation, got {steps:?}");
+		};
+		assert_eq!(code.len(), 6);
+		assert!(code.bytes().all(|b| b.is_ascii_digit()));
+		// Byte-identical to what the phone would print — the point of the comparison.
+		assert_eq!(phone.nonce_shown().as_deref(), Some(code.as_str()));
+
+		// The token is what an upload will be checked against, and the profiles are what
+		// `SupportedProfiles` narrows to.
+		assert!(backend.is_authorized(DEVICE_ID, "phone-token"));
+		assert!(!backend.is_authorized(DEVICE_ID, "some-other-token"));
+		assert_eq!(
+			backend.advertised_profiles(&scanner_id()),
+			vec![ProfileKind::Image]
+		);
+	}
+
+	/// The phone advertised what it can do, so `SupportedProfiles` says that and not the
+	/// daemon's full list — including across the discovery round that follows.
+	#[tokio::test]
+	async fn a_paired_phone_keeps_narrowing_supported_profiles() {
+		let phone = FakePhone::listen(Answer::Accept {
+			device_id: DEVICE_ID,
+		})
+		.await;
+		let backend = backend_that_saw(&phone.address);
+		pair_with(&backend).await.0.unwrap();
+
+		let mut info = scanner_info();
+		assert_eq!(
+			info.supported_profiles(),
+			vec![ProfileKind::Image, ProfileKind::Document],
+			"an info the backend has not filled in yet keeps the daemon's list"
+		);
+
+		info.capabilities.profiles = backend.advertised_profiles(&info.id);
+		assert_eq!(info.supported_profiles(), vec![ProfileKind::Image]);
+	}
+
+	/// §4.2 step 5, with the message the API document promises verbatim.
+	#[tokio::test]
+	async fn a_rejection_on_the_device_is_reported_as_such() {
+		let phone = FakePhone::listen(Answer::Reject).await;
+		let backend = backend_that_saw(&phone.address);
+
+		let (outcome, _) = pair_with(&backend).await;
+		assert_eq!(
+			outcome.unwrap_err().to_string(),
+			"rejected on the device",
+			"this string is what PairingError shows a user"
+		);
+		assert!(!backend.is_authorized(DEVICE_ID, "phone-token"));
+	}
+
+	/// §4.2 step 6: the response and the TXT record come over different paths, and a
+	/// mismatch is another device answering.
+	#[tokio::test]
+	async fn a_response_from_another_device_is_refused_and_stores_nothing() {
+		let phone = FakePhone::listen(Answer::Accept {
+			device_id: "phone_deadbeef",
+		})
+		.await;
+		let backend = backend_that_saw(&phone.address);
+
+		let (outcome, _) = pair_with(&backend).await;
+		let message = outcome.unwrap_err().to_string();
+		assert!(
+			message.contains("phone_deadbeef") && message.contains(DEVICE_ID),
+			"the error has to name both ids: {message}"
+		);
+		assert!(!backend.is_authorized("phone_deadbeef", "phone-token"));
+		assert!(backend.lock_paired().is_empty());
+	}
+
+	/// A phone that accepts the connection and never answers is a failure, not a hang.
+	#[tokio::test]
+	async fn silence_from_the_phone_ends_the_pairing_at_the_deadline() {
+		let phone = FakePhone::listen(Answer::Silence).await;
+		let backend = backend_that_saw(&phone.address);
+
+		let (outcome, steps) = pair_with(&backend).await;
+		let message = outcome.unwrap_err().to_string();
+		assert!(
+			message.contains("did not confirm within"),
+			"the error has to name the timeout: {message}"
+		);
+		// The code was shown before the wait, so the client had something to display for
+		// the whole of it.
+		assert!(matches!(
+			steps.as_slice(),
+			[scanbus_core::PairingProgress::AwaitingConfirmation { .. }]
+		));
+		assert!(backend.lock_paired().is_empty());
+	}
+
+	/// `CancelPairing()` is 1.4 aborting the task; from the phone's side that is the
+	/// socket closing, with no cancel message involved.
+	#[tokio::test]
+	async fn dropping_the_pairing_closes_the_socket_the_app_is_waiting_on() {
+		let phone = FakePhone::listen(Answer::Silence).await;
+		// Long deadlines: what ends this pairing must be the abort, not a timeout.
+		let backend = backend_that_saw(&phone.address)
+			.with_pairing_timeouts(PAIR_CONNECT_TIMEOUT, PAIR_CONFIRM_TIMEOUT);
+
+		let (tx, mut rx) = mpsc::channel(8);
+		let task = tokio::spawn(async move {
+			let _ = backend.ensure_installed(&scanner_info(), tx).await;
+		});
+
+		// Cancel only once the code is up, which is when a user would.
+		let step = rx.recv().await.unwrap();
+		assert!(matches!(
+			step,
+			scanbus_core::PairingProgress::AwaitingConfirmation { .. }
+		));
+		task.abort();
+
+		// The phone's read returns end-of-file rather than hanging for 120 s.
+		tokio::time::timeout(Duration::from_secs(5), async {
+			while !*phone.disconnected.lock().unwrap() {
+				tokio::time::sleep(Duration::from_millis(10)).await;
+			}
+		})
+		.await
+		.expect("the app should have seen the connection drop");
+	}
+
+	/// The rule that makes pairing the one moment the host dials: no live sighting, no
+	/// address, and nothing opened.
+	#[tokio::test]
+	async fn pairing_a_phone_that_was_never_seen_is_not_reachable() {
+		let backend = MobileBackend::default();
+
+		let (outcome, steps) = pair_with(&backend).await;
+		assert!(
+			matches!(outcome, Err(BackendError::NotReachable { .. })),
+			"expected NotReachable, got {outcome:?}"
+		);
+		// No socket was opened, so no code was ever shown.
+		assert!(steps.is_empty());
+	}
+
+	/// And a sighting from a session that has ended is not an address either — this is
+	/// what stops a remembered address being dialled.
+	#[tokio::test]
+	async fn a_stale_sighting_is_not_an_address_to_dial() {
+		let phone = FakePhone::listen(Answer::Accept {
+			device_id: DEVICE_ID,
+		})
+		.await;
+		let backend = MobileBackend::default();
+		backend.lock_discovered().insert(
+			scanner_id(),
+			DiscoveryRecord {
+				device_id: DEVICE_ID.to_owned(),
+				address: phone.address.clone(),
+				seen_at: Instant::now() - DISCOVERY_RECORD_TTL - Duration::from_secs(1),
+			},
+		);
+
+		let (outcome, _) = pair_with(&backend).await;
+		assert!(
+			matches!(outcome, Err(BackendError::NotReachable { .. })),
+			"expected NotReachable, got {outcome:?}"
+		);
+		// And the expired entry is gone rather than lingering to be found next time.
+		assert!(backend.lock_discovered().is_empty());
+	}
+
+	/// `Unpair()` calls this, and after it an upload with the old token is unauthorized —
+	/// with the phone never told, because it may be switched off.
+	#[tokio::test]
+	async fn forgetting_a_phone_revokes_the_token_it_uploads_with() {
+		let phone = FakePhone::listen(Answer::Accept {
+			device_id: DEVICE_ID,
+		})
+		.await;
+		let backend = backend_that_saw(&phone.address);
+		pair_with(&backend).await.0.unwrap();
+		assert!(backend.is_authorized(DEVICE_ID, "phone-token"));
+
+		backend.forget(&scanner_id()).await.unwrap();
+		assert!(!backend.is_authorized(DEVICE_ID, "phone-token"));
+
+		// Idempotent: `Unpair()` on a scanner already forgotten is not an error.
+		backend.forget(&scanner_id()).await.unwrap();
+	}
+
+	/// A phone has no buttons, but pairing still has to reach `Done`, so this is an
+	/// empty stream and not the refusal it was before 9.3.
+	#[tokio::test]
+	async fn listening_to_a_phone_succeeds_and_yields_nothing() {
+		use futures_util::StreamExt as _;
+
+		let backend = MobileBackend::default();
+		let mut events = backend.start_listening(&scanner_info()).await.unwrap();
+		assert!(events.next().await.is_none());
+		backend.stop_listening(&scanner_id()).await.unwrap();
+	}
+
+	/// The nonce is the whole security value of the comparison: six digits, every one of
+	/// them drawn, leading zeros included.
+	#[test]
+	fn nonces_cover_the_whole_six_digit_range() {
+		let mut leading = [0_u32; 10];
+		let mut distinct = std::collections::HashSet::new();
+
+		for _ in 0..1000 {
+			let nonce = generate_nonce();
+			assert_eq!(nonce.len(), 6, "{nonce:?} is not six digits");
+			assert!(
+				nonce.bytes().all(|b| b.is_ascii_digit()),
+				"{nonce:?} is not all digits"
+			);
+			leading[(nonce.as_bytes()[0] - b'0') as usize] += 1;
+			distinct.insert(nonce);
+		}
+
+		// Every leading digit including `0`, which is what the zero-padding is for: a
+		// generator that formatted the number without it, or drew from `100000..`, would
+		// leave this bucket empty. With 1000 draws each bucket expects 100, and the
+		// chance of any one coming up empty by luck is about 10^-46.
+		for (digit, count) in leading.iter().enumerate() {
+			assert!(*count > 0, "no nonce ever started with {digit}");
+		}
+		// A generator stuck on a handful of values would still pass the checks above.
+		assert!(
+			distinct.len() > 900,
+			"only {} distinct nonces in 1000 draws",
+			distinct.len()
+		);
+	}
+
+	#[test]
+	fn secrets_are_redacted_from_the_debug_output() {
+		let request = PairRequest {
+			v: 1,
+			host_id: "host".to_owned(),
+			host_name: "desktop".to_owned(),
+			upload_port: 4242,
+			nonce: "482913".to_owned(),
+		};
+		let response = PairResponse {
+			accepted: true,
+			device_id: DEVICE_ID.to_owned(),
+			capabilities: Capabilities::default(),
+			token: "phone-token".to_owned(),
+		};
+		let upload = Upload {
+			v: 1,
+			device_id: DEVICE_ID.to_owned(),
+			token: "phone-token".to_owned(),
+			profile: ProfileKind::Image,
+			page: 1,
+			of: 1,
+			format: "jpeg".to_owned(),
+		};
+
+		assert!(!format!("{request:?}").contains("482913"));
+		assert!(!format!("{response:?}").contains("phone-token"));
+		assert!(!format!("{upload:?}").contains("phone-token"));
+	}
 
 	#[tokio::test]
 	async fn unknown_message_type_is_refused_as_unsupported() {

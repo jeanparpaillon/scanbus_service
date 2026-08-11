@@ -60,14 +60,29 @@ pub struct ScannerInfo {
 }
 
 impl ScannerInfo {
-    /// The `SupportedProfiles` property: profile kinds this daemon will actually run.
+    /// The `SupportedProfiles` property: profile kinds this daemon will actually run
+    /// *and* the device can produce.
     ///
-    /// Currently the same set for every scanner, because the limit is our pipeline and
-    /// not the hardware — `email` and `ocr` exist in [`ProfileKind`] and are refused
-    /// (2.7). Narrowing this per device is a backend concern and lands with the first
-    /// backend that has an opinion.
+    /// [`ProfileKind::supported`] is the daemon's half — `email` and `ocr` exist in
+    /// [`ProfileKind`] and are refused (2.7) — and it is the whole answer for a scanner
+    /// this daemon drives itself, where the limit is our pipeline and not the hardware.
+    /// The mobile backend is the first with a device that has its own opinion: a phone
+    /// sends `capabilities.profiles` when it pairs (9.3), and the two are intersected
+    /// rather than unioned, because a profile is only offered when *both* ends can do
+    /// it.
+    ///
+    /// The order is [`ProfileKind::supported`]'s, so the property does not reshuffle
+    /// itself according to what a device happened to list first.
     pub fn supported_profiles(&self) -> Vec<ProfileKind> {
-        ProfileKind::supported()
+        let supported = ProfileKind::supported();
+        if self.capabilities.profiles.is_empty() {
+            return supported;
+        }
+
+        supported
+            .into_iter()
+            .filter(|kind| self.capabilities.profiles.contains(kind))
+            .collect()
     }
 }
 
@@ -92,6 +107,24 @@ mod tests {
             sample().supported_profiles(),
             vec![ProfileKind::Image, ProfileKind::Document]
         );
+    }
+
+    /// A device with an opinion narrows the list; it never widens it.
+    #[test]
+    fn supported_profiles_intersects_with_what_the_device_advertised() {
+        let mut info = sample();
+        info.capabilities.profiles = vec![ProfileKind::Image];
+        assert_eq!(info.supported_profiles(), vec![ProfileKind::Image]);
+
+        // `ocr` is the device's business and the pipeline's refusal, so it stays out —
+        // and the order is the daemon's, not the order the device listed.
+        info.capabilities.profiles = vec![ProfileKind::Ocr, ProfileKind::Document];
+        assert_eq!(info.supported_profiles(), vec![ProfileKind::Document]);
+
+        // A device that advertises nothing this daemon runs advertises nothing at all,
+        // rather than falling back to the full list.
+        info.capabilities.profiles = vec![ProfileKind::Ocr];
+        assert_eq!(info.supported_profiles(), Vec::<ProfileKind>::new());
     }
 
     #[test]

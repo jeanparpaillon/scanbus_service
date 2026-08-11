@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::Value;
+use super::{ProfileKind, Value};
 
 /// What a scanner can do — the `Capabilities` property (§3).
 ///
@@ -31,6 +31,16 @@ pub struct Capabilities {
     pub duplex: bool,
     /// The device's physical menu.
     pub buttons: ButtonsCapability,
+    /// Profiles the *device* says it can produce, when it has an opinion.
+    ///
+    /// Empty means "no opinion", which is every backend that discovers hardware: the
+    /// limit there is this daemon's pipeline, not the scanner, and
+    /// [`ScannerInfo::supported_profiles`](super::ScannerInfo::supported_profiles) says
+    /// so. A phone is the first device that answers the question itself — it sends
+    /// `capabilities.profiles` in its `pair_response` (mobile-backend.md §4.2) — and an
+    /// app that only knows how to send an image must not be advertised as able to
+    /// produce a document.
+    pub profiles: Vec<ProfileKind>,
     /// Keys this version of the daemon does not know about, preserved verbatim.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
@@ -109,6 +119,7 @@ mod tests {
                 count: 4,
                 label_configurable: false,
             },
+            profiles: Vec::new(),
             extra: BTreeMap::new(),
         }
     }

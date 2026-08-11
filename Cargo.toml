@@ -58,6 +58,8 @@ mdns-sd = "0.13"
 futures-util = "0.3"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "pnm", "tiff"] }
 lopdf = "0.38"
+# The pairing nonce (9.3): six digits, uniform, from a CSPRNG.
+rand = "0.9"
 serde = { version = "1", features = ["derive"] }
 # Test-only in scanbus-core: the model's serde impls are only worth asserting against a
 # real self-describing format, and JSON is also what the pairing store will use (4.1).

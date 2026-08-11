@@ -376,6 +376,10 @@ impl PairingMachine {
         };
 
         let stopped = self.backend.stop_listening(&scanner.id).await;
+        // Revokes the backend's own pairing state (a token, a vendor config entry)
+        // before the store entry is dropped, so nothing in between recognises a device
+        // this call is in the middle of forgetting.
+        let forgotten = self.backend.forget(&scanner.id).await;
 
         self.store
             .forget(&scanner.id)
@@ -393,8 +397,9 @@ impl PairingMachine {
         let _ = self.transitions.send(PairingState::None);
 
         // Reported, not raised: see the note above on why a listener that would not
-        // stop is not a reason to keep the pairing.
-        Ok(stopped.err())
+        // stop is not a reason to keep the pairing. A backend that could not forget its
+        // own state is the same kind of failure, so it takes priority when both fail.
+        Ok(forgotten.err().or_else(|| stopped.err()))
     }
 
     /// Marks the scanner paired without running the sequence — the restore path ([`4.2`]).
@@ -821,12 +826,15 @@ mod tests {
         assert_eq!(store.forgotten().await, vec![sample_scanner().id]);
         assert_eq!(
             handle.calls(),
-            vec![crate::backend::mock::MockCall::StopListening {
-                scanner: sample_scanner().id,
-                // The machine dropped the stream at `Done` (see `run`), so there is
-                // nothing live to stop until 2.4 owns the listener task.
-                was_listening: false,
-            }]
+            vec![
+                crate::backend::mock::MockCall::StopListening {
+                    scanner: sample_scanner().id,
+                    // The machine dropped the stream at `Done` (see `run`), so there is
+                    // nothing live to stop until 2.4 owns the listener task.
+                    was_listening: false,
+                },
+                crate::backend::mock::MockCall::Forget(sample_scanner().id),
+            ]
         );
 
         // And it is pairable again, from scratch.
@@ -963,6 +971,84 @@ mod tests {
             machine.unpair().await,
             Ok(Some(BackendError::Other(
                 "brscan-skey will not die".to_owned()
+            )))
+        );
+        assert!(!machine.is_paired());
+        assert_eq!(store.forgotten().await, vec![sample_scanner().id]);
+    }
+
+    /// A backend that cannot revoke its own pairing state is reported the same way as a
+    /// listener that will not stop: the pairing still goes.
+    #[tokio::test]
+    async fn a_backend_that_cannot_forget_does_not_block_the_unpairing() {
+        struct RefusesToForget(MockBackend);
+
+        #[async_trait]
+        impl ScannerBackend for RefusesToForget {
+            fn id(&self) -> &'static str {
+                self.0.id()
+            }
+
+            async fn discover(&self) -> Result<Vec<ScannerInfo>, BackendError> {
+                self.0.discover().await
+            }
+
+            async fn ensure_installed(
+                &self,
+                scanner: &ScannerInfo,
+                progress: mpsc::Sender<PairingProgress>,
+            ) -> Result<(), BackendError> {
+                self.0.ensure_installed(scanner, progress).await
+            }
+
+            async fn start_listening(
+                &self,
+                scanner: &ScannerInfo,
+            ) -> Result<BoxStream<'static, ButtonPressedEvent>, BackendError> {
+                self.0.start_listening(scanner).await
+            }
+
+            async fn stop_listening(&self, scanner_id: &ScannerId) -> Result<(), BackendError> {
+                self.0.stop_listening(scanner_id).await
+            }
+
+            async fn forget(&self, _scanner_id: &ScannerId) -> Result<(), BackendError> {
+                Err(BackendError::Other("device store is read-only".to_owned()))
+            }
+
+            async fn set_button_mapping(
+                &self,
+                scanner_id: &ScannerId,
+                button_index: u32,
+                profile: Option<ProfileKind>,
+                options: &BTreeMap<String, Value>,
+            ) -> Result<(), BackendError> {
+                self.0
+                    .set_button_mapping(scanner_id, button_index, profile, options)
+                    .await
+            }
+
+            async fn fetch_pages(
+                &self,
+                scanner_id: &ScannerId,
+                job_id: &str,
+            ) -> Result<BoxStream<'static, Result<crate::model::RawPage, BackendError>>, BackendError>
+            {
+                self.0.fetch_pages(scanner_id, job_id).await
+            }
+        }
+
+        let backend = RefusesToForget(MockBackend::with_scanners([sample_scanner()]));
+        let store = Arc::new(RecordingStore::default());
+        let machine = PairingMachine::new(sample_scanner(), Arc::new(backend), store.clone());
+
+        machine.pair();
+        wait_for(&machine, &PairingState::Done).await;
+
+        assert_eq!(
+            machine.unpair().await,
+            Ok(Some(BackendError::Other(
+                "device store is read-only".to_owned()
             )))
         );
         assert!(!machine.is_paired());

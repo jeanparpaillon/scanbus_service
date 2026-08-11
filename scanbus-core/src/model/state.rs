@@ -59,13 +59,14 @@ impl FromStr for Status {
 
 /// Where a scanner is in the pairing process — the `PairingState` property (§3, §6).
 ///
-/// D-Bus splits this over two properties: `PairingState` as a string and `PairingError`
-/// as the detail, "empty otherwise". That pair has an invariant no D-Bus type can
-/// express — a non-empty `PairingError` while the state is not `failed` is nonsense,
-/// and the way it happens in practice is forgetting to clear the field on a retry. Here
-/// the message is *inside* the variant, so the invariant holds by construction:
-/// [`PairingState::pairing_error`] has nothing to return unless the state is
-/// [`PairingState::Failed`].
+/// D-Bus splits this over three properties: `PairingState` as a string, `PairingError`
+/// as the failure detail, and `PairingInfo` as `{"code": _}` while a human is expected to
+/// confirm something. Those pairs have an invariant no D-Bus type can express — a
+/// non-empty `PairingError`/`PairingInfo` while the state disagrees is nonsense, and the
+/// way it happens in practice is forgetting to clear the field on a transition. Here the
+/// message is *inside* the variant, so the invariant holds by construction:
+/// [`PairingState::pairing_error`] and [`PairingState::pairing_info`] have nothing to
+/// return unless the state is the one that carries them.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PairingState {
@@ -76,6 +77,10 @@ pub enum PairingState {
     Pairing,
     /// Still pairing, currently installing the backend's system dependencies.
     InstallingBackend,
+    /// Waiting for a human to confirm on the device; the payload is what `PairingInfo`
+    /// reports as `{"code": _}`. Deliberately generic — any backend that needs a human
+    /// to confirm something lands here, not just a mobile phone showing a nonce.
+    AwaitingConfirmation(String),
     /// Paired.
     Done,
     /// The attempt failed; the payload is what `PairingError` reports.
@@ -89,6 +94,7 @@ impl PairingState {
             Self::None => "none",
             Self::Pairing => "pairing",
             Self::InstallingBackend => "installing_backend",
+            Self::AwaitingConfirmation(_) => "awaiting_confirmation",
             Self::Done => "done",
             Self::Failed(_) => "failed",
         }
@@ -102,20 +108,30 @@ impl PairingState {
         }
     }
 
-    /// Rebuilds a state from the two D-Bus properties.
+    /// The code the `PairingInfo` property carries as `{"code": _}`: empty unless
+    /// awaiting confirmation, so a code never outlives its nonce.
+    pub fn pairing_info(&self) -> &str {
+        match self {
+            Self::AwaitingConfirmation(code) => code,
+            _ => "",
+        }
+    }
+
+    /// Rebuilds a state from the three D-Bus properties.
     ///
-    /// `error` is only read for `"failed"`; a client that sends a stale error message
-    /// alongside `"done"` gets [`PairingState::Done`] and no trace of it, which is the
-    /// same invariant seen from the parsing side.
+    /// `error` is only read for `"failed"` and `info` only for `"awaiting_confirmation"`;
+    /// a client that sends a stale value alongside another state gets that state and no
+    /// trace of it, which is the same invariant seen from the parsing side.
     ///
     /// # Errors
     ///
-    /// Fails if `state` is not one of the five documented strings.
-    pub fn from_dbus(state: &str, error: &str) -> Result<Self, ParseError> {
+    /// Fails if `state` is not one of the six documented strings.
+    pub fn from_dbus(state: &str, error: &str, info: &str) -> Result<Self, ParseError> {
         Ok(match state {
             "none" => Self::None,
             "pairing" => Self::Pairing,
             "installing_backend" => Self::InstallingBackend,
+            "awaiting_confirmation" => Self::AwaitingConfirmation(info.to_owned()),
             "done" => Self::Done,
             "failed" => Self::Failed(error.to_owned()),
             _ => return Err(ParseError::new("PairingState", state)),
@@ -127,7 +143,10 @@ impl PairingState {
     /// This is the idempotency test from §9: `Pair()` on a scanner in one of these
     /// states does not restart anything, and `CancelPairing()` is only meaningful here.
     pub const fn is_in_progress(&self) -> bool {
-        matches!(self, Self::Pairing | Self::InstallingBackend)
+        matches!(
+            self,
+            Self::Pairing | Self::InstallingBackend | Self::AwaitingConfirmation(_)
+        )
     }
 
     /// Whether the last attempt failed.
@@ -146,12 +165,14 @@ impl fmt::Display for PairingState {
 mod tests {
     use super::*;
 
-    /// Every variant, `Failed` with a message that must not leak into the state string.
+    /// Every variant, `Failed`/`AwaitingConfirmation` with a payload that must not leak
+    /// into the state string.
     fn all_pairing_states() -> Vec<PairingState> {
         vec![
             PairingState::None,
             PairingState::Pairing,
             PairingState::InstallingBackend,
+            PairingState::AwaitingConfirmation("482913".to_owned()),
             PairingState::Done,
             PairingState::Failed("brscan5 install failed".to_owned()),
         ]
@@ -187,12 +208,20 @@ mod tests {
 
     #[test]
     fn pairing_state_matches_the_documented_strings() {
-        let expected = ["none", "pairing", "installing_backend", "done", "failed"];
+        let expected = [
+            "none",
+            "pairing",
+            "installing_backend",
+            "awaiting_confirmation",
+            "done",
+            "failed",
+        ];
 
         for (state, string) in all_pairing_states().into_iter().zip(expected) {
             assert_eq!(state.as_str(), string);
             assert_eq!(
-                PairingState::from_dbus(string, state.pairing_error()).unwrap(),
+                PairingState::from_dbus(string, state.pairing_error(), state.pairing_info())
+                    .unwrap(),
                 state
             );
         }
@@ -223,21 +252,36 @@ mod tests {
         }
     }
 
+    /// The property `PairingInfo` exists for.
+    #[test]
+    fn pairing_info_is_non_empty_exactly_when_awaiting_confirmation() {
+        for state in all_pairing_states() {
+            assert_eq!(
+                !state.pairing_info().is_empty(),
+                matches!(state, PairingState::AwaitingConfirmation(_)),
+                "{state:?} renders PairingInfo={:?}",
+                state.pairing_info()
+            );
+        }
+    }
+
     /// A stale error message cannot be smuggled back in alongside a non-failed state.
     #[test]
     fn from_dbus_drops_the_error_unless_the_state_is_failed() {
         for string in ["none", "pairing", "installing_backend", "done"] {
-            let state = PairingState::from_dbus(string, "stale message").unwrap();
+            let state = PairingState::from_dbus(string, "stale message", "stale code").unwrap();
             assert_eq!(state.pairing_error(), "");
+            assert_eq!(state.pairing_info(), "");
         }
 
-        assert!(PairingState::from_dbus("cancelled", "").is_err());
+        assert!(PairingState::from_dbus("cancelled", "", "").is_err());
     }
 
     #[test]
     fn in_progress_is_where_pair_is_a_no_op_and_cancel_applies() {
         assert!(PairingState::Pairing.is_in_progress());
         assert!(PairingState::InstallingBackend.is_in_progress());
+        assert!(PairingState::AwaitingConfirmation(String::new()).is_in_progress());
         assert!(!PairingState::None.is_in_progress());
         assert!(!PairingState::Done.is_in_progress());
         assert!(!PairingState::Failed(String::new()).is_in_progress());

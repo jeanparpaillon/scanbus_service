@@ -70,6 +70,15 @@ pub fn dict<'values>(entries: impl IntoIterator<Item = (String, &'values Value)>
         .collect()
 }
 
+/// A small `a{sv}` of plain strings — `PairingInfo`'s shape, `{"code": "482913"}` or
+/// empty.
+pub fn str_map(entries: &[(&str, &str)]) -> Dict {
+    entries
+        .iter()
+        .map(|(key, value)| ((*key).to_owned(), owned(ZValue::from(*value))))
+        .collect()
+}
+
 /// Why an `a{sv}` a client sent could not be read into the model.
 ///
 /// Both variants name the signature that caused it, because the client that sent it is
@@ -167,6 +176,11 @@ pub fn from_dict(dict: &Dict) -> Result<BTreeMap<String, Value>, FromValueError>
 /// supported". [`Capabilities::extra`] — the keys a backend reported that this version
 /// has no field for — is merged in underneath, so a known key always wins over a
 /// backend's homonym rather than the merge order deciding it.
+///
+/// `profiles` is the one exception to "always present": it is what the *device* said it
+/// can produce (9.3), and rendering an empty array for every scanner that never had an
+/// opinion would read as "produces nothing" rather than "did not say". Absent means did
+/// not say; `SupportedProfiles` is the property that always answers.
 pub fn capabilities(capabilities: &Capabilities) -> Dict {
     let mut rendered = dict(
         capabilities
@@ -223,6 +237,19 @@ pub fn capabilities(capabilities: &Capabilities) -> Dict {
     ]);
     rendered.insert("buttons".to_owned(), owned(ZValue::from(buttons)));
 
+    if !capabilities.profiles.is_empty() {
+        rendered.insert(
+            "profiles".to_owned(),
+            owned(ZValue::from(
+                capabilities
+                    .profiles
+                    .iter()
+                    .map(|kind| kind.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+        );
+    }
+
     rendered
 }
 
@@ -249,6 +276,7 @@ mod tests {
                 count: 4,
                 label_configurable: false,
             },
+            profiles: Vec::new(),
             extra: BTreeMap::new(),
         }
     }
