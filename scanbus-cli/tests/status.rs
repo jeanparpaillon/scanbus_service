@@ -153,14 +153,10 @@ async fn a_stub_command_says_which_issue_implements_it() {
     };
     let _daemon = serve(bus.address()).await;
 
-    let run = bus.scanbus(&["profile", "list"]);
+    let run = bus.scanbus(&["monitor"]);
     run.assert_code(1);
-    assert!(
-        run.stderr.contains("scanbus profile list"),
-        "{}",
-        run.stderr
-    );
-    assert!(run.stderr.contains("8.10"), "{}", run.stderr);
+    assert!(run.stderr.contains("scanbus monitor"), "{}", run.stderr);
+    assert!(run.stderr.contains("8.8"), "{}", run.stderr);
 }
 
 /// Acceptance: `scanbus` with no arguments prints help and exits 2.

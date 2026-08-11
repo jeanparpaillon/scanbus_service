@@ -26,6 +26,7 @@
 use std::time::Duration;
 
 use clap::{ArgGroup, Args, Parser, Subcommand};
+use clap_complete::Shell;
 use scanbus_client::{Bus, Match};
 
 use crate::duration::parse_duration;
@@ -137,6 +138,14 @@ impl ScannerFilter {
 /// The commands of §3.
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Emit a shell completion script on stdout
+    ///
+    /// Example: scanbus completions bash > /usr/share/bash-completion/completions/scanbus
+    Completions {
+        /// Shell to generate the completion script for
+        shell: Shell,
+    },
+
     /// Daemon presence, owner, version, backends and profile types
     ///
     /// The only command that tolerates an absent daemon, and the only one that never
@@ -545,6 +554,16 @@ mod tests {
     fn the_contradictory_flag_pairs_are_refused() {
         assert!(Cli::try_parse_from(["scanbus", "list", "--paired", "--unpaired"]).is_err());
         assert!(Cli::try_parse_from(["scanbus", "discover", "--watch", "--for", "5s"]).is_err());
+    }
+
+    /// Completion scripts are local output, so parsing them needs no bus context.
+    #[test]
+    fn completions_takes_a_supported_shell() {
+        let cli = Cli::try_parse_from(["scanbus", "completions", "bash"]).unwrap();
+        let Command::Completions { shell } = cli.command else {
+            panic!("that is a completions command")
+        };
+        assert_eq!(shell, Shell::Bash);
     }
 
     #[test]
