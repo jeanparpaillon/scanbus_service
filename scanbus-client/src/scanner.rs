@@ -242,7 +242,7 @@ fn as_dict(value: &ZValue<'_>, key: &str) -> Result<Dict, DecodeError> {
 /// `awaiting_confirmation` renders.
 fn pairing_info_code(info: &Dict) -> Result<String, DecodeError> {
     match info.get("code") {
-        Some(value) => as_string(&**value, "PairingInfo.code"),
+        Some(value) => as_string(value, "PairingInfo.code"),
         None => Ok(String::new()),
     }
 }

@@ -40,7 +40,7 @@ pub async fn list(context: &Context, scanner: &ScannerArg) -> Result<u8> {
         }
     }
 
-    report_list(context, &found, &views)?;
+    report_list(context, found, &views)?;
     Ok(0)
 }
 
@@ -58,7 +58,7 @@ pub async fn set(
         .within("listing the daemon's objects", Objects::fetch(&connection))
         .await?;
     let found = resolve_scanner(&objects, scanner)?;
-    let button = resolve_button(&objects, &found, selector)?;
+    let button = resolve_button(&objects, found, selector)?;
     let proxy = button_proxy(context, &connection, &button).await?;
 
     let target_profile = validate_profile(context, &connection, profile.as_deref()).await?;
@@ -96,7 +96,7 @@ pub async fn clear(context: &Context, scanner: &ScannerArg, selector: &str) -> R
         .within("listing the daemon's objects", Objects::fetch(&connection))
         .await?;
     let found = resolve_scanner(&objects, scanner)?;
-    let button = resolve_button(&objects, &found, selector)?;
+    let button = resolve_button(&objects, found, selector)?;
     let proxy = button_proxy(context, &connection, &button).await?;
 
     let write_result = write_changes(

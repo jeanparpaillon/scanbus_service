@@ -356,7 +356,7 @@ fn start_watch(
             let Ok(args) = signal.args() else {
                 return;
             };
-            if args.invalidated_properties.first().is_some() {
+            if !args.invalidated_properties.is_empty() {
                 return;
             }
             if job.apply(&args.changed_properties).is_err() {
