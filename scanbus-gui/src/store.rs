@@ -113,7 +113,21 @@ impl Store {
         self.scanners.clear();
         self.profiles.clear();
 
+        for (path, interfaces) in &snapshot {
+            if interfaces.contains_key(SCANNER_INTERFACE)
+                || interfaces.contains_key(PROFILE_INTERFACE)
+            {
+                self.apply_interfaces_added(path, interfaces)?;
+            }
+        }
+
         for (path, interfaces) in snapshot {
+            if !(interfaces.contains_key(BUTTON_INTERFACE)
+                || interfaces.contains_key(JOB_INTERFACE))
+            {
+                continue;
+            }
+
             self.apply_interfaces_added(&path, &interfaces)?;
         }
 
