@@ -82,6 +82,7 @@ use crate::dbus::{ObjectRegistry, path};
 use crate::error::Error;
 use crate::jobs::JobRegistry;
 use crate::listeners::{self, ButtonEventSink, ListenError, RestartPolicy};
+use crate::profiles::ProfileRegistry;
 
 mod address;
 
@@ -185,8 +186,12 @@ impl ScannerRegistry {
     ///
     /// Returns an [`Arc`] rather than a bare `Self` because every object it publishes
     /// gets a weak handle back to it; see [`ScannerRegistry::self_ref`].
-    pub fn new(objects: Arc<ObjectRegistry>, store: Arc<dyn PairingStore>) -> Arc<Self> {
-        let jobs = Arc::new(JobRegistry::new(Arc::clone(&objects)));
+    pub fn new(
+        objects: Arc<ObjectRegistry>,
+        store: Arc<dyn PairingStore>,
+        profiles: Arc<ProfileRegistry>,
+    ) -> Arc<Self> {
+        let jobs = Arc::new(JobRegistry::new(Arc::clone(&objects), profiles));
         Self::with_listeners(objects, store, jobs, RestartPolicy::DEFAULT)
     }
 

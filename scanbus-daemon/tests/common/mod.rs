@@ -23,8 +23,8 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use scanbus_daemon::dbus::{self, Manager1, ObjectRegistry, path};
-use scanbus_daemon::{Backends, Discovery, MemoryPairingStore, ScannerRegistry};
+use scanbus_daemon::dbus::{self, Manager1, ObjectRegistry, Profile1, path};
+use scanbus_daemon::{Backends, Discovery, MemoryPairingStore, ProfileRegistry, ScannerRegistry};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 
@@ -165,12 +165,27 @@ impl Daemon {
     pub async fn start(bus: &PrivateBus, backends: Backends) -> Self {
         let connection = bus.connect().await;
         let objects = Arc::new(ObjectRegistry::new(connection.clone()).await.unwrap());
+        let profiles = Arc::new(ProfileRegistry::ephemeral());
         let store = Arc::new(MemoryPairingStore::new());
-        let scanners = ScannerRegistry::new(Arc::clone(&objects), Arc::clone(&store) as _);
+        let scanners = ScannerRegistry::new(
+            Arc::clone(&objects),
+            Arc::clone(&store) as _,
+            Arc::clone(&profiles),
+        );
         let discovery = Arc::new(Discovery::new(backends, Arc::clone(&scanners)));
 
+        for kind in profiles.registered_profiles() {
+            objects
+                .add(path::profile(kind), Profile1::new(kind, Arc::clone(&profiles)))
+                .await
+                .unwrap();
+        }
+
         objects
-            .add(path::manager(), Manager1::new(Arc::clone(&discovery)))
+            .add(
+                path::manager(),
+                Manager1::new(Arc::clone(&discovery), Arc::clone(&profiles)),
+            )
             .await
             .unwrap();
         dbus::request_name(&connection).await.unwrap();

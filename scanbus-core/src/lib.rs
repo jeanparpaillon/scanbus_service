@@ -10,6 +10,7 @@ pub mod error;
 pub mod model;
 pub mod pairing;
 pub mod path;
+pub mod profile;
 
 pub use backend::{ButtonPressedEvent, PairingProgress, ScannerBackend};
 pub use error::{BackendError, InvalidScannerId, ParseError};
@@ -18,3 +19,4 @@ pub use model::{
     ProfileKind, RawPage, ScannerId, ScannerInfo, Source, Status, Value,
 };
 pub use pairing::{PairOutcome, PairingMachine, PairingStore, PairingStoreError, UnpairError};
+pub use profile::{ProfileProcessor, ProfileResult};

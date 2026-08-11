@@ -46,13 +46,11 @@
 //! a history is a second source of truth about jobs, and `GetManagedObjects` is already
 //! the first.
 //!
-//! # Where the profile pipeline goes
+//! # Profile processing
 //!
-//! [`run_profile`] is a hole. [3.1] is what fills it, with `Profile1` objects and the
-//! `ProfileProcessor` seam; until then a job with a profile assigned still moves
-//! `receiving` → `processing` → `done`, and its `Result` stays empty. The pages are
-//! counted and dropped rather than buffered, because there is nothing yet to hand them
-//! to and an ADF batch held in memory to be thrown away is megabytes per page of nothing.
+//! [3.1] wires the `ProfileProcessor` seam in: pages are streamed to the selected
+//! processor as they arrive, and `Job1.Result` is profile-specific (`paths` for image,
+//! `path` for document).
 //!
 //! [`scanbus-dbus-api.md`]: https://github.com/jeanparpaillon/scanbus_service/blob/master/docs/scanbus-dbus-api.md
 //! [`scanbus-cli.md`]: https://github.com/jeanparpaillon/scanbus_service/blob/master/docs/scanbus-cli.md
@@ -65,7 +63,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::StreamExt as _;
+use futures_util::stream::{self, BoxStream};
 use scanbus_core::{BackendError, JobState, ProfileKind, ScannerBackend, ScannerId, Value};
+use tokio::sync::mpsc;
 use tracing::{debug, info, instrument, warn};
 use zbus::object_server::InterfaceRef;
 use zbus::zvariant::OwnedObjectPath;
@@ -75,6 +75,7 @@ use crate::dbus::job::{self, HOST_TRIGGERED, Job1};
 use crate::dbus::objects::ObjectRegistry;
 use crate::dbus::path;
 use crate::listeners::{ButtonEvent, ButtonEventSink};
+use crate::profiles::ProfileRegistry;
 
 /// What started a scan — the `Button` property of §4, before it is narrowed to an `i`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +112,7 @@ impl JobTrigger {
 /// [`ScannerRegistry::with_listeners`]: crate::scanners::ScannerRegistry::with_listeners
 pub struct JobRegistry {
     objects: Arc<ObjectRegistry>,
+    profiles: Arc<ProfileRegistry>,
     /// The next job id. Monotonic across the whole daemon rather than per scanner, so a
     /// short id a user reads off `job list` names one job (`scanbus-cli.md` §5) instead
     /// of one per device, and so "not reused within a daemon lifetime" holds without a
@@ -138,8 +140,8 @@ impl JobRegistry {
 
     /// A registry publishing into `objects`, keeping finished jobs for
     /// [`JobRegistry::RETENTION`].
-    pub fn new(objects: Arc<ObjectRegistry>) -> Self {
-        Self::with_retention(objects, Self::RETENTION)
+    pub fn new(objects: Arc<ObjectRegistry>, profiles: Arc<ProfileRegistry>) -> Self {
+        Self::with_retention(objects, profiles, Self::RETENTION)
     }
 
     /// The same, with the retention window chosen.
@@ -147,9 +149,14 @@ impl JobRegistry {
     /// Exists for the one thing a test needs and a daemon does not: an object that is
     /// still there right after `State="done"` and gone shortly afterwards, without a
     /// minute of `sleep` in the suite.
-    pub fn with_retention(objects: Arc<ObjectRegistry>, retention: Duration) -> Self {
+    pub fn with_retention(
+        objects: Arc<ObjectRegistry>,
+        profiles: Arc<ProfileRegistry>,
+        retention: Duration,
+    ) -> Self {
         Self {
             objects,
+            profiles,
             next_id: AtomicU64::new(Self::FIRST_ID),
             retention,
         }
@@ -189,6 +196,7 @@ impl JobRegistry {
 
         let task = tokio::spawn(run(
             Arc::clone(&self.objects),
+            Arc::clone(&self.profiles),
             backend,
             scanner,
             job_id,
@@ -227,6 +235,14 @@ impl JobRegistry {
             }
         }
     }
+
+    async fn resolved_options(
+        &self,
+        profile: Option<ProfileKind>,
+        button_options: BTreeMap<String, Value>,
+    ) -> BTreeMap<String, Value> {
+        self.profiles.resolve_options(profile, button_options).await
+    }
 }
 
 #[async_trait]
@@ -237,8 +253,9 @@ impl ButtonEventSink for JobRegistry {
 
         // Both halves of the key's configuration, under one read, before anything else
         // can rewrite it — the "copied at trigger time" of §4.
-        let (button_profile, options) = self.assignment(&scanner, index).await;
+        let (button_profile, button_options) = self.assignment(&scanner, index).await;
         let profile = event.profile(button_profile);
+        let options = self.resolved_options(profile, button_options).await;
 
         self.start(
             backend,
@@ -262,6 +279,7 @@ impl ButtonEventSink for JobRegistry {
 #[instrument(level = "info", skip_all, fields(scanner = %scanner, job = job_id))]
 async fn run(
     objects: Arc<ObjectRegistry>,
+    profiles: Arc<ProfileRegistry>,
     backend: Arc<dyn ScannerBackend>,
     scanner: ScannerId,
     job_id: u64,
@@ -284,16 +302,30 @@ async fn run(
     let mut iface: Option<InterfaceRef<Job1>> = None;
     let mut count = 0u32;
     let mut failure: Option<BackendError> = None;
+    let mut pages_tx = None;
+    let mut processor = None;
+
+    if profile.is_some() {
+        let (tx, mut rx) = mpsc::channel::<scanbus_core::RawPage>(8);
+        let options_for_processor = options.clone();
+        let task = tokio::spawn(async move {
+            let stream: BoxStream<'static, scanbus_core::RawPage> =
+                Box::pin(stream::poll_fn(move |cx| rx.poll_recv(cx)));
+            profiles
+                .process(profile, stream, &options_for_processor)
+                .await
+        });
+        pages_tx = Some(tx);
+        processor = Some(task);
+    }
 
     while let Some(item) = pages.next().await {
-        let Ok(_page) = item else {
+        let Ok(page) = item else {
             // One `Err` ends the transfer; nothing is expected after it.
             failure = item.err();
             break;
         };
 
-        // The page itself is dropped: there is no `ProfileProcessor` to hand it to yet
-        // (3.1), and what the object needs is the count.
         count = count.saturating_add(1);
 
         match &iface {
@@ -308,7 +340,18 @@ async fn run(
                 }
             }
         }
+
+        if let Some(tx) = &pages_tx
+            && tx.send(page).await.is_err()
+        {
+            failure = Some(BackendError::Other(
+                "the profile processor stopped before capture ended".to_owned(),
+            ));
+            break;
+        }
     }
+
+    drop(pages_tx);
 
     let Some(iface) = iface else {
         match failure {
@@ -326,9 +369,16 @@ async fn run(
             // End of capture, start of post-processing (§9).
             announce(&iface, JobState::Processing, BTreeMap::new()).await;
 
-            match run_profile(profile, &options).await {
-                Ok(result) => (JobState::Done, result),
-                Err(message) => (JobState::Error(message), BTreeMap::new()),
+            match processor {
+                None => (JobState::Done, BTreeMap::new()),
+                Some(task) => match task.await {
+                    Ok(Ok(result)) => (JobState::Done, result),
+                    Ok(Err(message)) => (JobState::Error(message), BTreeMap::new()),
+                    Err(error) => (
+                        JobState::Error(format!("profile processing task failed: {error}")),
+                        BTreeMap::new(),
+                    ),
+                },
             }
         }
     };
@@ -418,32 +468,6 @@ fn retire(objects: Arc<ObjectRegistry>, path: OwnedObjectPath, retention: Durati
     });
 }
 
-/// The profile pipeline, as far as this iteration has one: it has none.
-///
-/// [3.1] is the issue that replaces this with `Profile1` objects and the
-/// `ProfileProcessor` seam of the implementation plan §6, and it is also the issue that
-/// decides how the pages reach a processor — as a stream it drives itself, or as the
-/// buffer `DocumentProcessor` needs for PDF assembly. Deciding that here, with nothing to
-/// consume either shape, would be inventing the seam that issue exists to design.
-///
-/// Until then the job still runs its whole lifecycle: `Result` stays empty, which §6
-/// makes readable — every documented shape is a map, and an empty one is "nothing was
-/// produced" rather than a malformed reply.
-///
-/// [3.1]: https://github.com/jeanparpaillon/scanbus_service/issues/13
-async fn run_profile(
-    profile: Option<ProfileKind>,
-    options: &BTreeMap<String, Value>,
-) -> Result<BTreeMap<String, Value>, String> {
-    debug!(
-        profile = ProfileKind::optional_as_str(profile),
-        options = options.len(),
-        "no profile processor yet (3.1); the job finishes with an empty Result"
-    );
-
-    Ok(BTreeMap::new())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -459,13 +483,18 @@ mod tests {
         assert_eq!(JobTrigger::Button(u32::MAX).button_property(), i32::MAX);
     }
 
-    /// The hole 3.1 fills: a lifecycle that completes, with nothing in `Result`.
+    /// Unsupported profile kinds are surfaced as processing errors.
     #[tokio::test]
-    async fn the_profile_pipeline_is_a_hole_that_still_finishes() {
-        let result = run_profile(Some(ProfileKind::Document), &BTreeMap::new())
-            .await
-            .expect("a missing processor is not a failed job");
+    async fn unsupported_profiles_are_processing_errors() {
+        let profiles = ProfileRegistry::ephemeral();
+        let pages: BoxStream<'static, scanbus_core::RawPage> =
+            Box::pin(stream::empty::<scanbus_core::RawPage>());
 
-        assert!(result.is_empty());
+        let error = profiles
+            .process(Some(ProfileKind::Email), pages, &BTreeMap::new())
+            .await
+            .expect_err("email is not implemented");
+
+        assert!(error.contains("not implemented"));
     }
 }

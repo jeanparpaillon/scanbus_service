@@ -526,6 +526,7 @@ dependencies = [
  "scanbus-backend-hplip",
  "scanbus-client",
  "scanbus-core",
+ "serde_json",
  "thiserror",
  "tokio",
  "tracing",

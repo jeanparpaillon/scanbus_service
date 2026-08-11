@@ -16,6 +16,7 @@ pub mod discovery;
 pub mod error;
 pub mod jobs;
 pub mod listeners;
+pub mod profiles;
 pub mod scanners;
 pub mod store;
 
@@ -24,5 +25,6 @@ pub use discovery::Discovery;
 pub use error::Error;
 pub use jobs::{JobRegistry, JobTrigger};
 pub use listeners::{ButtonEvent, ButtonEventSink, RestartPolicy};
+pub use profiles::ProfileRegistry;
 pub use scanners::ScannerRegistry;
 pub use store::MemoryPairingStore;

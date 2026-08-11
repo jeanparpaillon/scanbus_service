@@ -96,11 +96,8 @@ async fn discover(client: &zbus::Connection, id: &ScannerId) {
 
 /// Acceptance: each proxy round-trips one method and one property against the daemon.
 ///
-/// `Profile1` still has no server side (3.1), and a `Job1` object only exists while a
-/// scan is in flight (§4), so what is asserted for those two is the honest half: their
-/// proxies build against the paths of §1 and their calls come back as a refusal the
-/// client decodes *by name* — not as a transport failure, which is what a client that
-/// guessed would report.
+/// `Job1` objects are transient (§4), so a proxy built for an id nothing is running is a
+/// named refusal, while `Profile1` objects are persistent and readable.
 #[tokio::test]
 async fn every_proxy_round_trips_against_the_daemon() {
     let Some(bus) = PrivateBus::start().await else {
@@ -155,15 +152,8 @@ async fn every_proxy_round_trips_against_the_daemon() {
     assert!(!button.label_configurable().await.unwrap());
     assert_eq!(button.profile().await.unwrap(), "");
 
-    // Job1 and Profile1, which have no object at these paths — and for two different
-    // reasons worth keeping apart. A job is *transient* (§4): its object exists only
-    // while a scan is in flight, so a proxy built for an id nothing is running is
-    // `UnknownObject` by design, and `tests/jobs.rs` is where one is driven for real.
-    // `Profile1` has no server side at all yet (3.1).
-    //
-    // Either way what a client gets is a *named refusal* it classifies as one —
-    // `Error::Call`, not `Error::Bus`. That distinction is what lets the CLI say "there
-    // is no such object" instead of "the bus is broken".
+    // `Profile1` is now exported server-side (3.1): the proxy reads options from the
+    // object. `Job1` stays transient and is tested as a named refusal here.
     let job = scanbus_client::proxy::Job1Proxy::for_job(&client, &found.id, 1)
         .await
         .unwrap();
@@ -171,19 +161,21 @@ async fn every_proxy_round_trips_against_the_daemon() {
         .await
         .unwrap();
 
-    let refusals = [
-        job.state().await.map(|_| ()),
-        profile.options().await.map(|_| ()),
-    ];
-    for refusal in refusals {
-        let error = Error::from(refusal.expect_err("there is no object at that path"));
-        match &error {
-            Error::Call(ScanbusError::Other { name, .. }) => assert_eq!(
-                name, "org.freedesktop.DBus.Error.UnknownObject",
-                "an object that is not there is what the bus reports, by name"
-            ),
-            other => panic!("expected a named refusal, got {other:?}"),
-        }
+    assert_eq!(profile.name().await.unwrap(), "document");
+    assert!(!profile.options().await.unwrap().is_empty());
+
+    let refusal = job
+        .state()
+        .await
+        .map(|_| ())
+        .expect_err("there is no job object at that path");
+    let error = Error::from(refusal);
+    match &error {
+        Error::Call(ScanbusError::Other { name, .. }) => assert_eq!(
+            name, "org.freedesktop.DBus.Error.UnknownObject",
+            "an object that is not there is what the bus reports, by name"
+        ),
+        other => panic!("expected a named refusal, got {other:?}"),
     }
 
     daemon.shutdown().await;

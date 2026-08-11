@@ -16,7 +16,7 @@ use crate::error::ParseError;
 /// parse error indistinguishable from a typo, when the honest answer is
 /// `org.scanbus.Error.UnsupportedProfile` (2.7) — so they parse, and
 /// [`ProfileKind::is_supported`] is what refuses them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProfileKind {
     /// One file per page (jpeg/png).
