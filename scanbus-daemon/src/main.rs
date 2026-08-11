@@ -50,16 +50,17 @@ const BACKENDS: &[&str] = &[
 ///
 /// Vendor backends are still skeletons. The mobile backend is available and discoverable
 /// on default builds.
-fn backends() -> Result<Backends, String> {
+fn backends() -> Result<(Backends, u16), String> {
     let mut entries: Vec<Arc<dyn scanbus_core::ScannerBackend>> = Vec::new();
+    let upload_port = mobile_backend_port()?;
 
     #[cfg(feature = "mobile")]
     entries.push(Arc::new(
         scanbus_backend_mobile::MobileBackend::default()
-            .with_upload_port(mobile_backend_port()?),
+            .with_upload_port(upload_port),
     ));
 
-    Ok(Backends::new(entries))
+    Ok((Backends::new(entries), upload_port))
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -69,7 +70,7 @@ async fn main() -> ExitCode {
         .unwrap_or_else(|_| EnvFilter::new("warn,scanbus_daemon=info,scanbus_core=info"));
     fmt().with_env_filter(filter).with_target(true).init();
 
-    let compiled_backends = match backends() {
+    let (compiled_backends, mobile_upload_port) = match backends() {
         Ok(backends) => backends,
         Err(error) => {
             error!(%error, "scanbus-daemon cannot run");
@@ -81,6 +82,7 @@ async fn main() -> ExitCode {
         version = env!("CARGO_PKG_VERSION"),
         compiled_in = ?BACKENDS,
         probing = ?compiled_backends.ids(),
+        mobile_upload_port,
         "scanbus-daemon started"
     );
 
