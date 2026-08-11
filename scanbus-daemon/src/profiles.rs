@@ -1,12 +1,15 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt as _;
 use futures_util::stream::BoxStream;
-use scanbus_core::{ProfileKind, ProfileProcessor, ProfileResult, RawPage, Value};
+use image::ImageFormat;
+use image::codecs::jpeg::JpegEncoder;
+use scanbus_core::{PageFormat, ProfileKind, ProfileProcessor, ProfileResult, RawPage, Value};
 use tokio::sync::Mutex;
 
 const IMAGE_FORMAT: &str = "format";
@@ -140,6 +143,21 @@ impl Default for ProfileRegistry {
 
 struct ImageProcessor;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutputFormat {
+    Jpeg,
+    Png,
+}
+
+impl OutputFormat {
+    fn extension(self) -> &'static str {
+        match self {
+            Self::Jpeg => "jpg",
+            Self::Png => "png",
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl ProfileProcessor for ImageProcessor {
     async fn process(
@@ -148,6 +166,7 @@ impl ProfileProcessor for ImageProcessor {
         options: &BTreeMap<String, Value>,
     ) -> Result<ProfileResult, String> {
         let format = image_format(options)?;
+        let quality = image_quality(options)?;
         let output_dir = output_dir(options, ProfileKind::Image)?;
         ensure_output_dir(&output_dir)?;
 
@@ -155,14 +174,69 @@ impl ProfileProcessor for ImageProcessor {
         let mut written = Vec::new();
 
         while let Some(page) = pages.next().await {
-            let name = format!("scan-{stamp}-p{:03}.{format}", page.index + 1);
+            let name = format!("scan-{stamp}-p{:03}.{}", page.index + 1, format.extension());
             let path = unique_path(output_dir.join(name));
-            fs::write(&path, &page.data)
-                .map_err(|error| format!("cannot write image page to {}: {error}", path.display()))?;
+            let encoded = encode_for_output(&page, format, quality)?;
+            fs::write(&path, &encoded).map_err(|error| {
+                format!("cannot write image page to {}: {error}", path.display())
+            })?;
             written.push(path.to_string_lossy().to_string());
         }
 
         Ok(ProfileResult::Image { paths: written })
+    }
+}
+
+fn encode_for_output(page: &RawPage, output: OutputFormat, quality: u8) -> Result<Vec<u8>, String> {
+    if matches!(
+        (output, page.format),
+        (OutputFormat::Jpeg, PageFormat::Jpeg)
+    ) || matches!((output, page.format), (OutputFormat::Png, PageFormat::Png))
+    {
+        return Ok(page.data.clone());
+    }
+
+    let decoded = decode_page(page)?;
+
+    match output {
+        OutputFormat::Jpeg => {
+            let mut out = Vec::new();
+            let mut encoder = JpegEncoder::new_with_quality(&mut out, quality);
+            encoder.encode_image(&decoded).map_err(|error| {
+                format!("cannot encode page {} to JPEG: {error}", page.index + 1)
+            })?;
+            Ok(out)
+        }
+        OutputFormat::Png => {
+            let mut cursor = Cursor::new(Vec::new());
+            decoded
+                .write_to(&mut cursor, ImageFormat::Png)
+                .map_err(|error| {
+                    format!("cannot encode page {} to PNG: {error}", page.index + 1)
+                })?;
+            Ok(cursor.into_inner())
+        }
+    }
+}
+
+fn decode_page(page: &RawPage) -> Result<image::DynamicImage, String> {
+    image::load_from_memory_with_format(&page.data, image_format_from_page(page.format)).map_err(
+        |error| {
+            format!(
+                "cannot decode page {} with input format {}: {error}",
+                page.index + 1,
+                page.format
+            )
+        },
+    )
+}
+
+const fn image_format_from_page(format: PageFormat) -> ImageFormat {
+    match format {
+        PageFormat::Pnm => ImageFormat::Pnm,
+        PageFormat::Jpeg => ImageFormat::Jpeg,
+        PageFormat::Png => ImageFormat::Png,
+        PageFormat::Tiff => ImageFormat::Tiff,
     }
 }
 
@@ -277,9 +351,9 @@ fn validate_options(kind: ProfileKind, options: &BTreeMap<String, Value>) -> Res
     Ok(())
 }
 
-fn image_format(options: &BTreeMap<String, Value>) -> Result<&'static str, String> {
+fn image_format(options: &BTreeMap<String, Value>) -> Result<OutputFormat, String> {
     let Some(value) = options.get(IMAGE_FORMAT) else {
-        return Ok("jpeg");
+        return Ok(OutputFormat::Jpeg);
     };
 
     let Value::Str(format) = value else {
@@ -287,10 +361,22 @@ fn image_format(options: &BTreeMap<String, Value>) -> Result<&'static str, Strin
     };
 
     match format.as_str() {
-        "jpeg" | "jpg" => Ok("jpg"),
-        "png" => Ok("png"),
-        other => Err(format!("image format must be one of jpeg/jpg/png, got {other:?}")),
+        "jpeg" | "jpg" => Ok(OutputFormat::Jpeg),
+        "png" => Ok(OutputFormat::Png),
+        other => Err(format!(
+            "image format must be one of jpeg/jpg/png, got {other:?}"
+        )),
     }
+}
+
+fn image_quality(options: &BTreeMap<String, Value>) -> Result<u8, String> {
+    let Some(value) = options.get(IMAGE_QUALITY) else {
+        return Ok(90);
+    };
+
+    let quality =
+        as_u64(value).ok_or_else(|| "image option quality must be an integer".to_owned())?;
+    u8::try_from(quality).map_err(|_| format!("image quality must be in 1..=100, got {quality}"))
 }
 
 fn document_is_pdf(options: &BTreeMap<String, Value>) -> bool {
@@ -390,8 +476,12 @@ fn persist_options(
     options: &BTreeMap<ProfileKind, BTreeMap<String, Value>>,
 ) -> Result<(), String> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("cannot create profile store directory {}: {error}", parent.display()))?;
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "cannot create profile store directory {}: {error}",
+                parent.display()
+            )
+        })?;
     }
 
     let tmp = path.with_extension("json.tmp");
@@ -478,6 +568,9 @@ fn as_u64(value: &Value) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::stream;
+    use image::{ImageBuffer, Rgba};
+    use scanbus_core::ProfileProcessor;
 
     #[test]
     fn defaults_have_the_two_registered_profiles() {
@@ -513,7 +606,168 @@ mod tests {
             )
             .await;
 
-        assert_eq!(resolved.get(IMAGE_FORMAT), Some(&Value::Str("png".to_owned())));
+        assert_eq!(
+            resolved.get(IMAGE_FORMAT),
+            Some(&Value::Str("png".to_owned()))
+        );
         assert_eq!(resolved.get(IMAGE_QUALITY), Some(&Value::U64(90)));
+    }
+
+    fn tiny_jpeg() -> Vec<u8> {
+        let pixels: ImageBuffer<Rgba<u8>, Vec<u8>> =
+            ImageBuffer::from_pixel(2, 2, Rgba([10, 20, 30, 255]));
+        let mut out = Vec::new();
+        let mut encoder = JpegEncoder::new_with_quality(&mut out, 85);
+        encoder
+            .encode_image(&image::DynamicImage::ImageRgba8(pixels))
+            .unwrap();
+        out
+    }
+
+    fn tiny_png() -> Vec<u8> {
+        let pixels: ImageBuffer<Rgba<u8>, Vec<u8>> =
+            ImageBuffer::from_pixel(2, 2, Rgba([220, 120, 90, 255]));
+        let mut cursor = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(pixels)
+            .write_to(&mut cursor, ImageFormat::Png)
+            .unwrap();
+        cursor.into_inner()
+    }
+
+    #[tokio::test]
+    async fn image_profile_passes_through_when_input_and_output_match() {
+        let dir = std::env::temp_dir().join(format!(
+            "scanbus-image-pass-through-{}-{}",
+            std::process::id(),
+            scan_stamp()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+
+        let jpeg = tiny_jpeg();
+        let page = RawPage {
+            index: 0,
+            format: PageFormat::Jpeg,
+            resolution_dpi: 300,
+            data: jpeg.clone(),
+        };
+
+        let options = BTreeMap::from([
+            (IMAGE_FORMAT.to_owned(), Value::Str("jpeg".to_owned())),
+            (
+                OUTPUT_FOLDER.to_owned(),
+                Value::Str(dir.to_string_lossy().to_string()),
+            ),
+        ]);
+
+        let result = ImageProcessor
+            .process(Box::pin(stream::iter([page])), &options)
+            .await
+            .unwrap();
+
+        let ProfileResult::Image { paths } = result else {
+            panic!("unexpected profile result");
+        };
+        let written = std::fs::read(&paths[0]).unwrap();
+        assert_eq!(
+            written, jpeg,
+            "matching JPEG input must be passed through unchanged"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn image_profile_converts_when_output_differs() {
+        let dir = std::env::temp_dir().join(format!(
+            "scanbus-image-convert-{}-{}",
+            std::process::id(),
+            scan_stamp()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+
+        let options = BTreeMap::from([
+            (IMAGE_FORMAT.to_owned(), Value::Str("png".to_owned())),
+            (
+                OUTPUT_FOLDER.to_owned(),
+                Value::Str(dir.to_string_lossy().to_string()),
+            ),
+        ]);
+        let page = RawPage {
+            index: 0,
+            format: PageFormat::Jpeg,
+            resolution_dpi: 300,
+            data: tiny_jpeg(),
+        };
+
+        let result = ImageProcessor
+            .process(Box::pin(stream::iter([page])), &options)
+            .await
+            .unwrap();
+        let ProfileResult::Image { paths } = result else {
+            panic!("unexpected profile result");
+        };
+
+        let written = std::fs::read(&paths[0]).unwrap();
+        let format = image::guess_format(&written).unwrap();
+        assert_eq!(format, ImageFormat::Png);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn image_profile_uses_page_numbers_in_sort_order() {
+        let dir = std::env::temp_dir().join(format!(
+            "scanbus-image-page-numbers-{}-{}",
+            std::process::id(),
+            scan_stamp()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+
+        let options = BTreeMap::from([
+            (IMAGE_FORMAT.to_owned(), Value::Str("png".to_owned())),
+            (
+                OUTPUT_FOLDER.to_owned(),
+                Value::Str(dir.to_string_lossy().to_string()),
+            ),
+        ]);
+
+        let pages = (0..10).map(|index| RawPage {
+            index,
+            format: PageFormat::Png,
+            resolution_dpi: 300,
+            data: tiny_png(),
+        });
+
+        let result = ImageProcessor
+            .process(Box::pin(stream::iter(pages)), &options)
+            .await
+            .unwrap();
+        let ProfileResult::Image { paths } = result else {
+            panic!("unexpected profile result");
+        };
+
+        let names: Vec<String> = paths
+            .into_iter()
+            .map(|path| {
+                PathBuf::from(path)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect();
+        let sorted = {
+            let mut copy = names.clone();
+            copy.sort();
+            copy
+        };
+        assert_eq!(
+            names, sorted,
+            "filenames should already be lexicographically sorted by page index"
+        );
+        assert!(names[0].contains("p001"));
+        assert!(names[9].contains("p010"));
+
+        let _ = fs::remove_dir_all(dir);
     }
 }

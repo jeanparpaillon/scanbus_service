@@ -363,22 +363,48 @@ async fn run(
         return None;
     };
 
+    enum ProcessorOutcome {
+        None,
+        Success(BTreeMap<String, Value>),
+        Failed(String),
+    }
+
+    let processor_outcome = match processor {
+        None => ProcessorOutcome::None,
+        Some(task) => match task.await {
+            Ok(Ok(result)) => ProcessorOutcome::Success(result),
+            Ok(Err(message)) => {
+                warn!(%message, "profile processor failed");
+                ProcessorOutcome::Failed(message)
+            }
+            Err(error) => {
+                let message = format!("profile processing task failed: {error}");
+                warn!(%message, "profile processing task failed");
+                ProcessorOutcome::Failed(message)
+            }
+        },
+    };
+
     let (state, result) = match failure {
-        Some(error) => (JobState::Error(error.to_string()), BTreeMap::new()),
+        Some(error) => {
+            let partial = match processor_outcome {
+                ProcessorOutcome::Success(result) => result,
+                ProcessorOutcome::None | ProcessorOutcome::Failed(_) => BTreeMap::new(),
+            };
+            (JobState::Error(error.to_string()), partial)
+        }
         None => {
             // End of capture, start of post-processing (§9).
             announce(&iface, JobState::Processing, BTreeMap::new()).await;
 
-            match processor {
-                None => (JobState::Done, BTreeMap::new()),
-                Some(task) => match task.await {
-                    Ok(Ok(result)) => (JobState::Done, result),
-                    Ok(Err(message)) => (JobState::Error(message), BTreeMap::new()),
-                    Err(error) => (
-                        JobState::Error(format!("profile processing task failed: {error}")),
-                        BTreeMap::new(),
-                    ),
-                },
+            match processor_outcome {
+                ProcessorOutcome::Success(result) => (JobState::Done, result),
+                ProcessorOutcome::None if profile.is_none() => (JobState::Done, BTreeMap::new()),
+                ProcessorOutcome::None => (
+                    JobState::Error("profile processing failed".to_owned()),
+                    BTreeMap::new(),
+                ),
+                ProcessorOutcome::Failed(message) => (JobState::Error(message), BTreeMap::new()),
             }
         }
     };

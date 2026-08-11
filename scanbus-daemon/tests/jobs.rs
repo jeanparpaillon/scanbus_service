@@ -18,10 +18,13 @@
 //! itself one of the assertions below.
 
 use std::collections::HashMap;
+use std::fs;
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::StreamExt as _;
+use image::codecs::jpeg::JpegEncoder;
+use image::{DynamicImage, ImageBuffer, Rgba};
 use scanbus_core::backend::mock::{MockBackend, MockHandle, PageFeed};
 use scanbus_core::{
     BackendError, ButtonsCapability, Capabilities, PageFormat, RawPage, ScannerBackend, ScannerId,
@@ -83,6 +86,13 @@ trait Button {
     fn set_profile(&self, value: &str) -> zbus::Result<()>;
 }
 
+/// Just enough of `org.scanbus.Profile1` to override image defaults for a test.
+#[zbus::proxy(interface = "org.scanbus.Profile1", default_service = "org.scanbus")]
+trait Profile {
+    #[zbus(property)]
+    fn set_options(&self, value: HashMap<String, OwnedValue>) -> zbus::Result<()>;
+}
+
 /// Just enough of `org.scanbus.Scanner1` to connect and to set the fallback profile.
 #[zbus::proxy(interface = "org.scanbus.Scanner1", default_service = "org.scanbus")]
 trait Scanner {
@@ -128,7 +138,10 @@ impl Daemon {
 
         for kind in profiles.registered_profiles() {
             objects
-                .add(path::profile(kind), Profile1::new(kind, Arc::clone(&profiles)))
+                .add(
+                    path::profile(kind),
+                    Profile1::new(kind, Arc::clone(&profiles)),
+                )
                 .await
                 .unwrap();
         }
@@ -205,6 +218,26 @@ fn page(index: u32) -> RawPage {
     }
 }
 
+fn jpeg_page(index: u32, fill: u8) -> RawPage {
+    let pixels: ImageBuffer<Rgba<u8>, Vec<u8>> = ImageBuffer::from_pixel(
+        4,
+        4,
+        Rgba([fill, fill.saturating_add(1), fill.saturating_add(2), 255]),
+    );
+    let mut data = Vec::new();
+    let mut encoder = JpegEncoder::new_with_quality(&mut data, 80);
+    encoder
+        .encode_image(&DynamicImage::ImageRgba8(pixels))
+        .unwrap();
+
+    RawPage {
+        index,
+        format: PageFormat::Jpeg,
+        resolution_dpi: 300,
+        data,
+    }
+}
+
 /// The feed the daemon's *next* job will read, opened under the id it will mint.
 fn open_next_job(handle: &MockHandle, job_id: u64) -> PageFeed {
     handle.open_pages(job_id.to_string())
@@ -231,6 +264,19 @@ async fn button_proxy(
 ) -> ButtonProxy<'static> {
     ButtonProxy::builder(connection)
         .path(path::button(id, index))
+        .unwrap()
+        .cache_properties(zbus::proxy::CacheProperties::No)
+        .build()
+        .await
+        .unwrap()
+}
+
+async fn profile_proxy(
+    connection: &zbus::Connection,
+    profile: scanbus_core::ProfileKind,
+) -> ProfileProxy<'static> {
+    ProfileProxy::builder(connection)
+        .path(path::profile(profile))
         .unwrap()
         .cache_properties(zbus::proxy::CacheProperties::No)
         .build()
@@ -582,6 +628,83 @@ async fn a_transfer_that_dies_lands_in_error_and_is_then_removed() {
         "a call against a removed job is UnknownObject, not a stale reply"
     );
 
+    daemon.shutdown().await;
+}
+
+/// Acceptance: an image-profile job that fails after writing two pages keeps both files
+/// and reports them in `Result` alongside `State="error"`.
+#[tokio::test]
+async fn image_profile_failure_keeps_written_paths_in_result() {
+    let Some(bus) = PrivateBus::start().await else {
+        return skipped("image_profile_failure_keeps_written_paths_in_result");
+    };
+    let info = brother();
+    let daemon = Daemon::start(&bus, [info.clone()]).await;
+    let client = bus.connect().await;
+    daemon.ready(&info).await;
+
+    let out = std::env::temp_dir().join(format!(
+        "scanbus-image-error-result-{}-{}",
+        std::process::id(),
+        JobRegistry::FIRST_ID
+    ));
+    fs::create_dir_all(&out).unwrap();
+
+    let image = profile_proxy(&client, scanbus_core::ProfileKind::Image).await;
+    image
+        .set_options(HashMap::from([
+            (
+                "format".to_owned(),
+                OwnedValue::try_from(ZValue::from("jpeg")).unwrap(),
+            ),
+            (
+                "output_folder".to_owned(),
+                OwnedValue::try_from(ZValue::from(out.to_string_lossy().to_string())).unwrap(),
+            ),
+        ]))
+        .await
+        .unwrap();
+
+    let button = button_proxy(&client, &info.id, 1).await;
+    button.set_profile("image").await.unwrap();
+
+    let feed = open_next_job(&daemon.handle(), JobRegistry::FIRST_ID);
+    daemon.press(&info.id, 1);
+    feed.page(jpeg_page(0, 20)).unwrap();
+    let path = await_job(&client, &info.id, JobRegistry::FIRST_ID).await;
+    let job = job_proxy(&client, &info.id, JobRegistry::FIRST_ID).await;
+    let mut announced = changes(&client, path.clone()).await;
+
+    feed.page(jpeg_page(1, 80)).unwrap();
+    feed.fail(BackendError::NotReachable {
+        scanner: info.id.clone(),
+        detail: "dropped after two pages".to_owned(),
+    })
+    .unwrap();
+    feed.end();
+
+    assert_eq!(next_string(&mut announced, "State").await, "error");
+    let result = job.result().await.unwrap();
+    let paths = result
+        .get("paths")
+        .and_then(|value| Vec::<String>::try_from(value.clone()).ok())
+        .unwrap();
+    assert_eq!(paths.len(), 2);
+
+    for file in &paths {
+        assert!(
+            std::path::Path::new(file).exists(),
+            "written page is missing: {file}"
+        );
+        let bytes = fs::read(file).unwrap();
+        assert_eq!(
+            image::guess_format(&bytes).unwrap(),
+            image::ImageFormat::Jpeg
+        );
+    }
+
+    await_removed(&client, &path).await;
+    let _ = fs::remove_dir_all(&out);
     daemon.shutdown().await;
 }
 

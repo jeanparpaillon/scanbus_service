@@ -51,6 +51,7 @@ futures-core = "0.3"
 # for real. Kept out of core's [dependencies] so the library itself stays on
 # futures-core, which is the one that only defines `Stream`.
 futures-util = "0.3"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "pnm", "tiff"] }
 serde = { version = "1", features = ["derive"] }
 # Test-only in scanbus-core: the model's serde impls are only worth asserting against a
 # real self-describing format, and JSON is also what the pairing store will use (4.1).
