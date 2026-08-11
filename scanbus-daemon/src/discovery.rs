@@ -18,9 +18,10 @@
 //! One probe is not enough: a scanner powered on five seconds after the call would
 //! never appear, and a client's discovery UI would be wrong for as long as it stays
 //! open. The session re-probes every [`PROBE_INTERVAL`] until it is stopped or
-//! [`SESSION_LIMIT`] elapses. The limit is a stopgap: until [`2.9`] ties the session to
-//! the bus names that asked for it, a client that is killed without calling
-//! `StopDiscovery` would otherwise leave the daemon probing the network forever.
+//! [`SESSION_LIMIT`] elapses. The limit is now only a backstop — [`2.9`] ties the
+//! session to the bus names that asked for it (below), so a killed client's leak is
+//! closed well before it — but a session held open by a client that is merely wedged,
+//! never crashing, still has to end somewhere.
 //!
 //! # One broken backend is not a broken discovery
 //!
@@ -31,15 +32,30 @@
 //! where a name that matches no backend *is* a client bug and is refused
 //! ([`crate::backends`]).
 //!
+//! # Whose session is it
+//!
+//! [`2.9`] reference-counts the session by the caller's unique bus name: `start` adds
+//! the sender, `release` drops it, and the probe only actually stops when the set is
+//! empty. A second `StartDiscovery` therefore joins the running session rather than
+//! restarting it, from *either* end — §2 already required that of the running session,
+//! this is what makes it true of `StopDiscovery` too, so one client's `Ctrl-C` cannot
+//! take away the objects a second client is watching. [`watch_owners`] is the other
+//! half: a client that never calls `StopDiscovery` because it crashed or was killed
+//! still owns nothing once `NameOwnerChanged` says its name is gone.
+//!
 //! [`2.9`]: https://github.com/jeanparpaillon/scanbus_service/issues/34
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures_util::StreamExt;
 use scanbus_core::ScannerBackend;
 use tokio::sync::{Mutex, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, info, instrument, warn};
+use zbus::Connection;
+use zbus::names::{BusName, OwnedUniqueName, UniqueName};
 
 use crate::backends::{Backends, RankedBackend, UnknownBackend};
 use crate::scanners::ScannerRegistry;
@@ -60,7 +76,7 @@ pub const SESSION_LIMIT: Duration = Duration::from_secs(300);
 pub struct Discovery {
     backends: Backends,
     scanners: Arc<ScannerRegistry>,
-    session: Mutex<Option<Session>>,
+    state: Mutex<State>,
 }
 
 /// A running session, from the outside.
@@ -71,13 +87,23 @@ struct Session {
     task: JoinHandle<()>,
 }
 
+/// The session, and who is holding it open.
+#[derive(Default)]
+struct State {
+    session: Option<Session>,
+    /// The unique bus names that called `StartDiscovery` and have not since called
+    /// `StopDiscovery` (or disappeared — see [`Discovery::owner_gone`]). The probe runs
+    /// while this is non-empty and stops the moment it is not.
+    owners: HashSet<OwnedUniqueName>,
+}
+
 impl Discovery {
     /// A discovery that probes `backends` and publishes into `scanners`.
     pub fn new(backends: Backends, scanners: Arc<ScannerRegistry>) -> Self {
         Self {
             backends,
             scanners,
-            session: Mutex::new(None),
+            state: Mutex::new(State::default()),
         }
     }
 
@@ -86,24 +112,44 @@ impl Discovery {
         &self.backends
     }
 
-    /// Starts a session, or leaves the running one alone.
+    /// Adds `owner`'s reference and starts a session, or leaves the running one alone.
     ///
     /// §2's "a second `StartDiscovery` restarts nothing and returns successfully": the
     /// filters of the second call are *not* applied to the running session, because
     /// restarting it would remove and re-add every unpaired object the first client is
-    /// watching. [`2.9`](self) is what makes that sharing explicit.
+    /// watching. `owner` still joins the set that keeps the session open, so a later
+    /// `StopDiscovery` from the *first* client leaves it running for the second
+    /// ([`2.9`](self)).
     ///
     /// # Errors
     ///
     /// [`UnknownBackend`] if `backend_filter` names something this daemon does not
-    /// have. Checked before anything is started, so a refused call changes nothing.
+    /// have. Checked before anything is started, so a refused call changes nothing —
+    /// not even `owner`'s reference.
     #[instrument(level = "info", skip_all)]
-    pub async fn start(&self, backend_filter: Option<&[String]>) -> Result<(), UnknownBackend> {
+    pub async fn start(
+        &self,
+        owner: OwnedUniqueName,
+        backend_filter: Option<&[String]>,
+    ) -> Result<(), UnknownBackend> {
         let selected = self.backends.select(backend_filter)?;
-        let mut session = self.session.lock().await;
+        let mut state = self.state.lock().await;
 
-        if session.as_ref().is_some_and(|s| !s.task.is_finished()) {
-            info!("discovery is already running; joining it");
+        if state.owners.insert(owner.clone()) {
+            info!(%owner, owners = state.owners.len(), "discovery reference taken");
+        } else {
+            debug!(%owner, "StartDiscovery from a client that already holds a reference");
+        }
+
+        if state
+            .session
+            .as_ref()
+            .is_some_and(|s| !s.task.is_finished())
+        {
+            info!(
+                owners = state.owners.len(),
+                "discovery is already running; joining it"
+            );
             return Ok(());
         }
 
@@ -120,22 +166,64 @@ impl Discovery {
 
         info!(?backends, "discovery started");
         let task = tokio::spawn(run_session(selected, scanners, stopped));
-        *session = Some(Session { stop, task });
+        state.session = Some(Session { stop, task });
 
         Ok(())
     }
 
-    /// Stops the session and removes the objects that existed only for it.
+    /// Drops `owner`'s reference, stopping the session and removing the objects that
+    /// existed only for it once no reference is left.
     ///
-    /// Both halves are awaited before this returns, so a client that called
-    /// `StopDiscovery` and then `GetManagedObjects` cannot see an unpaired scanner that
-    /// is on its way out. Succeeds when nothing is running: stopping a session that
-    /// already ended on its own is not an error, and neither is a client's redundant
-    /// `StopDiscovery`.
+    /// Not an error to call for an `owner` that never called `start` — that owns
+    /// nothing, so releasing it changes nothing, which is what a redundant
+    /// `StopDiscovery` needs to be a no-op rather than a bug report. When this *is* the
+    /// last reference, both halves of the stop are awaited before returning, so a
+    /// client that called `StopDiscovery` and then `GetManagedObjects` cannot see an
+    /// unpaired scanner that is on its way out.
+    #[instrument(level = "info", skip_all)]
+    pub async fn release(&self, owner: &UniqueName<'_>) {
+        self.release_owner(owner, "StopDiscovery").await;
+    }
+
+    /// Stops the session unconditionally, dropping every reference to it.
+    ///
+    /// For daemon shutdown, not for a client's `StopDiscovery` — see [`release`](Self::release)
+    /// for that. Succeeds when nothing is running: stopping a session that already ended
+    /// on its own is not an error.
     #[instrument(level = "info", skip_all)]
     pub async fn stop(&self) {
-        let session = self.session.lock().await.take();
+        let mut state = self.state.lock().await;
+        state.owners.clear();
+        let session = state.session.take();
 
+        self.stop_session(session).await;
+    }
+
+    /// One reference off, with `reason` naming what took it away — the log line that
+    /// answers "why is discovery still running", or "why did it stop".
+    async fn release_owner(&self, owner: &UniqueName<'_>, reason: &'static str) {
+        // The lock is held across the stop rather than dropped first: a `start` landing
+        // in between would find `session` already taken, spawn a second one, and then
+        // watch the `end_discovery` still on its way out sweep the objects it published.
+        let mut state = self.state.lock().await;
+
+        if !state.owners.remove(owner) {
+            debug!(%owner, reason, "release from a client with no discovery reference; ignoring");
+            return;
+        }
+
+        info!(%owner, reason, owners_left = state.owners.len(), "discovery reference dropped");
+        if !state.owners.is_empty() {
+            return;
+        }
+
+        let session = state.session.take();
+        self.stop_session(session).await;
+    }
+
+    /// The shared tail of `release` and `stop`: signal the task, wait for it, then sweep
+    /// the objects the session leaves behind.
+    async fn stop_session(&self, session: Option<Session>) {
         if let Some(session) = session {
             // Ignored: a receiver-less channel means the task has already exited.
             let _ = session.stop.send(true);
@@ -150,14 +238,76 @@ impl Discovery {
         info!("discovery stopped");
     }
 
+    /// Drops `owner`'s reference because `NameOwnerChanged` said it is gone, not because
+    /// it called `StopDiscovery`.
+    ///
+    /// Same bookkeeping as [`release`](Self::release) — a crashed client owns exactly as
+    /// much as one that hung up politely — but logged as what it is, because "the client
+    /// went away" and "the client asked" are not the same answer to why a session ended.
+    /// Every disconnection on the bus reaches this, so a name that holds nothing is
+    /// `debug!` and not a line per unrelated client.
+    async fn owner_gone(&self, owner: &UniqueName<'_>) {
+        self.release_owner(owner, "client left the bus").await;
+    }
+
     /// Whether a session is running right now.
     pub async fn is_running(&self) -> bool {
-        self.session
+        self.state
             .lock()
             .await
+            .session
             .as_ref()
             .is_some_and(|session| !session.task.is_finished())
     }
+}
+
+/// Watches `NameOwnerChanged` and releases a discovery reference when the bus name that
+/// holds it disappears.
+///
+/// Spawned once, for the daemon's lifetime: without this, a client that is killed
+/// (`SIGKILL`, a crash) rather than calling `StopDiscovery` would hold its reference —
+/// and the unpaired scanners it never releases — forever. Only unique names are
+/// tracked; a well-known name losing its owner is not a client going away in the sense
+/// `start`/`release` mean (nothing here is ever called with one).
+pub fn watch_owners(discovery: Arc<Discovery>, connection: Connection) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let dbus = match zbus::fdo::DBusProxy::new(&connection).await {
+            Ok(proxy) => proxy,
+            Err(error) => {
+                warn!(
+                    %error,
+                    "could not watch NameOwnerChanged; a discovery client that crashes \
+                     will not be noticed"
+                );
+                return;
+            }
+        };
+
+        let mut changes = match dbus.receive_name_owner_changed().await {
+            Ok(stream) => stream,
+            Err(error) => {
+                warn!(
+                    %error,
+                    "could not subscribe to NameOwnerChanged; a discovery client that \
+                     crashes will not be noticed"
+                );
+                return;
+            }
+        };
+
+        while let Some(signal) = changes.next().await {
+            let Ok(args) = signal.args() else { continue };
+
+            // A name still has an owner, or never did (an acquisition, not a loss).
+            if args.new_owner().is_some() {
+                continue;
+            }
+
+            if let BusName::Unique(name) = args.name() {
+                discovery.owner_gone(name).await;
+            }
+        }
+    })
 }
 
 /// The session task: probe, publish, wait, repeat, until stopped or out of time.

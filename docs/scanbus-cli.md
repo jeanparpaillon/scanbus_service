@@ -227,19 +227,20 @@ timeout on a scanner that paired successfully. The pattern, used by every `--wai
 
 Step 3 is what makes step 1 sufficient. Skipping it converts a race into a hang.
 
-**Discovery is global, and the CLI is not its only client.** `StartDiscovery`/`StopDiscovery`
-(API §2) carry no notion of who asked. A `scanbus discover` that calls `StopDiscovery` on exit
-therefore kills the discovery session of a GUI client that started it a second earlier, and
-takes that client's unpaired scanner objects with it. This cannot be fixed in the CLI: it needs
-the daemon to reference-count discovery per client bus name and stop it when the last caller
-disappears — [2.9](todo/2_9.md). Until that exists, `discover` stops discovery only when its own
-`StartDiscovery` was the one that started it, which is a guess, and `--keep` exists as the escape
-hatch.
+**Discovery is shared, and the CLI is not its only client.** `StartDiscovery`/`StopDiscovery`
+(API §2) still carry no argument saying who asked, but the daemon reference-counts the session by
+the caller's bus name ([2.9]). A `scanbus discover` that calls `StopDiscovery` on exit therefore
+releases only its own share: it can no longer end the session of a GUI client that started one a
+second earlier, nor take that client's unpaired scanner objects with it. It cannot leave a
+session running past its own exit either — the reference goes when the process does — which is
+what makes `discover`'s best-effort ownership guess, and `--keep`, vestigial rather than
+load-bearing.
 
-The same ownership problem gives `pair` its most annoying failure: pairing a scanner that only
+Ownership is also what gives `pair` its most annoying failure: pairing a scanner that only
 exists because of a discovery session, while that session ends underneath it. `pair` therefore
 holds a discovery session itself when the target is unpaired, for the duration of the pairing,
-and releases it after the verdict.
+and releases it after the verdict — a reference of its own now, which no other client's
+`StopDiscovery` can take away.
 
 ## 8. Exit codes
 
@@ -290,8 +291,11 @@ what keeps the table from rotting.
 
 Four things the CLI needs that the contract does not currently guarantee:
 
-1. **Discovery has no owner** (§7). Needs [2.9](todo/2_9.md) in the daemon; the CLI is
-   best-effort until then.
+1. ~~**Discovery has no owner**~~ (§7). **Settled by [2.9]:** the daemon reference-counts the
+   session by caller bus name — a second `StartDiscovery` joins it, `StopDiscovery` releases only
+   the caller's share, and a client that dies without calling it releases its share anyway (API
+   §2). What the CLI still cannot do is hold a session open past its own exit, so `discover`'s
+   guess and `--keep` are now redundant rather than best-effort.
 2. **`Scan()` is optional** in API §3. `scanbus scan` is unimplementable on a daemon that omits
    it, and "optional" in a contract read by several clients means "absent in practice". Either
    the daemon commits to it in [2.4](todo/2_4.md) or the CLI must detect the missing method by
@@ -314,3 +318,4 @@ Four things the CLI needs that the contract does not currently guarantee:
    `probing` at startup) — close it, and `status` fills the rows in the moment they exist.
 
 [2.6]: https://github.com/jeanparpaillon/scanbus_service/issues/10
+[2.9]: https://github.com/jeanparpaillon/scanbus_service/issues/34

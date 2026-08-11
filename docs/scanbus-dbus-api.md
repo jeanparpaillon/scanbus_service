@@ -24,8 +24,15 @@ Object: `/org/scanbus`
 | Method | Signature | Description |
 |---|---|---|
 | `StartDiscovery` | `(a{sv} filters) → ()` | Starts discovery through every active backend (SANE, Avahi/eSCL, proprietary backends). `filters` is optional: `{"backends": ["sane","avahi"]}`. |
-| `StopDiscovery` | `() → ()` | Stops the discovery in progress. |
+| `StopDiscovery` | `() → ()` | Releases the caller's share of the discovery in progress; the probing stops once nobody holds one. |
 | `GetProfileTypes` | `() → (as)` | Returns the available profile types: `["image","document","email","ocr"]`. |
+
+**Discovery is shared between clients, and reference-counted by caller.** One session at a time, owned by every client that asked for it — tracked by unique bus name, so neither method needs an argument for it:
+
+- A second `StartDiscovery` **joins** the running session: it restarts nothing, applies none of its `filters` to what is already running — restarting would remove and re-add every unpaired object the first client is watching — and returns successfully.
+- `StopDiscovery` releases only the caller's own reference. The probing stops, and the unpaired `Scanner1` objects go with it (§1), when the **last** reference is released, not the first. Paired scanners are untouched either way.
+- `StopDiscovery` from a client that never called `StartDiscovery` succeeds and changes nothing: stopping what you do not own is not an error, so a client may call it unconditionally on the way out.
+- A client that disappears without calling `StopDiscovery` — killed, crashed, connection lost — releases its reference anyway; the service watches `org.freedesktop.DBus.NameOwnerChanged` for the names holding one. A `Ctrl-C` therefore cannot leave the daemon probing the network forever, and cannot take away a surviving client's objects either.
 
 ### Signals
 

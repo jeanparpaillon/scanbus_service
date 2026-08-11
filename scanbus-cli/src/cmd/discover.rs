@@ -14,14 +14,18 @@
 //! taken. [`crate::watch::PropertyWatch`] documents why that draining is sound; the
 //! reasoning is identical here, one level up.
 //!
-//! **It cannot know whether it owns the session.** `StartDiscovery`/`StopDiscovery`
-//! carry no notion of who asked until [2.9] lands in the daemon, so calling
-//! `StopDiscovery` unconditionally on exit can take down a GUI client's session a moment
-//! after it started one. Until then this command guesses: if no *unpaired* scanner
+//! **It does not need to know whether it owns the session, any more.** The guess below
+//! predates [2.9]: with no owner recorded anywhere, calling `StopDiscovery`
+//! unconditionally on exit could take down a GUI client's session a moment after it
+//! started one, so this command inferred ownership instead — if no *unpaired* scanner
 //! existed before it called `StartDiscovery`, nobody else's session could have been
-//! running, and it stops the one it started. If one did, it assumes that session is not
-//! this process's to end, and says so rather than silently leaving it running. `--keep`
-//! is the explicit version of the same escape hatch.
+//! running, and it stops the one it started; if one did, it leaves it alone and says so
+//! rather than silently keeping it running. `--keep` is the explicit version of the same
+//! escape hatch. The daemon now reference-counts the session by caller bus name, so
+//! `StopDiscovery` releases only this process's share and neither the guess nor `--keep`
+//! protects anything — and neither can extend a session past this process's exit, which
+//! drops its reference. Both are kept until the command's own issue revisits its surface:
+//! removing a documented flag is not this daemon change's to make.
 //!
 //! [2.9]: https://github.com/jeanparpaillon/scanbus_service/issues/34
 //! [`scanbus-cli.md`]: https://github.com/jeanparpaillon/scanbus_service/blob/master/docs/scanbus-cli.md
@@ -104,9 +108,9 @@ pub async fn run(
     Ok(if interrupted { 130 } else { 0 })
 }
 
-/// Whether nothing unpaired is visible yet — the fallback ownership guess documented in
-/// this module's header, until [2.9](https://github.com/jeanparpaillon/scanbus_service/issues/34)
-/// makes it exact.
+/// Whether nothing unpaired is visible yet — the ownership guess documented in this
+/// module's header, which [2.9](https://github.com/jeanparpaillon/scanbus_service/issues/34)
+/// has since made unnecessary rather than wrong.
 async fn no_unpaired_scanner_exists(context: &Context, connection: &Connection) -> Result<bool> {
     let objects = context
         .within("listing the daemon's objects", Objects::fetch(connection))

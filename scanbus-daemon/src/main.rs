@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use scanbus_daemon::dbus::{self, Manager1, ObjectRegistry, Profile1, path};
+use scanbus_daemon::discovery::watch_owners;
 use scanbus_daemon::{
     Backends, Discovery, Error, JsonPairingStore, ProfileRegistry, ScannerRegistry,
 };
@@ -120,8 +121,14 @@ async fn run() -> Result<&'static str, Error> {
 
     dbus::request_name(&connection).await?;
 
+    // A client that is killed rather than calling `StopDiscovery` (2.9) must still lose
+    // its discovery reference; this is what notices it left.
+    let owner_watch = watch_owners(Arc::clone(&discovery), connection.clone());
+
     let signal = shutdown_signal().await.map_err(Error::Signal)?;
     info!(signal, "shutting down");
+
+    owner_watch.abort();
 
     // Before the tree goes: the session task publishes objects, and one still running
     // during the unexports would be racing them.
