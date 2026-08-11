@@ -623,6 +623,10 @@ name = "scanbus-backend-mobile"
 version = "0.1.0"
 dependencies = [
  "scanbus-core",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]

@@ -9,14 +9,15 @@ members = [
     "scanbus-backend-hplip",
     "scanbus-backend-mobile",
 ]
-# `cargo build` with no `--workspace` builds only these four. The backend crates are
-# reachable through the daemon's `brother` / `hplip` features, so the default build
-# never compiles hardware-specific code — see scanbus-daemon/Cargo.toml.
+# `cargo build` with no `--workspace` builds these five members. The mobile backend is
+# a pure protocol crate that CI can exercise without hardware, so it is compiled by
+# default; hardware-specific backends stay opt-in through daemon features.
 default-members = [
     "scanbus-core",
     "scanbus-client",
     "scanbus-cli",
     "scanbus-daemon",
+    "scanbus-backend-mobile",
 ]
 
 [workspace.package]

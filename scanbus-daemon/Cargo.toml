@@ -17,10 +17,10 @@ path = "src/lib.rs"
 name = "scanbus-daemon"
 path = "src/main.rs"
 
-# Both backends are off by default: they shell out to hardware-specific tooling that
-# CI does not have. `cargo build` compiles neither crate.
+# Brother and HPLIP stay off by default because they shell out to hardware-specific
+# tooling that CI does not have. Mobile is default-on: this milestone is protocol-only.
 [features]
-default = []
+default = ["mobile"]
 brother = ["dep:scanbus-backend-brother"]
 hplip = ["dep:scanbus-backend-hplip"]
 mobile = ["dep:scanbus-backend-mobile"]
