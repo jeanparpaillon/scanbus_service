@@ -74,7 +74,11 @@ pub async fn fetch(
 ) -> Result<Option<ScannerState>> {
     let what = format!("reading scanner {}", scanner.id);
 
-    match tokio::time::timeout(context.timeout, ScannerState::fetch(connection, &scanner.id)).await
+    match tokio::time::timeout(
+        context.timeout,
+        ScannerState::fetch(connection, &scanner.id),
+    )
+    .await
     {
         Ok(Ok(state)) => Ok(Some(state)),
         Ok(Err(error)) => match scanner.gone(error) {

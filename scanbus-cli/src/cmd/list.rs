@@ -91,7 +91,13 @@ mod tests {
         let row = scanner_view::row(&scanner("brother_net_192_2E168_2E1_2E23", true));
         assert_eq!(
             row,
-            ["mock", "brother_net_192_2E168_2E1_2E23", "", "online", "yes"]
+            [
+                "mock",
+                "brother_net_192_2E168_2E1_2E23",
+                "",
+                "online",
+                "yes"
+            ]
         );
     }
 
