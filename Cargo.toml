@@ -76,3 +76,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # the same connection is how zbus deadlocks. `blocking-api` goes with it, since every
 # call site here is async.
 zbus = { version = "5.18", default-features = false, features = ["tokio"] }
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
