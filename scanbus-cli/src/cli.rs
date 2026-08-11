@@ -146,6 +146,9 @@ pub enum Command {
         shell: Shell,
     },
 
+    /// Emit a `scanbus(1)` man page on stdout
+    Manpage,
+
     /// Daemon presence, owner, version, backends and profile types
     ///
     /// The only command that tolerates an absent daemon, and the only one that never
@@ -564,6 +567,13 @@ mod tests {
             panic!("that is a completions command")
         };
         assert_eq!(shell, Shell::Bash);
+    }
+
+    /// The man page is a local artifact, like completions, with no extra arguments.
+    #[test]
+    fn manpage_parses_as_a_top_level_command() {
+        let cli = Cli::try_parse_from(["scanbus", "manpage"]).unwrap();
+        assert!(matches!(cli.command, Command::Manpage));
     }
 
     #[test]

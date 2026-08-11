@@ -22,6 +22,7 @@ scanbus-client.workspace = true
 scanbus-core.workspace = true
 clap = { workspace = true, features = ["derive"] }
 clap_complete.workspace = true
+clap_mangen.workspace = true
 serde_json.workspace = true
 # `discover` streams `InterfacesAdded` while also racing a timeout and `SIGINT`
 # (scanbus-cli.md §7, §9); `now_or_never` is the raceless-snapshot pattern
