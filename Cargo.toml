@@ -51,6 +51,7 @@ clap = { version = "4", default-features = false, features = [
     "wrap_help",
 ] }
 futures-core = "0.3"
+if-addrs = "0.13"
 mdns-sd = "0.13"
 # Test-only so far: core's own tests consume the backend streams, the daemon will do it
 # for real. Kept out of core's [dependencies] so the library itself stays on

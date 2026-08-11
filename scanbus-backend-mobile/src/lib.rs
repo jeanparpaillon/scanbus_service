@@ -2,12 +2,14 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use flume::RecvTimeoutError;
 use futures_core::stream::BoxStream;
+use if_addrs::{IfAddr, get_if_addrs};
 use mdns_sd::{ServiceDaemon, ServiceEvent};
 use rand::Rng;
 use scanbus_core::{
@@ -186,6 +188,14 @@ impl MobileBackend {
 		scanner: &ScannerInfo,
 		progress: &mpsc::Sender<scanbus_core::PairingProgress>,
 	) -> Result<(), BackendError> {
+		if self.upload_port == 0 {
+			return Err(BackendError::Other(
+				"mobile pairing is not configured yet: the daemon has no upload port to \
+				 advertise, so the phone refuses the pair_request"
+					.to_owned(),
+			));
+		}
+
 		let record = self.live_record(&scanner.id).ok_or_else(|| BackendError::NotReachable {
 			scanner: scanner.id.clone(),
 			detail: "no live discovery record: pairing is the one moment the host dials, \
@@ -194,19 +204,7 @@ impl MobileBackend {
 				.to_owned(),
 		})?;
 
-		let mut socket = timeout(self.connect_timeout, TcpStream::connect(&record.address))
-			.await
-			.map_err(|_| BackendError::NotReachable {
-				scanner: scanner.id.clone(),
-				detail: format!(
-					"{} did not accept a connection within {:?}",
-					record.address, self.connect_timeout
-				),
-			})?
-			.map_err(|error| BackendError::NotReachable {
-				scanner: scanner.id.clone(),
-				detail: format!("could not connect to {}: {error}", record.address),
-			})?;
+		let mut socket = self.connect_to_record(&scanner.id, &record.address).await?;
 
 		// Nothing below ever logs `nonce`: it is the whole security value of the
 		// comparison, and a code sitting in a log is a code an attacker can replay.
@@ -343,6 +341,88 @@ impl MobileBackend {
 		self.paired
 			.lock()
 			.expect("mobile paired device lock poisoned")
+	}
+
+	async fn connect_to_record(
+		&self,
+		scanner_id: &ScannerId,
+		address: &str,
+	) -> Result<TcpStream, BackendError> {
+		let parsed: SocketAddr = address.parse().map_err(|error| BackendError::NotReachable {
+			scanner: scanner_id.clone(),
+			detail: format!("could not parse discovered address {address}: {error}"),
+		})?;
+
+		if let SocketAddr::V6(addr) = parsed
+			&& addr.ip().is_unicast_link_local()
+			&& addr.scope_id() == 0
+		{
+			return self.connect_link_local(scanner_id, address, addr).await;
+		}
+
+		self.connect_socket_addr(scanner_id, address, parsed).await
+	}
+
+	async fn connect_link_local(
+		&self,
+		scanner_id: &ScannerId,
+		display_address: &str,
+		address: SocketAddrV6,
+	) -> Result<TcpStream, BackendError> {
+		let candidates =
+			link_local_candidates(*address.ip(), address.port()).map_err(|error| {
+				BackendError::NotReachable {
+					scanner: scanner_id.clone(),
+					detail: format!(
+						"could not choose an interface for link-local address {display_address}: \
+						 {error}"
+					),
+				}
+			})?;
+
+		if candidates.is_empty() {
+			return Err(BackendError::NotReachable {
+				scanner: scanner_id.clone(),
+				detail: format!(
+					"could not connect to {display_address}: no non-loopback IPv6 interface \
+					 with a scope id is available for link-local pairing"
+				),
+			});
+		}
+
+		let mut last_error = None;
+		for candidate in candidates {
+			match self
+				.connect_socket_addr(scanner_id, display_address, SocketAddr::V6(candidate))
+				.await
+			{
+				Ok(stream) => return Ok(stream),
+				Err(error) => last_error = Some(error),
+			}
+		}
+
+		Err(last_error.expect("link-local candidates are non-empty"))
+	}
+
+	async fn connect_socket_addr(
+		&self,
+		scanner_id: &ScannerId,
+		display_address: &str,
+		address: SocketAddr,
+	) -> Result<TcpStream, BackendError> {
+		timeout(self.connect_timeout, TcpStream::connect(address))
+			.await
+			.map_err(|_| BackendError::NotReachable {
+				scanner: scanner_id.clone(),
+				detail: format!(
+					"{display_address} did not accept a connection within {:?}",
+					self.connect_timeout
+				),
+			})?
+			.map_err(|error| BackendError::NotReachable {
+				scanner: scanner_id.clone(),
+				detail: format!("could not connect to {display_address}: {error}"),
+			})
 	}
 }
 
@@ -606,7 +686,11 @@ fn scanner_from_service(
 		return None;
 	};
 
-	let address = format!("{}:{}", ip, service.get_port());
+	// `TcpStream::connect` accepts `host:port` for IPv4 and `[host]:port` for IPv6.
+	// Hand-formatting with `"{}:{}"` turns a link-local IPv6 phone such as
+	// `fe80::...` into the ambiguous `fe80::...:45481`, which the socket layer rejects
+	// before any network attempt happens.
+	let address = SocketAddr::new(*ip, service.get_port()).to_string();
 
 	Some((
 		ScannerInfo {
@@ -637,6 +721,29 @@ fn instance_name(fullname: &str) -> String {
 		.and_then(|value| value.strip_suffix('.'))
 		.unwrap_or(fullname)
 		.to_owned()
+}
+
+fn link_local_candidates(ip: Ipv6Addr, port: u16) -> std::io::Result<Vec<SocketAddrV6>> {
+	let mut candidates = Vec::new();
+	let mut seen = std::collections::BTreeSet::new();
+
+	for interface in get_if_addrs()? {
+		let is_loopback = interface.is_loopback();
+		let IfAddr::V6(ref addr) = interface.addr else {
+			continue;
+		};
+		if !addr.is_link_local() || is_loopback {
+			continue;
+		}
+		let Some(index) = interface.index.filter(|index| *index != 0) else {
+			continue;
+		};
+		if seen.insert(index) {
+			candidates.push(SocketAddrV6::new(ip, port, 0, index));
+		}
+	}
+
+	Ok(candidates)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1298,6 +1405,30 @@ mod tests {
 		assert!(steps.is_empty());
 	}
 
+	#[tokio::test]
+	async fn pairing_refuses_to_start_without_an_upload_port() {
+		let backend = MobileBackend::default().with_pairing_timeouts(
+			Duration::from_millis(200),
+			Duration::from_millis(200),
+		);
+		backend.remember(vec![(
+			scanner_id(),
+			DiscoveryRecord {
+				device_id: DEVICE_ID.to_owned(),
+				address: "127.0.0.1:9".to_owned(),
+				seen_at: Instant::now(),
+			},
+		)]);
+
+		let (outcome, steps) = pair_with(&backend).await;
+		assert_eq!(
+			outcome.unwrap_err().to_string(),
+			"mobile pairing is not configured yet: the daemon has no upload port to \
+			 advertise, so the phone refuses the pair_request"
+		);
+		assert!(steps.is_empty());
+	}
+
 	/// And a sighting from a session that has ended is not an address either — this is
 	/// what stops a remembered address being dialled.
 	#[tokio::test]
@@ -1387,6 +1518,31 @@ mod tests {
 			"only {} distinct nonces in 1000 draws",
 			distinct.len()
 		);
+	}
+
+	#[test]
+	fn ipv6_discovery_addresses_keep_the_brackets_tcp_connect_needs() {
+		let address = SocketAddr::new(
+			"fe80::78a0:89ff:fe33:e293".parse().unwrap(),
+			45481,
+		)
+		.to_string();
+		assert_eq!(address, "[fe80::78a0:89ff:fe33:e293]:45481");
+	}
+
+	#[test]
+	fn link_local_candidates_apply_scope_ids_to_the_target_ip() {
+		let target: Ipv6Addr = "fe80::78a0:89ff:fe33:e293".parse().unwrap();
+		let candidates = link_local_candidates(
+			target,
+			45481,
+		)
+		.unwrap();
+		for candidate in candidates {
+			assert_eq!(candidate.ip(), &target);
+			assert_eq!(candidate.port(), 45481);
+			assert_ne!(candidate.scope_id(), 0);
+		}
 	}
 
 	#[test]

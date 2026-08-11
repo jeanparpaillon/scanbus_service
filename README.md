@@ -66,6 +66,12 @@ elsewhere. It exits 0 on SIGTERM, which is what systemd sends (see
 RUST_LOG=debug cargo run
 ```
 
+## Daemon configuration
+
+Daemon configuration is done through environment variables.
+
+`SCANBUS_MOBILE_BACKEND_PORT` : mobile backend upload port
+
 ## Documentation
 
 - `docs/scanbus-dbus-api.md` — the D-Bus API this service implements

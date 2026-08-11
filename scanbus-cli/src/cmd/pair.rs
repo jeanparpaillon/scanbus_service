@@ -235,6 +235,8 @@ fn print_transition(context: &Context, state: &ScannerState) -> Result<()> {
     let mut stdout = std::io::stdout().lock();
     let line = if state.pairing.is_failed() {
         format!("{:<12}{}", state.pairing.as_str(), state.pairing.pairing_error())
+    } else if state.pairing.as_str() == "awaiting_confirmation" {
+        format!("{:<22}{}", state.pairing.as_str(), state.pairing.pairing_info())
     } else {
         format!("{:<12}{}", state.pairing.as_str(), state.id)
     };

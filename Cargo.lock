@@ -1185,6 +1185,7 @@ dependencies = [
  "flume",
  "futures-core",
  "futures-util",
+ "if-addrs",
  "mdns-sd",
  "rand",
  "scanbus-core",

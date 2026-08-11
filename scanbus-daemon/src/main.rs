@@ -5,6 +5,7 @@
 //! `Button1`, `Job1`) hang off the registry built here as the rest of workstream 2
 //! lands.
 
+use std::env;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,6 +25,9 @@ use tracing_subscriber::{EnvFilter, fmt};
 /// that is actually there answers a local backend call well inside this, and one that
 /// is not there is exactly the case the reconnect backoff exists for, not this timeout.
 const RESTORE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The environment variable README.md documents for the mobile upload listener port.
+const MOBILE_BACKEND_PORT_ENV: &str = "SCANBUS_MOBILE_BACKEND_PORT";
 
 /// Backends compiled into this binary, in the order they will be probed.
 ///
@@ -46,13 +50,16 @@ const BACKENDS: &[&str] = &[
 ///
 /// Vendor backends are still skeletons. The mobile backend is available and discoverable
 /// on default builds.
-fn backends() -> Backends {
+fn backends() -> Result<Backends, String> {
     let mut entries: Vec<Arc<dyn scanbus_core::ScannerBackend>> = Vec::new();
 
     #[cfg(feature = "mobile")]
-    entries.push(Arc::new(scanbus_backend_mobile::MobileBackend::default()));
+    entries.push(Arc::new(
+        scanbus_backend_mobile::MobileBackend::default()
+            .with_upload_port(mobile_backend_port()?),
+    ));
 
-    Backends::new(entries)
+    Ok(Backends::new(entries))
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -62,14 +69,22 @@ async fn main() -> ExitCode {
         .unwrap_or_else(|_| EnvFilter::new("warn,scanbus_daemon=info,scanbus_core=info"));
     fmt().with_env_filter(filter).with_target(true).init();
 
+    let compiled_backends = match backends() {
+        Ok(backends) => backends,
+        Err(error) => {
+            error!(%error, "scanbus-daemon cannot run");
+            return ExitCode::FAILURE;
+        }
+    };
+
     info!(
         version = env!("CARGO_PKG_VERSION"),
         compiled_in = ?BACKENDS,
-        probing = ?backends().ids(),
+        probing = ?compiled_backends.ids(),
         "scanbus-daemon started"
     );
 
-    match run().await {
+    match run(compiled_backends).await {
         Ok(signal) => {
             info!(signal, "stopped");
             ExitCode::SUCCESS
@@ -85,8 +100,29 @@ async fn main() -> ExitCode {
     }
 }
 
+#[cfg(feature = "mobile")]
+fn mobile_backend_port() -> Result<u16, String> {
+    match env::var(MOBILE_BACKEND_PORT_ENV) {
+        Ok(value) => value.parse::<u16>().map_err(|error| {
+            format!(
+                "{MOBILE_BACKEND_PORT_ENV} must be a valid TCP port in 0..=65535, got {value:?}: \
+                 {error}"
+            )
+        }),
+        Err(env::VarError::NotPresent) => Ok(0),
+        Err(env::VarError::NotUnicode(_)) => Err(format!(
+            "{MOBILE_BACKEND_PORT_ENV} must be valid Unicode text"
+        )),
+    }
+}
+
+#[cfg(not(feature = "mobile"))]
+fn mobile_backend_port() -> Result<u16, String> {
+    Ok(0)
+}
+
 /// Serves until a termination signal arrives, then takes the object tree down.
-async fn run() -> Result<&'static str, Error> {
+async fn run(compiled_backends: Backends) -> Result<&'static str, Error> {
     let connection = dbus::connect().await?;
 
     // Objects first, name second: see the ordering in `dbus`. Everything later
@@ -98,7 +134,6 @@ async fn run() -> Result<&'static str, Error> {
         Arc::new(JsonPairingStore::new()),
         Arc::clone(&profiles),
     );
-    let compiled_backends = backends();
     let discovery = Arc::new(Discovery::new(compiled_backends.clone(), Arc::clone(&scanners)));
 
     for kind in profiles.registered_profiles() {

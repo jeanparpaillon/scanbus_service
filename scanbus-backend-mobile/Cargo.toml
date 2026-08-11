@@ -12,6 +12,7 @@ async-trait.workspace = true
 flume.workspace = true
 futures-core.workspace = true
 futures-util.workspace = true
+if-addrs.workspace = true
 mdns-sd.workspace = true
 rand.workspace = true
 serde.workspace = true
