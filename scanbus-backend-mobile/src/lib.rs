@@ -1004,7 +1004,7 @@ async fn handle_upload_connection(
 
     let result = stream_upload_pages(&mut socket, first, pages_tx).await;
     if let Err(ref error) = result {
-        let _ = send_error_ack(&mut socket, ack_reason_for(&error)).await;
+        let _ = send_error_ack(&mut socket, ack_reason_for(error)).await;
     }
     result
 }

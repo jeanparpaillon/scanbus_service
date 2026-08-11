@@ -1060,7 +1060,7 @@ async fn disconnecting_mid_scan_does_not_strand_the_job() {
     let client = bus.connect().await;
     daemon.ready(&info).await;
 
-    let feed = daemon.handle().open_pages("host-1");
+    let feed = open_next_job(&daemon.handle(), JobRegistry::FIRST_ID);
     daemon.press(&info.id, 0);
     feed.page(page(0)).unwrap();
     let path = await_job(&client, &info.id, JobRegistry::FIRST_ID).await;
@@ -1109,7 +1109,7 @@ async fn a_host_driven_job_reports_button_minus_one() {
         Arc::new(ProfileRegistry::ephemeral()),
         TEST_RETENTION,
     );
-    let feed = open_next_job(&daemon.handle(), JobRegistry::FIRST_ID);
+    let feed = daemon.handle().open_pages("host-1");
 
     let started = tokio::spawn({
         let backend = Arc::clone(&daemon.backend) as Arc<dyn ScannerBackend>;
