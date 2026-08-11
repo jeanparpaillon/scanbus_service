@@ -9,7 +9,7 @@ use gtk::glib;
 use gtk4 as gtk;
 use libadwaita as adw;
 use libadwaita::prelude::*;
-use scanbus_core::{PairingState, Status};
+use scanbus_core::{PairingState, ProfileKind, Status};
 
 use crate::bus::BusCommand;
 use crate::store::{DiscoveryState, ScannerEntry, ServiceState, Store, StoreEvent};
@@ -58,6 +58,8 @@ mod scanner_object {
         pub address: RefCell<String>,
         #[property(get, set, type = String)]
         pub backend: RefCell<String>,
+        #[property(get, set, type = String)]
+        pub default_profile: RefCell<String>,
         #[property(get, set, type = bool)]
         pub paired: Cell<bool>,
         #[property(get, set, type = bool)]
@@ -95,6 +97,10 @@ impl ScannerObject {
             .property("name", &entry.state.name)
             .property("address", &entry.state.address)
             .property("backend", &entry.state.backend)
+            .property(
+                "default-profile",
+                default_profile_label(entry.state.default_profile),
+            )
             .property("paired", entry.state.paired)
             .property("connected", entry.state.connected)
             .property("status", entry.state.status.as_str())
@@ -118,6 +124,10 @@ impl ScannerObject {
         self.set_property("name", &entry.state.name);
         self.set_property("address", &entry.state.address);
         self.set_property("backend", &entry.state.backend);
+        self.set_property(
+            "default-profile",
+            default_profile_label(entry.state.default_profile),
+        );
         self.set_property("paired", entry.state.paired);
         self.set_property("connected", entry.state.connected);
         self.set_property("status", entry.state.status.as_str());
@@ -164,6 +174,59 @@ pub fn status_line(status: Status, connected: bool, paired: bool) -> String {
             }
         }
     }
+}
+
+fn default_profile_label(profile: Option<ProfileKind>) -> String {
+    profile.map_or_else(|| "None".to_owned(), |profile| humanize_profile(profile.as_str()))
+}
+
+fn humanize_profile(profile: &str) -> String {
+    let mut chars = profile.chars();
+    if let Some(first) = chars.next() {
+        let mut label = first.to_uppercase().collect::<String>();
+        label.push_str(chars.as_str());
+        label
+    } else {
+        "None".to_owned()
+    }
+}
+
+fn status_value(status: Status) -> &'static str {
+    match status {
+        Status::Offline => "Offline",
+        Status::Online => "Online",
+        Status::Busy => "Busy",
+        Status::Error => "Error",
+    }
+}
+
+fn connection_value(connected: bool) -> &'static str {
+    if connected {
+        "Listening"
+    } else {
+        "Not listening"
+    }
+}
+
+fn connection_subtitle(status: Status, connected: bool) -> &'static str {
+    if status == Status::Offline {
+        "Unavailable while the scanner is offline"
+    } else if connected {
+        "This host is ready to receive from this scanner"
+    } else {
+        "Turn on to let this host receive from this scanner"
+    }
+}
+
+fn connection_banner(status: Status, connected: bool, paired: bool) -> String {
+    let paired = if paired { "Paired" } else { "Not paired" };
+    let online = status_value(status);
+    let listening = if connected {
+        "Host listening"
+    } else {
+        "Host not listening"
+    };
+    format!("{paired} • {online} • {listening}")
 }
 
 type Callback = Box<dyn Fn() + 'static>;
@@ -453,52 +516,179 @@ impl ScannersPane {
         scroller.set_hexpand(true);
         scroller.set_vexpand(true);
 
+        let detail_placeholder = adw::StatusPage::builder()
+            .title("No scanner selected")
+            .description("Select a scanner to inspect it")
+            .build();
+
         let detail_title = gtk::Label::new(Some("Scanner details"));
         detail_title.add_css_class("title-3");
         detail_title.set_xalign(0.0);
 
-        let detail_name = gtk::Label::new(Some("No scanner selected"));
+        let detail_name = gtk::Label::new(None);
         detail_name.add_css_class("heading");
         detail_name.set_xalign(0.0);
         detail_name.set_wrap(true);
 
-        let detail_status = gtk::Label::new(None);
-        detail_status.add_css_class("dim-label");
-        detail_status.set_xalign(0.0);
-        detail_status.set_wrap(true);
+        let detail_status_value = gtk::Label::new(None);
+        detail_status_value.set_xalign(0.0);
+        detail_status_value.set_wrap(true);
 
-        let detail_path = gtk::Label::new(None);
-        detail_path.set_xalign(0.0);
-        detail_path.set_wrap(true);
-        detail_path.set_selectable(true);
+        let detail_connection_value = gtk::Label::new(None);
+        detail_connection_value.set_xalign(0.0);
+        detail_connection_value.set_wrap(true);
 
-        let detail_backend = gtk::Label::new(None);
-        detail_backend.add_css_class("dim-label");
-        detail_backend.set_xalign(0.0);
-        detail_backend.set_wrap(true);
+        let detail_connection_hint = gtk::Label::new(None);
+        detail_connection_hint.add_css_class("dim-label");
+        detail_connection_hint.set_xalign(0.0);
+        detail_connection_hint.set_wrap(true);
+
+        let detail_address_value = gtk::Label::new(None);
+        detail_address_value.set_xalign(0.0);
+        detail_address_value.set_wrap(true);
+        detail_address_value.set_selectable(true);
+
+        let detail_backend_value = gtk::Label::new(None);
+        detail_backend_value.set_xalign(0.0);
+        detail_backend_value.set_wrap(true);
+
+        let detail_default_profile_value = gtk::Label::new(None);
+        detail_default_profile_value.set_xalign(0.0);
+        detail_default_profile_value.set_wrap(true);
+
+        let buttons_default_profile_value = gtk::Label::new(None);
+        buttons_default_profile_value.set_xalign(0.0);
+        buttons_default_profile_value.set_wrap(true);
+
+        let configure_buttons = gtk::Button::with_label("Configure buttons");
+        configure_buttons.set_halign(gtk::Align::Start);
+        configure_buttons.add_css_class("flat");
+        configure_buttons.set_visible(false);
 
         let unpair_button = gtk::Button::with_label("Unpair");
         unpair_button.add_css_class("destructive-action");
+        unpair_button.set_halign(gtk::Align::Start);
         unpair_button.set_visible(false);
 
-        let detail = gtk::Box::new(gtk::Orientation::Vertical, 12);
-        detail.set_margin_top(24);
-        detail.set_margin_bottom(24);
-        detail.set_margin_start(24);
-        detail.set_margin_end(24);
-        detail.set_size_request(320, -1);
-        detail.append(&detail_title);
-        detail.append(&detail_name);
-        detail.append(&detail_status);
-        detail.append(&detail_path);
-        detail.append(&detail_backend);
-        detail.append(&unpair_button);
+        let detail_page = gtk::Box::new(gtk::Orientation::Vertical, 18);
+        detail_page.set_margin_top(24);
+        detail_page.set_margin_bottom(24);
+        detail_page.set_margin_start(24);
+        detail_page.set_margin_end(24);
+        detail_page.append(&detail_title);
+        detail_page.append(&detail_name);
+        detail_page.append(&detail_fact_row("Status", &detail_status_value));
+        detail_page.append(&detail_fact_with_hint_row(
+            "Connection",
+            &detail_connection_value,
+            &detail_connection_hint,
+        ));
+        detail_page.append(&detail_fact_row("Address", &detail_address_value));
+        detail_page.append(&detail_fact_row("Backend", &detail_backend_value));
+        detail_page.append(&detail_fact_row(
+            "Default profile",
+            &detail_default_profile_value,
+        ));
+        detail_page.append(&configure_buttons);
+        detail_page.append(&unpair_button);
+
+        let detail_scroller = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .min_content_width(360)
+            .child(&detail_page)
+            .build();
+
+        let back_button = gtk::Button::with_label("Back");
+        back_button.add_css_class("flat");
+
+        let buttons_title = gtk::Label::new(Some("Configure buttons"));
+        buttons_title.add_css_class("title-3");
+        buttons_title.set_xalign(0.0);
+        buttons_title.set_hexpand(true);
+
+        let buttons_header = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        buttons_header.append(&back_button);
+        buttons_header.append(&buttons_title);
+
+        let buttons_banner_title = gtk::Label::new(None);
+        buttons_banner_title.add_css_class("heading");
+        buttons_banner_title.set_xalign(0.0);
+        buttons_banner_title.set_wrap(true);
+
+        let buttons_banner_address = gtk::Label::new(None);
+        buttons_banner_address.add_css_class("dim-label");
+        buttons_banner_address.set_xalign(0.0);
+        buttons_banner_address.set_wrap(true);
+
+        let buttons_connection_title = gtk::Label::new(Some("Connection"));
+        buttons_connection_title.add_css_class("heading");
+        buttons_connection_title.set_xalign(0.0);
+
+        let buttons_connection_hint = gtk::Label::new(None);
+        buttons_connection_hint.add_css_class("dim-label");
+        buttons_connection_hint.set_xalign(0.0);
+        buttons_connection_hint.set_wrap(true);
+
+        let buttons_connection_text = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        buttons_connection_text.append(&buttons_connection_title);
+        buttons_connection_text.append(&buttons_connection_hint);
+
+        let connection_switch = gtk::Switch::new();
+        connection_switch.set_halign(gtk::Align::End);
+        connection_switch.set_valign(gtk::Align::Center);
+
+        let buttons_connection_row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        buttons_connection_row.append(&buttons_connection_text);
+        buttons_connection_row.append(&gtk::Box::builder().hexpand(true).build());
+        buttons_connection_row.append(&connection_switch);
+
+        let buttons_banner = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        buttons_banner.add_css_class("card");
+        buttons_banner.set_margin_top(6);
+        buttons_banner.set_margin_bottom(6);
+        buttons_banner.set_margin_start(6);
+        buttons_banner.set_margin_end(6);
+        buttons_banner.append(&buttons_banner_title);
+        buttons_banner.append(&buttons_banner_address);
+        buttons_banner.append(&buttons_connection_row);
+
+        let buttons_placeholder = gtk::Label::new(Some(
+            "Button assignment and default profile editing land here in the next issue.",
+        ));
+        buttons_placeholder.add_css_class("dim-label");
+        buttons_placeholder.set_wrap(true);
+        buttons_placeholder.set_xalign(0.0);
+
+        let buttons_page = gtk::Box::new(gtk::Orientation::Vertical, 18);
+        buttons_page.set_margin_top(24);
+        buttons_page.set_margin_bottom(24);
+        buttons_page.set_margin_start(24);
+        buttons_page.set_margin_end(24);
+        buttons_page.append(&buttons_header);
+        buttons_page.append(&buttons_banner);
+        buttons_page.append(&detail_fact_row(
+            "Default profile",
+            &buttons_default_profile_value,
+        ));
+        buttons_page.append(&buttons_placeholder);
+
+        let buttons_scroller = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .min_content_width(360)
+            .child(&buttons_page)
+            .build();
+
+        let detail_stack = gtk::Stack::new();
+        detail_stack.add_named(&detail_placeholder, Some("placeholder"));
+        detail_stack.add_named(&detail_scroller, Some("details"));
+        detail_stack.add_named(&buttons_scroller, Some("buttons"));
+        detail_stack.set_visible_child_name("placeholder");
 
         let content = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         content.set_vexpand(true);
         content.append(&scroller);
         content.append(&gtk::Separator::new(gtk::Orientation::Vertical));
-        content.append(&detail);
+        content.append(&detail_stack);
 
         let stack = gtk::Stack::new();
         stack.add_named(&content, Some("content"));
@@ -544,10 +734,20 @@ impl ScannersPane {
             let paired_group = paired_group.clone();
             let discovered_group = discovered_group.clone();
             let discovery_caption = discovery_caption.clone();
+            let detail_stack = detail_stack.clone();
             let detail_name = detail_name.clone();
-            let detail_status = detail_status.clone();
-            let detail_path = detail_path.clone();
-            let detail_backend = detail_backend.clone();
+            let detail_status_value = detail_status_value.clone();
+            let detail_connection_value = detail_connection_value.clone();
+            let detail_connection_hint = detail_connection_hint.clone();
+            let detail_address_value = detail_address_value.clone();
+            let detail_backend_value = detail_backend_value.clone();
+            let detail_default_profile_value = detail_default_profile_value.clone();
+            let buttons_default_profile_value = buttons_default_profile_value.clone();
+            let configure_buttons = configure_buttons.clone();
+            let buttons_banner_title = buttons_banner_title.clone();
+            let buttons_banner_address = buttons_banner_address.clone();
+            let buttons_connection_hint = buttons_connection_hint.clone();
+            let connection_switch = connection_switch.clone();
             let unpair_button = unpair_button.clone();
             model.connect_changed(move || {
                 let paired_count = paired_model.n_items();
@@ -568,25 +768,58 @@ impl ScannersPane {
                     && let Some(scanner) = model_for_callback.scanner(&path)
                 {
                     detail_name.set_label(&scanner.state.name);
-                    detail_status.set_label(&status_line(
+                    detail_status_value.set_label(status_value(scanner.state.status));
+                    detail_connection_value.set_label(connection_value(scanner.state.connected));
+                    detail_connection_hint
+                        .set_label(connection_subtitle(scanner.state.status, scanner.state.connected));
+                    detail_address_value.set_label(&scanner.state.address);
+                    detail_backend_value.set_label(&humanize_backend(&scanner.state.backend));
+                    detail_default_profile_value
+                        .set_label(&default_profile_label(scanner.state.default_profile));
+                    buttons_default_profile_value
+                        .set_label(&default_profile_label(scanner.state.default_profile));
+                    configure_buttons.set_visible(scanner.state.paired);
+                    configure_buttons.set_sensitive(scanner.state.paired);
+                    buttons_banner_title.set_label(&connection_banner(
                         scanner.state.status,
                         scanner.state.connected,
                         scanner.state.paired,
                     ));
-                    detail_path.set_label(&path);
-                    detail_backend.set_label(&format!(
-                        "Backend: {}",
-                        humanize_backend(&scanner.state.backend)
-                    ));
+                    buttons_banner_address
+                        .set_label(&format!("Address: {}", scanner.state.address));
+                    buttons_connection_hint
+                        .set_label(connection_subtitle(scanner.state.status, scanner.state.connected));
+                    connection_switch.set_active(scanner.state.connected);
+                    connection_switch
+                        .set_sensitive(scanner.state.paired && scanner.state.status != Status::Offline);
                     unpair_button.set_visible(scanner.state.paired);
                     unpair_button.set_sensitive(scanner.state.paired);
+                    if detail_stack.visible_child_name().as_deref() == Some("placeholder") {
+                        detail_stack.set_visible_child_name("details");
+                    }
+                    if !scanner.state.paired
+                        && detail_stack.visible_child_name().as_deref() == Some("buttons")
+                    {
+                        detail_stack.set_visible_child_name("details");
+                    }
                 } else {
-                    detail_name.set_label("No scanner selected");
-                    detail_status.set_label("");
-                    detail_path.set_label("");
-                    detail_backend.set_label("");
+                    detail_name.set_label("");
+                    detail_status_value.set_label("");
+                    detail_connection_value.set_label("");
+                    detail_connection_hint.set_label("");
+                    detail_address_value.set_label("");
+                    detail_backend_value.set_label("");
+                    detail_default_profile_value.set_label("");
+                    buttons_default_profile_value.set_label("");
+                    configure_buttons.set_visible(false);
+                    buttons_banner_title.set_label("");
+                    buttons_banner_address.set_label("");
+                    buttons_connection_hint.set_label("");
+                    connection_switch.set_active(false);
+                    connection_switch.set_sensitive(false);
                     unpair_button.set_visible(false);
                     unpair_button.set_sensitive(false);
+                    detail_stack.set_visible_child_name("placeholder");
                 }
 
                 let caption =
@@ -603,6 +836,50 @@ impl ScannersPane {
 
         // Seed the derived visibility once the widgets exist.
         model.set_selected_path(None);
+
+        {
+            let detail_stack = detail_stack.clone();
+            let model = Rc::clone(&model);
+            configure_buttons.connect_clicked(move |_| {
+                if model
+                    .selected_path()
+                    .and_then(|path| model.scanner(&path))
+                    .is_some_and(|scanner| scanner.state.paired)
+                {
+                    detail_stack.set_visible_child_name("buttons");
+                }
+            });
+        }
+
+        {
+            let detail_stack = detail_stack.clone();
+            back_button.connect_clicked(move |_| {
+                detail_stack.set_visible_child_name("details");
+            });
+        }
+
+        {
+            let model = Rc::clone(&model);
+            let commands = commands.clone();
+            connection_switch.connect_state_set(move |_, state| {
+                let Some(path) = model.selected_path() else {
+                    return glib::Propagation::Stop;
+                };
+                let Some(scanner) = model.scanner(&path) else {
+                    return glib::Propagation::Stop;
+                };
+                if !scanner.state.paired || scanner.state.status == Status::Offline {
+                    return glib::Propagation::Stop;
+                }
+                let command = if state {
+                    BusCommand::Connect { path }
+                } else {
+                    BusCommand::Disconnect { path }
+                };
+                let _ = commands.try_send(command);
+                glib::Propagation::Stop
+            });
+        }
 
         {
             let model = Rc::clone(&model);
@@ -668,6 +945,23 @@ pub fn discovery_caption_text(state: DiscoveryState, discovered_count: usize) ->
             format!("Finding scanners... {discovered_count} {noun} found")
         }
     }
+}
+
+fn detail_fact_row(title: &str, value: &gtk::Label) -> gtk::Box {
+    let title_label = gtk::Label::new(Some(title));
+    title_label.add_css_class("caption-heading");
+    title_label.set_xalign(0.0);
+
+    let row = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    row.append(&title_label);
+    row.append(value);
+    row
+}
+
+fn detail_fact_with_hint_row(title: &str, value: &gtk::Label, hint: &gtk::Label) -> gtk::Box {
+    let row = detail_fact_row(title, value);
+    row.append(hint);
+    row
 }
 
 fn scanner_row(
@@ -936,6 +1230,33 @@ mod tests {
         assert_eq!(
             discovery_caption_text(DiscoveryState::Active, 1),
             "Finding scanners... 1 scanner found"
+        );
+    }
+
+    #[test]
+    fn connection_copy_spells_out_host_listening() {
+        assert_eq!(connection_value(false), "Not listening");
+        assert_eq!(connection_value(true), "Listening");
+        assert_eq!(
+            connection_subtitle(Status::Offline, false),
+            "Unavailable while the scanner is offline"
+        );
+        assert_eq!(
+            connection_subtitle(Status::Online, true),
+            "This host is ready to receive from this scanner"
+        );
+        assert_eq!(
+            connection_banner(Status::Online, false, true),
+            "Paired • Online • Host not listening"
+        );
+    }
+
+    #[test]
+    fn default_profile_copy_is_human_readable() {
+        assert_eq!(default_profile_label(None), "None");
+        assert_eq!(
+            default_profile_label(Some(ProfileKind::Document)),
+            "Document"
         );
     }
 
