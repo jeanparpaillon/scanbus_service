@@ -619,6 +619,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "scanbus-backend-mobile"
+version = "0.1.0"
+dependencies = [
+ "scanbus-core",
+]
+
+[[package]]
 name = "scanbus-cli"
 version = "0.1.0"
 dependencies = [
@@ -666,6 +673,7 @@ dependencies = [
  "image",
  "scanbus-backend-brother",
  "scanbus-backend-hplip",
+ "scanbus-backend-mobile",
  "scanbus-client",
  "scanbus-core",
  "serde_json",

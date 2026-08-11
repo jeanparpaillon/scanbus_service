@@ -23,6 +23,7 @@ path = "src/main.rs"
 default = []
 brother = ["dep:scanbus-backend-brother"]
 hplip = ["dep:scanbus-backend-hplip"]
+mobile = ["dep:scanbus-backend-mobile"]
 
 [dependencies]
 scanbus-core.workspace = true
@@ -30,6 +31,7 @@ scanbus-core.workspace = true
 async-trait.workspace = true
 scanbus-backend-brother = { workspace = true, optional = true }
 scanbus-backend-hplip = { workspace = true, optional = true }
+scanbus-backend-mobile = { workspace = true, optional = true }
 # `StreamExt::next` and `BoxStream`, for the task that consumes a backend's button
 # stream (2.4). Core stays on `futures-core`, which only defines the trait; the daemon is
 # where the streams are actually driven.

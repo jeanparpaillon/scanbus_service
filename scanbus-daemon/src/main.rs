@@ -28,6 +28,8 @@ const BACKENDS: &[&str] = &[
     scanbus_backend_brother::ID,
     #[cfg(feature = "hplip")]
     scanbus_backend_hplip::ID,
+    #[cfg(feature = "mobile")]
+    scanbus_backend_mobile::ID,
 ];
 
 /// The backend instances, in the same order as [`BACKENDS`].

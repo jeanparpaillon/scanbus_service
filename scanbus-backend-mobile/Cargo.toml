@@ -1,0 +1,10 @@
+[package]
+name = "scanbus-backend-mobile"
+description = "Mobile protocol backend for scanbus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+scanbus-core.workspace = true
