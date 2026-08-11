@@ -29,7 +29,9 @@ mod job;
 mod job_follow;
 mod list;
 mod monitor;
+mod options;
 mod pair;
+mod profile;
 mod scanner_view;
 mod show;
 
@@ -50,6 +52,10 @@ use crate::error::{Error, Result};
 /// [`Error`], whose [`exit_code`](Error::exit_code) is what the process ends with.
 ///
 /// [`scanbus-cli.md`]: https://github.com/jeanparpaillon/scanbus_service/blob/master/docs/scanbus-cli.md
+#[allow(
+    unreachable_patterns,
+    reason = "the stub arm stays as the future-command checklist even when all current commands are implemented"
+)]
 pub async fn dispatch(context: &Context, command: &Command) -> Result<u8> {
     match command {
         Command::Status => status::run(context).await,
@@ -105,6 +111,15 @@ pub async fn dispatch(context: &Context, command: &Command) -> Result<u8> {
             }
         },
         Command::Monitor { path } => monitor::run(context, path.as_deref()).await,
+        Command::Profile { command } => match command {
+            ProfileCommand::List => profile::list(context).await,
+            ProfileCommand::Show { name } => profile::show(context, name).await,
+            ProfileCommand::Set {
+                name,
+                options,
+                option_json,
+            } => profile::set(context, name, options, option_json).await,
+        },
         pending => stub(context, pending).await,
     }
 }
