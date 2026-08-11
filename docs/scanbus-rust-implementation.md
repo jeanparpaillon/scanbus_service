@@ -150,7 +150,7 @@ trait ProfileProcessor {
 4. **`image`/`document` profiles**: full end-to-end pipeline on Brother.
 5. **`scanbus-backend-hplip`**: same sequence.
 6. **Persistence** of pairings + restoring them when the daemon restarts.
-7. **Packaging**: D-Bus `.service` file (on-demand activation), systemd unit, D-Bus policy file (`/etc/dbus-1/system.d/` or the session bus depending on the choice — session bus recommended here since this is per user/graphical session, consistent with your `brscan-skey` setup as a systemd user service).
+7. **Packaging**: D-Bus `.service` file (on-demand activation), systemd unit, D-Bus policy file (`/etc/dbus-1/system.d/` or the session bus depending on the choice — session bus recommended here since this is per user, and because the daemon must own `org.scanbus` on the user's bus whether or not a graphical session is currently active).
 ## 8. Concrete packaging (session bus)
 
 ### D-Bus activation file
@@ -175,6 +175,8 @@ SystemdService=scanbus.service
 Description=Scanbus document scanner service
 Requires=dbus.socket
 After=dbus.socket
+StartLimitIntervalSec=30
+StartLimitBurst=5
 
 [Service]
 Type=dbus
@@ -182,6 +184,7 @@ BusName=org.scanbus
 ExecStart=/usr/bin/scanbus-daemon
 Restart=on-failure
 RestartSec=2
+TimeoutStopSec=45
 
 [Install]
 WantedBy=default.target
@@ -191,15 +194,34 @@ WantedBy=default.target
 
 `Restart=on-failure` covers the case where a backend (Brother/HP) crashes the process — the D-Bus service comes back, but **the button listeners must be restarted** on startup: this has to be coded explicitly in `main.rs` (re-read the persisted state, call `start_listening()` again for every scanner with `Paired=true` and `Connected=true`, before even starting to handle D-Bus calls).
 
+`TimeoutStopSec=45` matches the daemon's shutdown path better than the default. On `SIGTERM`
+the daemon stops discovery, stops listeners, unexports the object tree, and releases
+`org.scanbus` before exiting; that is expected to be fast in the normal case, but the unit
+still needs enough headroom for an in-flight scan to finish cleanly or fail cleanly rather
+than being cut off by systemd mid-cleanup.
+
+`StartLimit*` is there because this daemon supervises vendor tooling and shells out to backend
+helpers. A persistent crash loop should stop and stay visible in `systemctl --user status`
+rather than being restarted forever by the user manager.
+
 ### Registration at login (no forced launch)
 
 Since the service is activated on demand, no `autostart` entry is needed for regular use. But given the "zero PC interaction" goal for the physical button, the service must run **continuously** (not just at the time of a D-Bus call), otherwise a button press while nobody has used the D-Bus bus since boot would never be caught. Two options:
 
-- `systemctl --user enable scanbus.service` — explicit start at graphical login, recommended for this use case.
+- `systemctl --user enable scanbus.service` — start it from the user's **default target**. On this machine the user manager is shared between GNOME and sway and runs with lingering enabled, so `default.target` means "start for the user manager itself", not "start once per compositor". That is deliberate here: a button press with no graphical session must still be caught, and wiring the unit to `graphical-session.target` would make it start under both sessions while still not covering the "booted but nobody logged in yet" case.
 - Or trigger the D-Bus activation at session start through an autostart `.desktop` that simply runs `dbus-send --session --print-reply --dest=org.scanbus /org/scanbus org.freedesktop.DBus.Peer.Ping` — more fragile, prefer a plain `enable`.
+
+That `default.target` choice only holds because the daemon does not require a compositor. Its
+state lives under `XDG_CONFIG_HOME`/`$HOME`, profile output roots are read from
+`user-dirs.dirs` or fall back to `$HOME`, and there is no dependency on `DISPLAY` or
+`WAYLAND_DISPLAY` in the daemon startup path. If that ever changes, this section must change
+with it.
 ### Packaging the binary as `.deb`
 
 - The `.service`/`.dbus-service` files should be shipped by the package in the system paths (`/usr/lib/systemd/user/`, `/usr/share/dbus-1/services/`) rather than `~/.config`/`~/.local` — this avoids every user having to install them by hand on a multi-account machine.
+- Do not enable or mask anything from maintainer scripts in global scope. The package should
+  install the files; `systemctl --user enable scanbus.service` is a per-user choice, and doing
+  it globally is how you end up with root-owned links a user manager cannot clean up later.
 - System dependencies to declare: `libdbus-1-3` (through `zbus`, which can work without `libdbus` depending on the transport chosen — check whether we keep zbus's native Rust transport precisely to avoid this dependency).
 ## 9. Testing strategy
 

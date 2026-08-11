@@ -59,12 +59,18 @@ cargo test --workspace
 ## Running
 
 The daemon reads `RUST_LOG`; without it, `info` for the scanbus crates and `warn`
-elsewhere. It exits 0 on SIGTERM, which is what systemd sends (see
-`docs/todo/7_1.md`).
+elsewhere. It exits 0 on SIGTERM, which is what systemd sends; the packaged user unit
+therefore uses `Type=dbus`, `BusName=org.scanbus`, and a generous `TimeoutStopSec`
+so shutdown can unexport objects and release the name cleanly.
 
 ```sh
 RUST_LOG=debug cargo run
 ```
+
+Packaging assets for issue 26 live under `packaging/`:
+
+- `packaging/dbus-1/services/org.scanbus.service`
+- `packaging/systemd/user/scanbus.service`
 
 ## Documentation
 

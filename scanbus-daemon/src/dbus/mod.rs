@@ -12,8 +12,10 @@
 //! property: paired scanners restored from disk are exported before the name appears,
 //! so no client ever sees the daemon with an empty tree it will fill in a moment.
 //!
-//! Session bus rather than system bus, per implementation plan §7: this is per-user and
-//! per-graphical-session, which matches how `brscan-skey` already runs.
+//! Session bus rather than system bus, per implementation plan §7: this is per-user, and
+//! the packaged unit is intended to run under the user's lingering manager even when no
+//! compositor is active yet. That is why the daemon startup path must stay free of
+//! assumptions about `DISPLAY`, `WAYLAND_DISPLAY`, or any other graphical-session state.
 
 pub mod button;
 pub mod convert;
