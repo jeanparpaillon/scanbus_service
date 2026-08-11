@@ -42,7 +42,10 @@ pub async fn run(context: &Context, scanner: &ScannerArg) -> Result<u8> {
         .map_err(|error| Error::call("finding the scanner", error.into()))?;
 
     let state = context
-        .within(format!("reading {}", found.id), ScannerState::fetch(&connection, &found.id))
+        .within(
+            format!("reading {}", found.id),
+            ScannerState::fetch(&connection, &found.id),
+        )
         .await?;
 
     let buttons: Vec<&Button> = objects
@@ -62,7 +65,8 @@ fn report(context: &Context, state: &ScannerState, buttons: &[&Button]) -> Resul
     match context.format {
         Format::Json => {
             let mut document = scanner_view::json(state);
-            document["Buttons"] = serde_json::Value::Array(buttons.iter().map(|b| button_json(b)).collect());
+            document["Buttons"] =
+                serde_json::Value::Array(buttons.iter().map(|b| button_json(b)).collect());
             output::json(&mut stdout, &document)
         }
         Format::Human => human(&mut stdout, context, state, buttons),
@@ -84,12 +88,20 @@ fn human(
             ("name", state.name.clone()),
             ("backend", state.backend.clone()),
             ("address", state.address.clone()),
-            ("paired", (if state.paired { "yes" } else { "no" }).to_owned()),
-            ("connected", (if state.connected { "yes" } else { "no" }).to_owned()),
+            (
+                "paired",
+                (if state.paired { "yes" } else { "no" }).to_owned(),
+            ),
+            (
+                "connected",
+                (if state.connected { "yes" } else { "no" }).to_owned(),
+            ),
             ("status", state.status.as_str().to_owned()),
             (
                 "default profile",
-                state.default_profile.map_or(String::new(), |profile| profile.as_str().to_owned()),
+                state
+                    .default_profile
+                    .map_or(String::new(), |profile| profile.as_str().to_owned()),
             ),
             (
                 "supported profiles",
@@ -112,12 +124,7 @@ fn human(
     writeln!(writer).map_err(Error::write)?;
     let rows: Vec<_> = buttons
         .iter()
-        .map(|button| {
-            vec![
-                button.index.to_string(),
-                button.device_label.clone(),
-            ]
-        })
+        .map(|button| vec![button.index.to_string(), button.device_label.clone()])
         .collect();
     output::table(writer, context.style, &["IDX", "DEVICE LABEL"], &rows)
 }

@@ -188,7 +188,12 @@ async fn stream(
 
 /// Releases the session unless `--keep` was given or this process does not believe it
 /// started it — see the module header.
-async fn stop(context: &Context, connection: &Connection, owns_session: bool, keep: bool) -> Result<()> {
+async fn stop(
+    context: &Context,
+    connection: &Connection,
+    owns_session: bool,
+    keep: bool,
+) -> Result<()> {
     if keep {
         return Ok(());
     }

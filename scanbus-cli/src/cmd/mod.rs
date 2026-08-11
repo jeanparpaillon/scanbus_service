@@ -22,7 +22,9 @@
 
 pub mod status;
 
+mod connect;
 mod discover;
+mod job_follow;
 mod list;
 mod pair;
 mod scanner_view;
@@ -59,6 +61,14 @@ pub async fn dispatch(context: &Context, command: &Command) -> Result<u8> {
         Command::Pair { scanner, no_wait } => pair::run(context, scanner, *no_wait).await,
         Command::CancelPairing { scanner } => pair::cancel(context, scanner).await,
         Command::Unpair { scanner, yes } => pair::unpair(context, scanner, *yes).await,
+        Command::Connect { scanner, profile } => connect::connect(context, scanner, profile).await,
+        Command::Disconnect { scanner } => connect::disconnect(context, scanner).await,
+        Command::Scan {
+            scanner,
+            profile,
+            options,
+            no_wait,
+        } => connect::scan(context, scanner, profile, options, *no_wait).await,
         pending => stub(context, pending).await,
     }
 }

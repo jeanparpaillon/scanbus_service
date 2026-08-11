@@ -61,7 +61,10 @@ pub async fn run(context: &Context, scanner: &ScannerArg, no_wait: bool) -> Resu
     };
 
     let state = context
-        .within(format!("reading {}", found.id), ScannerState::fetch(&connection, &found.id))
+        .within(
+            format!("reading {}", found.id),
+            ScannerState::fetch(&connection, &found.id),
+        )
         .await?;
 
     if state.paired {
@@ -90,7 +93,10 @@ pub async fn cancel(context: &Context, scanner: &ScannerArg) -> Result<u8> {
     let found = resolve(context, &connection, scanner).await?;
 
     let proxy = context
-        .within(format!("resolving {}", found.id), Scanner1Proxy::for_scanner(&connection, &found.id))
+        .within(
+            format!("resolving {}", found.id),
+            Scanner1Proxy::for_scanner(&connection, &found.id),
+        )
         .await?;
 
     context
@@ -117,7 +123,10 @@ pub async fn unpair(context: &Context, scanner: &ScannerArg, yes: bool) -> Resul
     }
 
     let proxy = context
-        .within(format!("resolving {}", found.id), Scanner1Proxy::for_scanner(&connection, &found.id))
+        .within(
+            format!("resolving {}", found.id),
+            Scanner1Proxy::for_scanner(&connection, &found.id),
+        )
         .await?;
 
     context
@@ -146,7 +155,10 @@ async fn pair_and_wait(
         .await?;
 
     let proxy = context
-        .within(format!("resolving {}", found.id), Scanner1Proxy::for_scanner(connection, &found.id))
+        .within(
+            format!("resolving {}", found.id),
+            Scanner1Proxy::for_scanner(connection, &found.id),
+        )
         .await?;
 
     context
@@ -234,9 +246,17 @@ fn print_transition(context: &Context, state: &ScannerState) -> Result<()> {
 
     let mut stdout = std::io::stdout().lock();
     let line = if state.pairing.is_failed() {
-        format!("{:<12}{}", state.pairing.as_str(), state.pairing.pairing_error())
+        format!(
+            "{:<12}{}",
+            state.pairing.as_str(),
+            state.pairing.pairing_error()
+        )
     } else if state.pairing.as_str() == "awaiting_confirmation" {
-        format!("{:<22}{}", state.pairing.as_str(), state.pairing.pairing_info())
+        format!(
+            "{:<22}{}",
+            state.pairing.as_str(),
+            state.pairing.pairing_info()
+        )
     } else {
         format!("{:<12}{}", state.pairing.as_str(), state.id)
     };
@@ -379,7 +399,11 @@ async fn try_match(
 }
 
 /// A selector that resolves, or fails with exit 4 and the candidates §8 promises.
-async fn resolve(context: &Context, connection: &Connection, scanner: &ScannerArg) -> Result<Scanner> {
+async fn resolve(
+    context: &Context,
+    connection: &Connection,
+    scanner: &ScannerArg,
+) -> Result<Scanner> {
     let objects = context
         .within("listing the daemon's objects", Objects::fetch(connection))
         .await?;
@@ -392,7 +416,11 @@ async fn resolve(context: &Context, connection: &Connection, scanner: &ScannerAr
 
 /// The final report once a short discovery gave up without a match: one more read of
 /// the object tree, so the message carries whatever the daemon does know about.
-async fn unresolved(context: &Context, connection: &Connection, scanner: &ScannerArg) -> Result<Error> {
+async fn unresolved(
+    context: &Context,
+    connection: &Connection,
+    scanner: &ScannerArg,
+) -> Result<Error> {
     let objects = context
         .within("listing the daemon's objects", Objects::fetch(connection))
         .await?;
@@ -444,6 +472,8 @@ fn confirm(found: &Scanner) -> Result<bool> {
     std::io::stderr().flush().map_err(Error::write)?;
 
     let mut line = String::new();
-    std::io::stdin().read_line(&mut line).map_err(Error::write)?;
+    std::io::stdin()
+        .read_line(&mut line)
+        .map_err(Error::write)?;
     Ok(matches!(line.trim().to_lowercase().as_str(), "y" | "yes"))
 }
