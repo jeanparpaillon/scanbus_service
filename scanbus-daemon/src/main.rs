@@ -43,13 +43,15 @@ const BACKENDS: &[&str] = &[
 
 /// The backend instances, in the same order as [`BACKENDS`].
 ///
-/// Empty even with a feature enabled, because neither vendor crate implements
-/// `ScannerBackend` yet — that is workstreams 5 and 6. `Manager1` is fully functional in
-/// the meantime and simply finds nothing, which is why the startup log reports the two
-/// lists separately: `compiled_in` says what this binary was built with, `probing` says
-/// what `StartDiscovery` will actually ask.
+/// Vendor backends are still skeletons. The mobile backend is available and discoverable
+/// on default builds.
 fn backends() -> Backends {
-    Backends::new([])
+    let mut entries: Vec<Arc<dyn scanbus_core::ScannerBackend>> = Vec::new();
+
+    #[cfg(feature = "mobile")]
+    entries.push(Arc::new(scanbus_backend_mobile::MobileBackend::default()));
+
+    Backends::new(entries)
 }
 
 #[tokio::main(flavor = "multi_thread")]

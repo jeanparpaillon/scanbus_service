@@ -1,13 +1,21 @@
-//! Wire protocol primitives for `scanbus-backend-mobile`.
-//!
-//! This crate is intentionally pure protocol in this milestone: frame I/O, JSON message
-//! decoding and validation. There is no network listener code here yet.
+//! Wire protocol primitives and backend plumbing for `scanbus-backend-mobile`.
 
+use std::collections::BTreeMap;
 use std::fmt;
+use std::time::{Duration, Instant};
 
-use scanbus_core::ProfileKind;
+use async_trait::async_trait;
+use flume::RecvTimeoutError;
+use futures_core::stream::BoxStream;
+use mdns_sd::{ServiceDaemon, ServiceEvent};
+use scanbus_core::{
+	BackendError, ButtonsCapability, Capabilities as ScannerCapabilities, ProfileKind, RawPage,
+	ScannerBackend, ScannerId, ScannerInfo, Status, Value,
+};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::mpsc;
+use tracing::{debug, warn};
 
 /// Backend identifier, as reported by `ScannerBackend::id`.
 pub const ID: &str = "mobile";
@@ -23,6 +31,223 @@ pub const DEFAULT_PAGE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 /// Maximum allowed value for `of` in an upload header.
 pub const MAX_PAGES_PER_JOB: u32 = 200;
+
+/// Service type used by mobile app instances.
+pub const SERVICE_TYPE: &str = "_scanbus-mobile._tcp.local.";
+
+/// How long one `discover()` call browses mDNS before returning.
+pub const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Backend implementation for mobile scanners.
+#[derive(Debug, Clone)]
+pub struct MobileBackend {
+	discovery_timeout: Duration,
+}
+
+impl Default for MobileBackend {
+	fn default() -> Self {
+		Self {
+			discovery_timeout: DISCOVERY_TIMEOUT,
+		}
+	}
+}
+
+impl MobileBackend {
+	pub fn new(discovery_timeout: Duration) -> Self {
+		Self { discovery_timeout }
+	}
+}
+
+#[async_trait]
+impl ScannerBackend for MobileBackend {
+	fn id(&self) -> &'static str {
+		ID
+	}
+
+	async fn discover(&self) -> Result<Vec<ScannerInfo>, BackendError> {
+		let timeout = self.discovery_timeout;
+		tokio::task::spawn_blocking(move || discover_once(timeout))
+			.await
+			.map_err(|error| BackendError::Other(format!("mobile discover task failed: {error}")))?
+	}
+
+	async fn ensure_installed(
+		&self,
+		_scanner: &ScannerInfo,
+		_progress: mpsc::Sender<scanbus_core::PairingProgress>,
+	) -> Result<(), BackendError> {
+		Err(BackendError::Unsupported {
+			backend: ID,
+			operation: "ensure_installed",
+		})
+	}
+
+	async fn start_listening(
+		&self,
+		_scanner: &ScannerInfo,
+	) -> Result<BoxStream<'static, scanbus_core::ButtonPressedEvent>, BackendError> {
+		Err(BackendError::Unsupported {
+			backend: ID,
+			operation: "start_listening",
+		})
+	}
+
+	async fn stop_listening(&self, _scanner_id: &ScannerId) -> Result<(), BackendError> {
+		Err(BackendError::Unsupported {
+			backend: ID,
+			operation: "stop_listening",
+		})
+	}
+
+	async fn set_button_mapping(
+		&self,
+		_scanner_id: &ScannerId,
+		_button_index: u32,
+		_profile: Option<ProfileKind>,
+		_options: &BTreeMap<String, Value>,
+	) -> Result<(), BackendError> {
+		Err(BackendError::Unsupported {
+			backend: ID,
+			operation: "set_button_mapping",
+		})
+	}
+
+	async fn fetch_pages(
+		&self,
+		_scanner_id: &ScannerId,
+		_job_id: &str,
+	) -> Result<BoxStream<'static, Result<RawPage, BackendError>>, BackendError> {
+		Err(BackendError::Unsupported {
+			backend: ID,
+			operation: "fetch_pages",
+		})
+	}
+}
+
+fn discover_once(timeout: Duration) -> Result<Vec<ScannerInfo>, BackendError> {
+	let daemon = ServiceDaemon::new().map_err(|error| BackendError::NotReachable {
+		scanner: ScannerId::from_backend(ID, "discovery").expect("static discovery id is valid"),
+		detail: format!("failed to start mDNS browser: {error}"),
+	})?;
+	let receiver = daemon
+		.browse(SERVICE_TYPE)
+		.map_err(|error| BackendError::Other(format!("failed to browse {SERVICE_TYPE}: {error}")))?;
+
+	let mut seen = BTreeMap::<ScannerId, ScannerInfo>::new();
+	let started = Instant::now();
+	loop {
+		let elapsed = started.elapsed();
+		if elapsed >= timeout {
+			break;
+		}
+		let remaining = timeout - elapsed;
+		match receiver.recv_timeout(remaining) {
+			Ok(ServiceEvent::ServiceResolved(service)) => {
+				if let Some(scanner) = scanner_from_service(&service) {
+					if seen.contains_key(&scanner.id) {
+						warn!(
+							scanner_id = %scanner.id,
+							instance = %service.get_fullname(),
+							"duplicate mobile scanner id discovered; keeping first one"
+						);
+						continue;
+					}
+					seen.insert(scanner.id.clone(), scanner);
+				}
+			}
+			Ok(
+				ServiceEvent::SearchStarted(_)
+				| ServiceEvent::ServiceFound(_, _)
+				| ServiceEvent::ServiceRemoved(_, _)
+				| ServiceEvent::SearchStopped(_),
+			) => {}
+			Err(RecvTimeoutError::Timeout) => break,
+			Err(RecvTimeoutError::Disconnected) => {
+				warn!("mDNS browser disconnected before timeout");
+				break;
+			}
+		}
+	}
+
+	if let Err(error) = daemon.stop_browse(SERVICE_TYPE) {
+		debug!(%error, "mobile discover stop_browse failed; continuing");
+	}
+	if let Err(error) = daemon.shutdown() {
+		debug!(%error, "mobile discover daemon shutdown failed; continuing");
+	}
+
+	Ok(seen.into_values().collect())
+}
+
+fn scanner_from_service(service: &mdns_sd::ServiceInfo) -> Option<ScannerInfo> {
+	let instance = service.get_fullname().to_owned();
+	let properties = service.get_properties();
+
+	let id = match properties.get_property_val_str("id") {
+		Some(id) if !id.trim().is_empty() => id,
+		_ => {
+			debug!(instance = %instance, "dropping mobile service with no txt id");
+			return None;
+		}
+	};
+
+	let version = match properties
+		.get_property_val_str("v")
+		.and_then(|v| v.parse::<u32>().ok())
+	{
+		Some(v) => v,
+		None => {
+			debug!(instance = %instance, "dropping mobile service with missing/invalid txt v");
+			return None;
+		}
+	};
+
+	if version != PROTOCOL_VERSION {
+		debug!(
+			instance = %instance,
+			seen = version,
+			supported = PROTOCOL_VERSION,
+			"dropping mobile service with unsupported protocol version"
+		);
+		return None;
+	}
+
+	let scanner_id = match ScannerId::from_backend(ID, id) {
+		Ok(scanner_id) => scanner_id,
+		Err(error) => {
+			debug!(instance = %instance, %error, "dropping mobile service with invalid txt id");
+			return None;
+		}
+	};
+
+	let Some(ip) = service.get_addresses().iter().next() else {
+		debug!(instance = %instance, "dropping mobile service with no resolved address");
+		return None;
+	};
+
+	Some(ScannerInfo {
+		id: scanner_id,
+		name: instance_name(&instance),
+		backend: ID.to_owned(),
+		address: format!("{}:{}", ip, service.get_port()),
+		capabilities: ScannerCapabilities {
+			buttons: ButtonsCapability {
+				count: 0,
+				label_configurable: false,
+			},
+			..ScannerCapabilities::default()
+		},
+		status: Status::Online,
+	})
+}
+
+fn instance_name(fullname: &str) -> String {
+	fullname
+		.strip_suffix(SERVICE_TYPE)
+		.and_then(|value| value.strip_suffix('.'))
+		.unwrap_or(fullname)
+		.to_owned()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameKind {

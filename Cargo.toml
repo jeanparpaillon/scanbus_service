@@ -39,6 +39,7 @@ scanbus-backend-hplip = { path = "scanbus-backend-hplip", version = "0.1.0" }
 scanbus-backend-mobile = { path = "scanbus-backend-mobile", version = "0.1.0" }
 
 async-trait = "0.1"
+flume = "0.11"
 # The CLI's only non-scanbus surface of its own. `derive` is not enabled here: the
 # feature is turned on in scanbus-cli, so a future consumer of clap in this workspace —
 # a test helper, say — does not silently pull the macro crate in.
@@ -50,6 +51,7 @@ clap = { version = "4", default-features = false, features = [
     "wrap_help",
 ] }
 futures-core = "0.3"
+mdns-sd = "0.13"
 # Test-only so far: core's own tests consume the backend streams, the daemon will do it
 # for real. Kept out of core's [dependencies] so the library itself stays on
 # futures-core, which is the one that only defines `Stream`.
