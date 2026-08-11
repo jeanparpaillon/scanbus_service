@@ -1,0 +1,30 @@
+#!/usr/bin/make -f
+
+PACKAGE_NAME ?= scanbus
+VERSION ?= $(shell sed -n '/^\[workspace\.package\]/,/^\[/{s/^version = "\(.*\)"/\1/p}' Cargo.toml | head -n 1)
+DEB_ARCH ?= $(shell dpkg-architecture -qDEB_HOST_ARCH)
+DEB_STAGE_DIR ?= target/debian/$(PACKAGE_NAME)/$(PACKAGE_NAME)_$(VERSION)_$(DEB_ARCH)
+DEB_ROOT ?= $(DEB_STAGE_DIR)/pkg
+DEB_OUTPUT ?= $(DEB_STAGE_DIR)/$(PACKAGE_NAME)_$(VERSION)_$(DEB_ARCH).deb
+SUBSTVARS := $(DEB_STAGE_DIR)/substvars
+
+.PHONY: binary build install control clean
+
+binary: build install control
+	dpkg-deb --root-owner-group --build $(DEB_ROOT) $(DEB_OUTPUT)
+	@printf '%s\n' "$(DEB_OUTPUT)"
+
+build:
+	rm -rf $(DEB_STAGE_DIR)
+	mkdir -p $(DEB_ROOT)/DEBIAN
+	$(MAKE) release
+
+install:
+	$(MAKE) install DESTDIR=$(abspath $(DEB_ROOT))
+
+control:
+	dpkg-shlibdeps -T$(SUBSTVARS) $(DEB_ROOT)/usr/bin/scanbus $(DEB_ROOT)/usr/bin/scanbus-daemon
+	dpkg-gencontrol -p$(PACKAGE_NAME) -P$(DEB_ROOT) -fdebian/control -T$(SUBSTVARS) -v$(VERSION)
+
+clean:
+	rm -rf $(DEB_STAGE_DIR)

@@ -71,6 +71,28 @@ Packaging assets for issue 26 live under `packaging/`:
 
 - `packaging/dbus-1/services/org.scanbus.service`
 - `packaging/systemd/user/scanbus.service`
+- `packaging/libexec/scanbus/scanbus-scanimage`
+- `debian/control`
+- `debian/rules`
+- `debian/postinst`
+- `debian/postrm`
+
+Build the `.deb` from a clean checkout with the backend features enabled in the daemon:
+
+```sh
+make deb
+```
+
+`make deb` drives the packaged build through `debian/rules`: `make release`
+builds `scanbus` and `scanbus-daemon`, `make install DESTDIR=...` stages the package
+layout under `target/debian/`, `dpkg-shlibdeps`/`dpkg-gencontrol` derive the binary's
+shared-library dependencies from `debian/control`, and `dpkg-deb` emits
+`scanbus_<version>_<arch>.deb`. It intentionally does **not** enable `scanbus.service`;
+that remains a per-user action:
+
+```sh
+systemctl --user enable --now scanbus.service
+```
 
 ## Documentation
 

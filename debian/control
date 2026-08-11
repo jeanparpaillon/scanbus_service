@@ -1,0 +1,12 @@
+Source: scanbus
+Section: utils
+Priority: optional
+Maintainer: Jean Parpaillon <jean@parpaillon.info>
+Standards-Version: 4.7.0
+
+Package: scanbus
+Architecture: any
+Depends: ${shlibs:Depends}, sane-utils
+Description: scanbus D-Bus service and command-line client
+ A session-scoped D-Bus service for document scanners, installed with its
+ user-level systemd unit, D-Bus activation file and stable scanimage helper.
