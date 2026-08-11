@@ -7,13 +7,22 @@
 
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 use scanbus_daemon::dbus::{self, Manager1, ObjectRegistry, Profile1, path};
 use scanbus_daemon::{
     Backends, Discovery, Error, JsonPairingStore, ProfileRegistry, ScannerRegistry,
 };
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
+
+/// How long the restore path (4.2) waits on a single scanner's `start_listening` before
+/// moving on and publishing it offline.
+///
+/// Short enough that a switched-off scanner cannot make `org.scanbus` late: a device
+/// that is actually there answers a local backend call well inside this, and one that
+/// is not there is exactly the case the reconnect backoff exists for, not this timeout.
+const RESTORE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Backends compiled into this binary, in the order they will be probed.
 ///
@@ -86,7 +95,8 @@ async fn run() -> Result<&'static str, Error> {
         Arc::new(JsonPairingStore::new()),
         Arc::clone(&profiles),
     );
-    let discovery = Arc::new(Discovery::new(backends(), Arc::clone(&scanners)));
+    let compiled_backends = backends();
+    let discovery = Arc::new(Discovery::new(compiled_backends.clone(), Arc::clone(&scanners)));
 
     for kind in profiles.registered_profiles() {
         registry
@@ -100,6 +110,12 @@ async fn run() -> Result<&'static str, Error> {
             Manager1::new(Arc::clone(&discovery), Arc::clone(&profiles)),
         )
         .await?;
+
+    // The last thing exported before the name: a client that resolves `org.scanbus` the
+    // instant it appears must already find every paired scanner, listening if it was
+    // connected before this restart (4.2).
+    scanners.restore(&compiled_backends, RESTORE_TIMEOUT).await;
+
     dbus::request_name(&connection).await?;
 
     let signal = shutdown_signal().await.map_err(Error::Signal)?;
@@ -117,6 +133,13 @@ async fn run() -> Result<&'static str, Error> {
     // await the unexports, so clients see `InterfacesRemoved` for every object instead
     // of just watching the name vanish.
     registry.shutdown().await;
+
+    // Released explicitly rather than left to the connection's `Drop`, so a restart
+    // that races its own predecessor never finds the name still owned by a process on
+    // its way out.
+    if let Err(error) = connection.release_name(dbus::BUS_NAME).await {
+        warn!(%error, "could not release the bus name");
+    }
 
     Ok(signal)
 }

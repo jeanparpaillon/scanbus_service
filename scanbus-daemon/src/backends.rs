@@ -103,6 +103,18 @@ impl Backends {
         self.entries.iter().map(|backend| backend.id()).collect()
     }
 
+    /// The backend named `id`, if this daemon was built with it.
+    ///
+    /// What the restore path (4.2) uses to find the backend a persisted scanner names —
+    /// `ScannerInfo::backend` is free text a store may hold from a build compiled with a
+    /// backend this one is not, so `None` is a normal outcome, not a bug.
+    pub fn get(&self, id: &str) -> Option<Arc<dyn ScannerBackend>> {
+        self.entries
+            .iter()
+            .find(|backend| backend.id() == id)
+            .map(Arc::clone)
+    }
+
     /// Whether no backend is compiled in.
     ///
     /// True on a default build: both vendor backends are behind cargo features, so

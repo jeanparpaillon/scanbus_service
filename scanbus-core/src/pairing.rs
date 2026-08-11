@@ -107,6 +107,45 @@ pub trait PairingStore: Send + Sync {
     ) -> Result<(), PairingStoreError> {
         Ok(())
     }
+
+    /// Records whether a paired scanner has a listener running — the `Connected` half
+    /// of what [`4.2`] restores.
+    ///
+    /// Default no-op for the same reason as [`PairingStore::save_default_profile`]: a
+    /// store that does not implement restoration keeps working, it simply has nothing
+    /// for [`PairingStore::restorable`] to report back.
+    ///
+    /// [`4.2`]: https://github.com/jeanparpaillon/scanbus_service/issues/17
+    async fn save_connected(
+        &self,
+        _scanner_id: &ScannerId,
+        _connected: bool,
+    ) -> Result<(), PairingStoreError> {
+        Ok(())
+    }
+
+    /// Every paired scanner this store knows of, for the restore path at startup
+    /// ([`4.2`]).
+    ///
+    /// Default empty, matching the other defaults: a store with nothing durable behind
+    /// it restores nothing, rather than the daemon failing to start.
+    ///
+    /// [`4.2`]: https://github.com/jeanparpaillon/scanbus_service/issues/17
+    async fn restorable(&self) -> Result<Vec<Restorable>, PairingStoreError> {
+        Ok(Vec::new())
+    }
+}
+
+/// One paired scanner, as the restore path at startup ([`4.2`]) needs it: enough to
+/// re-publish the object and decide whether to restart its listener.
+///
+/// [`4.2`]: https://github.com/jeanparpaillon/scanbus_service/issues/17
+#[derive(Debug, Clone, PartialEq)]
+pub struct Restorable {
+    /// The scanner, as it was last known.
+    pub scanner: ScannerInfo,
+    /// Whether a listener was running for it when the daemon last recorded `Connected`.
+    pub connected: bool,
 }
 
 /// A [`PairingStore::save_paired`] failure.

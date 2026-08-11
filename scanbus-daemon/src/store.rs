@@ -15,7 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use scanbus_core::{
-    ButtonInfo, PairingStore, PairingStoreError, ProfileKind, ScannerId, ScannerInfo,
+    ButtonInfo, PairingStore, PairingStoreError, ProfileKind, Restorable, ScannerId, ScannerInfo,
 };
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
@@ -63,6 +63,20 @@ impl PairingStore for MemoryPairingStore {
         }
         Ok(())
     }
+
+    async fn restorable(&self) -> Result<Vec<Restorable>, PairingStoreError> {
+        Ok(self
+            .lock()
+            .values()
+            .cloned()
+            .map(|scanner| Restorable {
+                scanner,
+                // No `Connected` tracking in the ephemeral store: tests that need it use
+                // `JsonPairingStore`.
+                connected: false,
+            })
+            .collect())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,6 +84,12 @@ struct PersistedScanner {
     scanner: ScannerInfo,
     default_profile: Option<ProfileKind>,
     buttons: BTreeMap<u32, ButtonInfo>,
+    /// Whether a listener was running for this scanner — the restore path (4.2) reads
+    /// this to decide whether to call `start_listening` again. Defaulted for stores
+    /// written before this field existed: a scanner such a file names was not
+    /// necessarily connected, and "not connected" is the safe reading.
+    #[serde(default)]
+    connected: bool,
 }
 
 impl PersistedScanner {
@@ -78,6 +98,7 @@ impl PersistedScanner {
             scanner,
             default_profile: None,
             buttons: BTreeMap::new(),
+            connected: false,
         }
     }
 }
@@ -184,6 +205,35 @@ impl PairingStore for JsonPairingStore {
             debug!(id = %scanner_id, index = button.index, "skipping button persistence for unpaired scanner");
         }
         Ok(())
+    }
+
+    async fn save_connected(
+        &self,
+        scanner_id: &ScannerId,
+        connected: bool,
+    ) -> Result<(), PairingStoreError> {
+        let mut state = self.lock();
+        if let Some(scanner) = state.scanners.get_mut(scanner_id) {
+            if scanner.connected != connected {
+                scanner.connected = connected;
+                self.flush_locked(&state)?;
+            }
+        } else {
+            debug!(id = %scanner_id, "skipping Connected persistence for unpaired scanner");
+        }
+        Ok(())
+    }
+
+    async fn restorable(&self) -> Result<Vec<Restorable>, PairingStoreError> {
+        Ok(self
+            .lock()
+            .scanners
+            .values()
+            .map(|entry| Restorable {
+                scanner: entry.scanner.clone(),
+                connected: entry.connected,
+            })
+            .collect())
     }
 }
 

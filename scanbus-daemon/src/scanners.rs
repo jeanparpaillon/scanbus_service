@@ -67,16 +67,17 @@
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use scanbus_core::{
-    ButtonInfo, PairingMachine, PairingStore, ProfileKind, ScannerBackend, ScannerId,
-    ScannerInfo, Status,
+    ButtonInfo, PairingMachine, PairingStore, ProfileKind, Restorable, ScannerBackend,
+    ScannerId, ScannerInfo, Status,
 };
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, instrument, warn};
 
-use crate::backends::RankedBackend;
+use crate::backends::{Backends, RankedBackend};
 use crate::dbus::button::Button1;
 use crate::dbus::scanner::{self, Scanner1};
 use crate::dbus::{ObjectRegistry, path};
@@ -348,6 +349,97 @@ impl ScannerRegistry {
             true,
         )
         .await
+    }
+
+    /// Restores every persisted scanner before `org.scanbus` is requested (4.2).
+    ///
+    /// For each entry the store reports: publish its object (as
+    /// [`register_persistent`](Self::register_persistent) does), then, if it was
+    /// `Connected` when the daemon last recorded it, restart its listener through
+    /// [`ensure_listening`](Self::ensure_listening) — the same call `Connect()` uses, so
+    /// this is not a parallel path with its own bugs.
+    ///
+    /// Bounded per scanner by `per_scanner_timeout`, so one scanner whose backend hangs
+    /// on `start_listening` — the switched-off case is exactly this, for a backend that
+    /// blocks instead of erroring — cannot stall every scanner behind it, and cannot
+    /// delay `org.scanbus` appearing on the bus at all: a scanner that times out is
+    /// published anyway, with `Status="offline"` and `Connected=false`, left for the
+    /// reconnect backoff ([`crate::listeners`]) to pick up once it comes back.
+    ///
+    /// A persisted scanner naming a backend this binary was not built with is logged and
+    /// skipped: there is no [`ScannerBackend`] to hand its object, so there is nothing to
+    /// publish for it.
+    #[instrument(level = "info", skip_all)]
+    pub async fn restore(&self, backends: &Backends, per_scanner_timeout: Duration) {
+        let entries = match self.store.restorable().await {
+            Ok(entries) => entries,
+            Err(error) => {
+                warn!(%error, "could not read the pairing store; starting with no restored scanner");
+                return;
+            }
+        };
+
+        for entry in entries {
+            self.restore_one(backends, entry, per_scanner_timeout).await;
+        }
+    }
+
+    /// One scanner's share of [`Self::restore`].
+    async fn restore_one(&self, backends: &Backends, entry: Restorable, timeout: Duration) {
+        let id = entry.scanner.id.clone();
+
+        let Some(backend) = backends.get(&entry.scanner.backend) else {
+            warn!(
+                %id,
+                backend = %entry.scanner.backend,
+                "restored scanner names a backend this daemon was not built with; skipping"
+            );
+            return;
+        };
+
+        if let Err(error) = self
+            .register_persistent(Arc::clone(&backend), entry.scanner.clone())
+            .await
+        {
+            warn!(%id, %error, "could not publish a restored scanner");
+            return;
+        }
+
+        if !entry.connected {
+            info!(%id, "restored: was not connected, listener left stopped");
+            return;
+        }
+
+        match tokio::time::timeout(timeout, self.ensure_listening(&id)).await {
+            Ok(Ok(())) => info!(%id, "restored: listening for button presses"),
+            Ok(Err(error)) => {
+                self.mark_restore_offline(&id).await;
+                warn!(%id, %error, "restored offline: the backend refused to listen");
+            }
+            Err(_) => {
+                self.mark_restore_offline(&id).await;
+                warn!(
+                    %id,
+                    timeout = ?timeout,
+                    "restored offline: the backend did not respond in time"
+                );
+            }
+        }
+    }
+
+    /// Moves a restored scanner to `Status="offline"` and announces `Connected=false`,
+    /// without touching its pairing — the §9 rule [`mark_unseen_offline`] applies at
+    /// startup instead of at the next probe round.
+    ///
+    /// [`mark_unseen_offline`]: Self::mark_unseen_offline
+    async fn mark_restore_offline(&self, id: &ScannerId) {
+        {
+            let mut state = self.state.lock().await;
+            if let Some(entry) = state.entries.get_mut(id) {
+                set_status(&self.objects, entry, Status::Offline).await;
+            }
+        }
+        self.announce_connected(id, false).await;
     }
 
     /// Records that a pairing succeeded, so the object stops belonging to the session.
@@ -707,7 +799,8 @@ impl ScannerRegistry {
         }
     }
 
-    /// Writes `Connected` on a scanner's object, if it still has one.
+    /// Writes `Connected` on a scanner's object, if it still has one, and persists it —
+    /// what the restore path (4.2) reads back to decide whether to listen again.
     ///
     /// Best effort by design: the listener task is the truth, and an object that has gone
     /// away between the task starting and this call has no client left to tell.
@@ -721,6 +814,10 @@ impl ScannerRegistry {
                 }
             }
             Err(error) => debug!(%id, %error, "no object to announce Connected on"),
+        }
+
+        if let Err(error) = self.store.save_connected(id, connected).await {
+            warn!(%id, %error, "could not persist Connected");
         }
     }
 
