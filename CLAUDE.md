@@ -92,7 +92,7 @@ When working an issue, ask user whether to work on main checkout or a dedicated
 branch *and* a git worktree for it. If dedicated branch :
 
 ```sh
-git worktree add ../marmoos_os-<issue>-<topic> -b <issue>-<topic> origin/master
+git worktree add .worktrees/<issue>-<topic> -b <issue>-<topic> origin/master
 ```
 
 The branch name starts with the **issue number**, then a short kebab-case name
