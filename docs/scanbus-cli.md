@@ -84,7 +84,8 @@ scanbus [GLOBAL] <command> [ARGS]
   scan <scanner> [--profile P]           host-driven scan (API §3, optional method — see §11)
        [--option k=v]… [--no-wait]
   button list <scanner>
-  button set <scanner> <button>          --profile P | --label S | --option k=v
+  button set <scanner> <button>          [--profile P] [--label S] [--option k=v]
+       [--option-json k=json]…           at least one of the four is required
   button clear <scanner> <button>
   job list [--scanner S]
   job show <job>
@@ -125,6 +126,10 @@ timeout is not a conflict, because `--for` bounds the session and `--timeout` bo
   as the method call returns, which is what the API itself does.
 - **`unpair`** prompts when stdout is a TTY; `--yes` skips the prompt. It is the one command
   that destroys persisted state ([4.1](todo/4_1.md)).
+- **`button set`** checks locally before writing where that is cheaper and clearer than a daemon
+  refusal: `--label` is refused when `LabelConfigurable=false`, `--profile` is checked against
+  `GetProfileTypes`, `true`/`false` and bare integers in `--option k=v` are typed, and
+  `--option-json` is the escape hatch when that guess would be wrong.
 - **`monitor`** prints `InterfacesAdded`/`InterfacesRemoved`/`PropertiesChanged` under
   `/org/scanbus` in a readable form. This is `dbus-monitor` with the variants decoded, and it is
   what an acceptance criterion in another workstream should reference instead of grepping raw
@@ -145,13 +150,20 @@ done         paired
 
 $ scanbus connect MFC-L2710DW --profile document
 $ scanbus button list MFC-L2710DW
-IDX  DEVICE LABEL      CONFIGURABLE  PROFILE   OPTIONS
-0    Scan to File      no            document  dir=~/Documents/Scans
-1    Scan to Image     no            image     -
-2    Scan to OCR       no            -         -
-3    Scan to E-mail    no            -         -
+IDX  DEVICE LABEL      CONFIGURABLE  LABEL            PROFILE   OPTIONS
+0    Scan to File      no            Scan to File     document  dir=~/Documents/Scans
+1    Scan to Image     no            Scan to Image    image     -
+2    Scan to OCR       no            Scan to OCR      -         -
+3    Scan to E-mail    no            Scan to E-mail   -         -
 
 $ scanbus button set MFC-L2710DW 2 --profile document --option dir=~/Documents/Contracts
+index         2
+device label  Scan to OCR
+configurable  no
+label         Scan to OCR
+profile       document
+options       dir=/home/jean/Documents/Contracts
+note  device label "Scan to OCR" still points at ocr, while this host will run document
 
 $ scanbus job watch --until-done
 job 4f2a  scanner=brother_net_192_168_1_23 button=2 profile=document  receiving  pages=1

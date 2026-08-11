@@ -22,6 +22,7 @@
 
 pub mod status;
 
+mod button;
 mod connect;
 mod discover;
 mod job;
@@ -71,10 +72,37 @@ pub async fn dispatch(context: &Context, command: &Command) -> Result<u8> {
             options,
             no_wait,
         } => connect::scan(context, scanner, profile, options, *no_wait).await,
+        Command::Button { command } => match command {
+            ButtonCommand::List { scanner } => button::list(context, scanner).await,
+            ButtonCommand::Set {
+                scanner,
+                button,
+                profile,
+                label,
+                options,
+                option_json,
+            } => {
+                button::set(
+                    context,
+                    scanner,
+                    button,
+                    profile,
+                    label,
+                    options,
+                    option_json,
+                )
+                .await
+            }
+            ButtonCommand::Clear { scanner, button } => {
+                button::clear(context, scanner, button).await
+            }
+        },
         Command::Job { command } => match command {
             JobCommand::List { filter } => job::list(context, filter).await,
             JobCommand::Show { job } => job::show(context, job).await,
-            JobCommand::Watch { filter, until_done } => job::watch(context, filter, *until_done).await,
+            JobCommand::Watch { filter, until_done } => {
+                job::watch(context, filter, *until_done).await
+            }
         },
         Command::Monitor { path } => monitor::run(context, path.as_deref()).await,
         pending => stub(context, pending).await,
@@ -117,12 +145,6 @@ async fn resolve(context: &Context, connection: &Connection, command: &Command) 
         Selectors::Scanner(argument) => {
             scanner(&objects, argument)?;
         }
-        Selectors::ScannerAndButton(argument, selector) => {
-            let scanner = scanner(&objects, argument)?;
-            objects
-                .button(&scanner.id, selector)
-                .map_err(|error| Error::call("finding the button", error.into()))?;
-        }
         Selectors::Job(selector) => {
             objects
                 .job(selector)
@@ -149,8 +171,6 @@ fn scanner<'a>(objects: &'a Objects, argument: &ScannerArg) -> Result<&'a Scanne
 enum Selectors<'a> {
     /// One scanner.
     Scanner(&'a ScannerArg),
-    /// A scanner, and one of its buttons.
-    ScannerAndButton(&'a ScannerArg, &'a str),
     /// One job, which names its scanner through its path.
     Job(&'a str),
     /// The optional `--scanner` of a `job` listing.
@@ -172,15 +192,7 @@ fn selectors(command: &Command) -> Option<Selectors<'_>> {
         | Command::Disconnect { scanner }
         | Command::Scan { scanner, .. } => Some(Selectors::Scanner(scanner)),
 
-        Command::Button { command } => Some(match command {
-            ButtonCommand::List { scanner } => Selectors::Scanner(scanner),
-            ButtonCommand::Set {
-                scanner, button, ..
-            }
-            | ButtonCommand::Clear { scanner, button } => {
-                Selectors::ScannerAndButton(scanner, button)
-            }
-        }),
+        Command::Button { .. } => None,
 
         Command::Job { command } => match command {
             JobCommand::Show { job } => Some(Selectors::Job(job)),
@@ -307,7 +319,6 @@ mod tests {
             let command = command(&args);
             let named = selectors(&command).map(|selectors| match selectors {
                 Selectors::Scanner(_) => "scanner",
-                Selectors::ScannerAndButton(..) => "scanner+button",
                 Selectors::Job(_) => "job",
                 Selectors::ScannerFilter(..) => "filter",
             });
