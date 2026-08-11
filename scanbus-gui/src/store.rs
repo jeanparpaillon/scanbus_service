@@ -40,6 +40,15 @@ pub enum ServiceState {
     Absent,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DiscoveryState {
+    #[default]
+    Idle,
+    Starting,
+    Active,
+    Stopping,
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Store {
     pub service: ServiceState,
