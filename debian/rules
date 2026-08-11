@@ -1,34 +1,58 @@
 #!/usr/bin/make -f
 
 PACKAGE_NAME := scanbus
+FRONTEND_PACKAGE := scanbus-frontend
+BACKEND_PACKAGE := scanbus-backend
+CARGO_ENV := release
 VERSION := $(shell sed -n '/^\[workspace\.package\]/,/^\[/{s/^version = "\(.*\)"/\1/p}' Cargo.toml | head -n 1)
 DEB_ARCH := $(shell dpkg-architecture -qDEB_HOST_ARCH)
-DEB_STAGE_DIR := target/debian/$(PACKAGE_NAME)/$(PACKAGE_NAME)_$(VERSION)_$(DEB_ARCH)
-DEB_ROOT := $(DEB_STAGE_DIR)/pkg
-DEB_OUTPUT := $(DEB_STAGE_DIR)/$(PACKAGE_NAME)_$(VERSION)_$(DEB_ARCH).deb
-SUBSTVARS := $(DEB_STAGE_DIR)/substvars
+DEB_STAGE_DIR := target/debian/$(PACKAGE_NAME)
+FRONTEND_STAGE_DIR := $(DEB_STAGE_DIR)/$(FRONTEND_PACKAGE)_$(VERSION)_$(DEB_ARCH)
+BACKEND_STAGE_DIR := $(DEB_STAGE_DIR)/$(BACKEND_PACKAGE)_$(VERSION)_$(DEB_ARCH)
+META_STAGE_DIR := $(DEB_STAGE_DIR)/$(PACKAGE_NAME)_$(VERSION)_all
+FRONTEND_ROOT := $(FRONTEND_STAGE_DIR)/pkg
+BACKEND_ROOT := $(BACKEND_STAGE_DIR)/pkg
+META_ROOT := $(META_STAGE_DIR)/pkg
+FRONTEND_OUTPUT := $(FRONTEND_STAGE_DIR)/$(FRONTEND_PACKAGE)_$(VERSION)_$(DEB_ARCH).deb
+BACKEND_OUTPUT := $(BACKEND_STAGE_DIR)/$(BACKEND_PACKAGE)_$(VERSION)_$(DEB_ARCH).deb
+META_OUTPUT := $(META_STAGE_DIR)/$(PACKAGE_NAME)_$(VERSION)_all.deb
+FRONTEND_SUBSTVARS := $(FRONTEND_STAGE_DIR)/substvars
+BACKEND_SUBSTVARS := $(BACKEND_STAGE_DIR)/substvars
+META_SUBSTVARS := $(META_STAGE_DIR)/substvars
 
 .PHONY: build build-arch build-indep binary binary-arch binary-indep clean install control
 
 build build-arch:
-	$(MAKE) CARGO_ENV=release release
+	$(MAKE) release
 
 build-indep:
 
 install: build
 	rm -rf $(DEB_STAGE_DIR)
-	mkdir -p $(DEB_ROOT)/DEBIAN
-	$(MAKE) CARGO_ENV=release install DESTDIR=$(abspath $(DEB_ROOT))
+	mkdir -p $(FRONTEND_ROOT)/DEBIAN $(BACKEND_ROOT)/DEBIAN $(META_ROOT)/DEBIAN
+	$(MAKE) install-frontend DESTDIR=$(abspath $(FRONTEND_ROOT))
+	$(MAKE) install-backend install-services DESTDIR=$(abspath $(BACKEND_ROOT))
+	install -D -m 0755 debian/postinst "$(BACKEND_ROOT)/DEBIAN/postinst"
 
 control: install
-	dpkg-shlibdeps -T$(SUBSTVARS) $(DEB_ROOT)/usr/bin/scanbus $(DEB_ROOT)/usr/bin/scanbus-daemon
-	dpkg-gencontrol -p$(PACKAGE_NAME) -P$(DEB_ROOT) -fdebian/control -T$(SUBSTVARS) -v$(VERSION)
+	dpkg-shlibdeps -T$(FRONTEND_SUBSTVARS) -p$(FRONTEND_PACKAGE) $(FRONTEND_ROOT)/usr/bin/scanbus-gui
+	dpkg-shlibdeps -T$(BACKEND_SUBSTVARS) -p$(BACKEND_PACKAGE) \
+		$(BACKEND_ROOT)/usr/bin/scanbus \
+		$(BACKEND_ROOT)/usr/bin/scanbus-daemon
+	dpkg-gencontrol -p$(FRONTEND_PACKAGE) -P$(FRONTEND_ROOT) -fdebian/control -T$(FRONTEND_SUBSTVARS) -v$(VERSION)
+	dpkg-gencontrol -p$(BACKEND_PACKAGE) -P$(BACKEND_ROOT) -fdebian/control -T$(BACKEND_SUBSTVARS) -v$(VERSION)
+	dpkg-gencontrol -p$(PACKAGE_NAME) -P$(META_ROOT) -fdebian/control -T$(META_SUBSTVARS) -v$(VERSION)
 
-binary binary-arch: control
-	dpkg-deb --root-owner-group --build $(DEB_ROOT) $(DEB_OUTPUT)
-	@printf '%s\n' "$(DEB_OUTPUT)"
+binary: binary-arch binary-indep
 
-binary-indep:
+binary-arch: control
+	dpkg-deb --root-owner-group --build $(FRONTEND_ROOT) $(FRONTEND_OUTPUT)
+	dpkg-deb --root-owner-group --build $(BACKEND_ROOT) $(BACKEND_OUTPUT)
+	@printf '%s\n' "$(FRONTEND_OUTPUT)" "$(BACKEND_OUTPUT)"
+
+binary-indep: control
+	dpkg-deb --root-owner-group --build $(META_ROOT) $(META_OUTPUT)
+	@printf '%s\n' "$(META_OUTPUT)"
 
 clean:
 	$(MAKE) clean

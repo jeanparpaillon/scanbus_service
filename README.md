@@ -98,11 +98,11 @@ make deb
 ```
 
 `make deb` drives the packaged build through `debian/rules`: `make release`
-builds `scanbus` and `scanbus-daemon`, `make install DESTDIR=...` stages the package
-layout under `target/debian/`, `dpkg-shlibdeps`/`dpkg-gencontrol` derive the binary's
-shared-library dependencies from `debian/control`, and `dpkg-deb` emits
-`scanbus_<version>_<arch>.deb`. It intentionally does **not** enable `scanbus.service`;
-that remains a per-user action:
+builds `scanbus`, `scanbus-daemon`, and `scanbus-gui`; the staged install is then split
+under `target/debian/` into `scanbus-frontend`, `scanbus-backend`, and the `scanbus`
+metapackage. `dpkg-shlibdeps`/`dpkg-gencontrol` derive the package dependencies from
+`debian/control`, and `dpkg-deb` emits three `.deb` files. It intentionally does **not**
+enable `scanbus.service`; that remains a per-user action:
 
 ```sh
 systemctl --user enable --now scanbus.service

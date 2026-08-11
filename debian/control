@@ -9,6 +9,19 @@ Build-Depends: cargo,
 Standards-Version: 4.7.0
 
 Package: scanbus
+Architecture: all
+Depends: scanbus-frontend (= ${binary:Version}),
+ scanbus-backend (= ${binary:Version})
+Description: metapackage for the scanbus frontend and backend
+ Installs both the GTK frontend and the backend components for scanbus.
+
+Package: scanbus-frontend
+Architecture: any
+Depends: ${shlibs:Depends}
+Description: GTK frontend for scanbus
+ The graphical scanbus application for browsing scanners and launching scans.
+
+Package: scanbus-backend
 Architecture: any
 Depends: ${shlibs:Depends}, sane-utils
 Description: scanbus D-Bus service and command-line client
