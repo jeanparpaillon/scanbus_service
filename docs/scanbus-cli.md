@@ -72,6 +72,7 @@ will be to share a helper from the daemon's registry; the answer is to move that
 scanbus [GLOBAL] <command> [ARGS]
 
   completions <shell>                    emit a shell completion script on stdout
+  manpage                                emit the `scanbus(1)` man page on stdout
   status                                 daemon presence, version, backends, profile types
   list [--paired|--unpaired]             scanners the daemon knows about right now
   show <scanner>                         every Scanner1 property, plus its buttons
@@ -117,6 +118,8 @@ timeout is not a conflict, because `--for` bounds the session and `--timeout` bo
   `activatable`/`running`/`absent` and exits 0 for the first two. Everything else exits 3.
 - **`completions`** is local output only: it prints the shell script to stdout and never
   touches D-Bus, so it works on a machine with no bus or daemon at all.
+- **`manpage`** is local output too: it renders the `scanbus(1)` document to stdout and
+  never touches D-Bus, so packaging can generate it offline from the binary itself.
 - **`list`** reads `GetManagedObjects` and prints what exists *now*. It never starts discovery —
   a freshly started daemon that has restored two paired scanners lists two scanners, and that is
   the honest answer. `discover` is the command that goes looking.

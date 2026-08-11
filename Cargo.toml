@@ -51,6 +51,7 @@ clap = { version = "4", default-features = false, features = [
     "wrap_help",
 ] }
 clap_complete = "4"
+clap_mangen = "0.2"
 futures-core = "0.3"
 if-addrs = "0.13"
 mdns-sd = "0.13"

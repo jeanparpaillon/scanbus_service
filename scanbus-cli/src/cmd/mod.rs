@@ -29,6 +29,7 @@ mod discover;
 mod job;
 mod job_follow;
 mod list;
+mod manpage;
 mod monitor;
 mod options;
 mod pair;
@@ -60,6 +61,7 @@ use crate::error::{Error, Result};
 pub async fn dispatch(context: &Context, command: &Command) -> Result<u8> {
     match command {
         Command::Completions { shell } => completions::run(*shell),
+        Command::Manpage => manpage::run(),
         Command::Status => status::run(context).await,
         Command::List { paired, unpaired } => list::run(context, *paired, *unpaired).await,
         Command::Show { scanner } => show::run(context, scanner).await,
@@ -240,6 +242,7 @@ fn selectors(command: &Command) -> Option<Selectors<'_>> {
         // path prefix rather than a selector — a prefix that matches nothing is an empty
         // stream, not a failed lookup.
         Command::Completions { .. }
+        | Command::Manpage
         | Command::Status
         | Command::List { .. }
         | Command::Discover { .. }
@@ -259,6 +262,7 @@ const fn pending(command: &Command) -> (&'static str, &'static str) {
         // `completions` is implemented; the arm exists so new commands still have to say
         // whether they are implemented or stubs.
         Command::Completions { .. } => ("completions", "8.11"),
+        Command::Manpage => ("manpage", "8.11"),
         // 8.2 owns `status`, which is implemented; the arm exists so that adding a
         // command to `Command` is a compile error here rather than a silent fallthrough.
         Command::Status => ("status", "8.2"),
@@ -363,6 +367,7 @@ mod tests {
             ),
             // No selector: nothing to resolve, and nothing to fail on.
             (vec!["scanbus", "completions", "bash"], None),
+            (vec!["scanbus", "manpage"], None),
             (vec!["scanbus", "list"], None),
             (vec!["scanbus", "discover"], None),
             (vec!["scanbus", "job", "list"], None),
