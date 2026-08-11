@@ -891,6 +891,10 @@ impl Drop for MobileBackend {
         if Arc::strong_count(&self.listener_task) != 1 {
             return;
         }
+        self.listener
+            .lock()
+            .expect("mobile listener lock poisoned")
+            .listener = None;
         if let Some(task) = self
             .listener_task
             .lock()
@@ -2579,27 +2583,27 @@ mod tests {
     async fn an_occupied_persisted_port_leaves_paired_phones_offline_and_the_port_unchanged() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("devices.json");
-        let phone = FakePhone::listen(Answer::Accept {
-            device_id: DEVICE_ID,
-        })
-        .await;
-        let backend = MobileBackend::with_store_path(path.clone(), DISCOVERY_TIMEOUT, 0)
-            .with_pairing_timeouts(Duration::from_millis(200), Duration::from_millis(200));
-        backend.remember(vec![(
-            scanner_id(),
-            DiscoveryRecord {
-                device_id: DEVICE_ID.to_owned(),
-                address: phone.address,
-                seen_at: Instant::now(),
-            },
-        )]);
-        pair_with(&backend).await.0.unwrap();
-        let port = backend.upload_port();
-        drop(backend);
-
-        let blocker = std::net::TcpListener::bind((std::net::Ipv6Addr::UNSPECIFIED, port))
-            .or_else(|_| std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port)))
+        let blocker = std::net::TcpListener::bind((std::net::Ipv6Addr::UNSPECIFIED, 0))
+            .or_else(|_| std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)))
             .unwrap();
+        let port = blocker.local_addr().unwrap().port();
+        persist_device_store(
+            &path,
+            &PersistedDeviceStore {
+                version: DEVICE_STORE_VERSION,
+                upload_port: port,
+                devices: BTreeMap::from([(
+                    scanner_id(),
+                    PersistedDevice {
+                        device_id: DEVICE_ID.to_owned(),
+                        token_sha256: hash_token("phone-token"),
+                        profiles: vec![ProfileKind::Image],
+                        paired_at: unix_timestamp_now(),
+                    },
+                )]),
+            },
+        )
+        .unwrap();
 
         let backend = MobileBackend::with_store_path(path.clone(), DISCOVERY_TIMEOUT, 0);
         assert_eq!(backend.upload_port(), port);

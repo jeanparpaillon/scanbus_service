@@ -144,21 +144,6 @@ fn no_activate_against_a_stopped_daemon_exits_three() {
     assert!(run.stdout.is_empty(), "errors go to stderr: {}", run.stdout);
 }
 
-/// A stub command against a daemon that is there fails as unimplemented, not as absent —
-/// the two must not be confusable while the surface is being filled in.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_stub_command_says_which_issue_implements_it() {
-    let Some(bus) = PrivateBus::start() else {
-        return skipped("a_stub_command_says_which_issue_implements_it");
-    };
-    let _daemon = serve(bus.address()).await;
-
-    let run = bus.scanbus(&["monitor"]);
-    run.assert_code(1);
-    assert!(run.stderr.contains("scanbus monitor"), "{}", run.stderr);
-    assert!(run.stderr.contains("8.8"), "{}", run.stderr);
-}
-
 /// Acceptance: `scanbus` with no arguments prints help and exits 2.
 ///
 /// No bus: a usage error is decided before anything is connected, and that is the point

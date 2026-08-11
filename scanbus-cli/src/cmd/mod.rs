@@ -325,7 +325,6 @@ mod tests {
                 ("button set", "8.9"),
             ),
             (vec!["scanbus", "profile", "list"], ("profile list", "8.10")),
-            (vec!["scanbus", "monitor"], ("monitor", "8.8")),
         ] {
             assert_eq!(pending(&command(&args)), expected, "{args:?}");
         }
