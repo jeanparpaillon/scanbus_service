@@ -21,10 +21,14 @@ path = "src/main.rs"
 scanbus-client.workspace = true
 clap = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+# `discover` streams `InterfacesAdded` while also racing a timeout and `SIGINT`
+# (scanbus-cli.md §7, §9); `now_or_never` is the raceless-snapshot pattern
+# scanbus-client's own `PropertyWatch` documents, applied here to the object tree.
+futures-util.workspace = true
 # `rt` and not `rt-multi-thread`: this process makes a handful of D-Bus calls and exits,
 # so a thread pool would be startup cost with nothing to run on it (8.2). `time` is what
-# `--timeout` is made of.
-tokio = { workspace = true, features = ["macros", "rt", "time"] }
+# `--timeout` and `discover --for` are made of, and `signal` is `discover`'s `SIGINT`.
+tokio = { workspace = true, features = ["macros", "rt", "time", "signal"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
@@ -34,6 +38,9 @@ tracing-subscriber.workspace = true
 # depend on `scanbus-daemon` and the direction of scanbus-cli.md §2 holds for the tests
 # too. The full-daemon end of it is 8.11.
 zbus.workspace = true
+# Test fixtures build a `ScannerState` from scratch, which needs the model types it is
+# made of — the same exception the line above makes for `zbus` itself.
+scanbus-core.workspace = true
 # `rt-multi-thread` for the tests that own `org.scanbus` while the CLI runs as a
 # subprocess: the stand-in has to keep answering the bus while the test thread blocks on
 # the child, which a current-thread runtime cannot do.

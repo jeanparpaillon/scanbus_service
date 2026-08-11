@@ -1,12 +1,15 @@
 //! One module per command group, and the dispatch that stands between them and `main`.
 //!
-//! Everything but [`status`] is a stub at this point, and the stubs are not empty: they
-//! **open the connection first**, then **resolve whatever selectors the command carries**,
-//! and only then fail. That order is the whole of what the finished commands must keep —
-//! `scanbus --no-activate list` against a stopped daemon has to exit 3 because the daemon
-//! is stopped, and `scanbus show nosuch` has to exit 4 because nothing is called `nosuch`,
-//! neither of them exit 1 because the command is unfinished. A stub that failed earlier
-//! would let both regress unnoticed until the issue that finishes the command lands.
+//! [`status`] ([8.2](https://github.com/jeanparpaillon/scanbus_service/issues/29)) and
+//! `list`/`show`/`discover` ([8.5](https://github.com/jeanparpaillon/scanbus_service/issues/32),
+//! in [`list`], [`show`], [`discover`]) are implemented. Everything else is still a stub,
+//! and the stubs are not empty: they **open the connection first**, then **resolve
+//! whatever selectors the command carries**, and only then fail. That order is the whole
+//! of what the finished commands must keep — `scanbus --no-activate pair MFC` against a
+//! stopped daemon has to exit 3 because the daemon is stopped, and `scanbus connect
+//! nosuch` has to exit 4 because nothing is called `nosuch`, neither of them exit 1
+//! because the command is unfinished. A stub that failed earlier would let both regress
+//! unnoticed until the issue that finishes the command lands.
 //!
 //! Resolving in the stub is also what makes §5 observable end to end today: the selector
 //! table itself is unit-tested in `scanbus-client` without a bus, and the exit code, the
@@ -18,6 +21,11 @@
 //! precisely the case it exists to report.
 
 pub mod status;
+
+mod discover;
+mod list;
+mod scanner_view;
+mod show;
 
 use scanbus_client::{Connection, Match, Objects, Scanner};
 
@@ -39,6 +47,14 @@ use crate::error::{Error, Result};
 pub async fn dispatch(context: &Context, command: &Command) -> Result<u8> {
     match command {
         Command::Status => status::run(context).await,
+        Command::List { paired, unpaired } => list::run(context, *paired, *unpaired).await,
+        Command::Show { scanner } => show::run(context, scanner).await,
+        Command::Discover {
+            backends,
+            duration,
+            watch,
+            keep,
+        } => discover::run(context, backends, *duration, *watch, *keep).await,
         pending => stub(context, pending).await,
     }
 }

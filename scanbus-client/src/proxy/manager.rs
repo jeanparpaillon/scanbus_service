@@ -47,3 +47,22 @@ pub trait Manager1 {
     /// §6 offers two that fail at scan time.
     fn get_profile_types(&self) -> zbus::Result<Vec<String>>;
 }
+
+/// The `filters` argument of [`Manager1Proxy::start_discovery`] for a `--backend` list.
+///
+/// Empty for no restriction — §2's "probe through every active backend" — so this is
+/// also what a `discover` with no `--backend` passes. Written here rather than in the
+/// CLI so that `scanbus-cli` never has to name `zbus::zvariant::OwnedValue` itself
+/// ([`scanbus-cli.md`] §2: its manifest is `scanbus-client`, `clap`, `tokio`,
+/// `serde_json`, nothing that talks to a bus directly).
+///
+/// [`scanbus-cli.md`]: https://github.com/jeanparpaillon/scanbus_service/blob/master/docs/scanbus-cli.md
+pub fn backend_filters(backends: &[String]) -> HashMap<String, OwnedValue> {
+    if backends.is_empty() {
+        return HashMap::new();
+    }
+
+    let value = OwnedValue::try_from(zbus::zvariant::Value::from(backends.to_vec()))
+        .expect("a Vec<String> always converts to a variant");
+    HashMap::from([("backends".to_owned(), value)])
+}

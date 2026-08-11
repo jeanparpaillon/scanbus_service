@@ -484,7 +484,9 @@ name = "scanbus-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "futures-util",
  "scanbus-client",
+ "scanbus-core",
  "serde_json",
  "tokio",
  "tracing",

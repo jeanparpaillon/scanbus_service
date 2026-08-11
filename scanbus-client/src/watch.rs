@@ -29,6 +29,7 @@
 //!
 //! [`scanbus-cli.md`]: https://github.com/jeanparpaillon/scanbus_service/blob/master/docs/scanbus-cli.md
 
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -263,4 +264,80 @@ impl Stream for ScannerStates {
             return Poll::Ready(Some(Ok(next)));
         }
     }
+}
+
+/// `Scanner1` objects announced by `InterfacesAdded` on `/org/scanbus`, decoded.
+///
+/// `discover` ([`scanbus-cli.md`] §7) needs the same raceless shape as one object's
+/// properties — subscribe before `StartDiscovery`, then read `GetManagedObjects` once it
+/// returns — one level up, on the whole tree instead of one path. This is step 1 for
+/// that case: every `InterfacesAdded` reaches a client, buttons and jobs included, and
+/// this filters to the ones carrying a `Scanner1`, the same way [`PropertyChanges`]
+/// filters one interface out of several sharing a path.
+///
+/// Kept out of the CLI on purpose: the alternative is `scanbus-cli` naming
+/// `zbus::fdo::InterfacesAdded` and `zbus::zvariant::OwnedValue` itself, which is the
+/// `zbus` dependency [`scanbus-cli.md`] §2 says stays out of that crate's manifest.
+///
+/// [`scanbus-cli.md`]: https://github.com/jeanparpaillon/scanbus_service/blob/master/docs/scanbus-cli.md
+pub struct ScannerAdditions {
+    stream: zbus::fdo::InterfacesAddedStream,
+}
+
+impl ScannerAdditions {
+    /// Subscribes to every `InterfacesAdded` under `/org/scanbus`. Reads nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Bus`] if the match rule cannot be installed.
+    pub async fn subscribe(connection: &Connection) -> Result<Self> {
+        let manager = crate::proxy::object_manager(connection).await?;
+        let stream = manager.receive_interfaces_added().await?;
+        Ok(Self { stream })
+    }
+}
+
+impl Stream for ScannerAdditions {
+    type Item = Result<ScannerState>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+
+        loop {
+            let signal = match Pin::new(&mut this.stream).poll_next(cx) {
+                Poll::Ready(Some(signal)) => signal,
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
+            };
+
+            let args = match signal.args() {
+                Ok(args) => args,
+                Err(error) => return Poll::Ready(Some(Err(Error::Bus(error)))),
+            };
+
+            let Some(properties) = args.interfaces_and_properties().get(SCANNER_INTERFACE) else {
+                // A button or a job gaining its interface — not ours.
+                continue;
+            };
+
+            let dict = to_dict(properties);
+            return Poll::Ready(Some(ScannerState::from_properties(&dict).map_err(Error::from)));
+        }
+    }
+}
+
+/// Reads one `InterfacesAdded`'s properties into an owned `a{sv}`.
+///
+/// A value that fails to clone — only possible for a file descriptor, which nothing in
+/// this API ever sends — is dropped rather than failing the whole event: a scanner
+/// missing one such key is still a scanner worth reporting, and [`ScannerState`] treats
+/// a missing key exactly like the daemon having omitted it.
+fn to_dict(properties: &HashMap<&str, zbus::zvariant::Value<'_>>) -> Dict {
+    properties
+        .iter()
+        .filter_map(|(key, value)| {
+            let owned = zbus::zvariant::OwnedValue::try_from(value.try_clone().ok()?).ok()?;
+            Some(((*key).to_owned(), owned))
+        })
+        .collect()
 }

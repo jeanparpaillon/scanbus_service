@@ -180,7 +180,7 @@ async fn a_shared_id_prefix_exits_four_and_the_full_id_of_either_works() {
         return skipped("a_shared_id_prefix_exits_four_and_the_full_id_of_either_works");
     };
 
-    let run = bus.scanbus(&["show", "brother"]);
+    let run = bus.scanbus(&["connect", "brother"]);
     run.assert_code(4);
     assert!(run.stderr.contains(BROTHER_23), "{}", run.stderr);
     assert!(run.stderr.contains(BROTHER_24), "{}", run.stderr);
@@ -190,9 +190,9 @@ async fn a_shared_id_prefix_exits_four_and_the_full_id_of_either_works() {
     // Resolved, then unfinished: exit 1 naming the issue is what a *successful*
     // resolution looks like today.
     for full in [BROTHER_23, BROTHER_24] {
-        let run = bus.scanbus(&["show", full]);
+        let run = bus.scanbus(&["connect", full]);
         run.assert_code(1);
-        assert!(run.stderr.contains("8.5"), "{}", run.stderr);
+        assert!(run.stderr.contains("8.7"), "{}", run.stderr);
     }
 }
 
@@ -203,10 +203,10 @@ async fn a_name_substring_resolves_when_unique_and_exits_four_when_not() {
         return skipped("a_name_substring_resolves_when_unique_and_exits_four_when_not");
     };
 
-    bus.scanbus(&["show", "l2710"]).assert_code(1);
-    bus.scanbus(&["show", "officejet"]).assert_code(1);
+    bus.scanbus(&["connect", "l2710"]).assert_code(1);
+    bus.scanbus(&["connect", "officejet"]).assert_code(1);
 
-    let run = bus.scanbus(&["show", "MFC"]);
+    let run = bus.scanbus(&["connect", "MFC"]);
     run.assert_code(4);
     assert!(run.stderr.contains("MFC-L2710DW"), "{}", run.stderr);
     assert!(run.stderr.contains("MFC-J5330DW"), "{}", run.stderr);
@@ -220,17 +220,17 @@ async fn the_id_flag_refuses_a_name_that_would_otherwise_resolve() {
     };
 
     // Unambiguous as a name substring, and still not an id.
-    bus.scanbus(&["show", "l2710"]).assert_code(1);
+    bus.scanbus(&["connect", "l2710"]).assert_code(1);
 
-    let run = bus.scanbus(&["show", "--id", "l2710"]);
+    let run = bus.scanbus(&["connect", "--id", "l2710"]);
     run.assert_code(4);
     assert!(run.stderr.contains("no scanner matches"), "{}", run.stderr);
 
     // A unique id prefix and the object path are refused by `--id` too; the id is not.
-    bus.scanbus(&["show", "--id", "escl_avahi"]).assert_code(4);
-    bus.scanbus(&["show", "--id", &format!("/org/scanbus/scanner/{ESCL}")])
+    bus.scanbus(&["connect", "--id", "escl_avahi"]).assert_code(4);
+    bus.scanbus(&["connect", "--id", &format!("/org/scanbus/scanner/{ESCL}")])
         .assert_code(4);
-    bus.scanbus(&["show", "--id", ESCL]).assert_code(1);
+    bus.scanbus(&["connect", "--id", ESCL]).assert_code(1);
 }
 
 /// A selector matching nothing is exit 4 and lists what does exist — not exit 1, which
@@ -366,9 +366,9 @@ async fn resolution_never_starts_discovery() {
     };
 
     for args in [
-        vec!["show", "l2710"],
-        vec!["show", "MFC"],
-        vec!["show", "epson"],
+        vec!["connect", "l2710"],
+        vec!["connect", "MFC"],
+        vec!["connect", "epson"],
         vec!["pair", BROTHER_23],
         vec!["button", "clear", "l2710", "0"],
         vec!["job", "show", "8"],

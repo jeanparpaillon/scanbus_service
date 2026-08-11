@@ -126,6 +126,80 @@ pub fn json(writer: &mut impl Write, value: &serde_json::Value) -> Result<()> {
     writeln!(writer, "{value}").map_err(Error::write)
 }
 
+/// Writes a column-aligned table: a header, then one row per entry.
+///
+/// §6's shape: no borders, widths computed from the data (the header counts as a row for
+/// this purpose, so a short column is never narrower than its own name), `-` for an
+/// empty cell. Nothing is written for an empty `rows` — the caller decides what a
+/// scanner-less `list` says instead, on stderr, so that `scanbus list | wc -l` still
+/// counts scanners rather than counting a table that prints itself out of nothing.
+///
+/// This is [8.5]'s use of the renderer [8.4] owns; a second table (`job list`, `button
+/// list`) is the same call with different headers, not a second implementation.
+///
+/// # Errors
+///
+/// [`Error::write`] when stdout cannot be written — a closed pipe, in practice.
+///
+/// [8.4]: https://github.com/jeanparpaillon/scanbus_service/issues/31
+/// [8.5]: https://github.com/jeanparpaillon/scanbus_service/issues/32
+pub fn table(
+    writer: &mut impl Write,
+    style: Style,
+    headers: &[&str],
+    rows: &[Vec<String>],
+) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    let widths: Vec<usize> = headers
+        .iter()
+        .enumerate()
+        .map(|(column, header)| {
+            rows.iter()
+                .map(|row| row.get(column).map_or(0, String::len))
+                .max()
+                .unwrap_or(0)
+                .max(header.len())
+        })
+        .collect();
+
+    // Padded — and therefore aligned — before it is bolded: an escape sequence counted
+    // towards a column's width would misalign every row after the first, on exactly the
+    // terminals this table is trying to look good on.
+    let header = pad(headers.iter().copied(), &widths);
+    writeln!(writer, "{}", style.bold(&header)).map_err(Error::write)?;
+
+    for row in rows {
+        let cells = row
+            .iter()
+            .map(|cell| if cell.is_empty() { EMPTY } else { cell.as_str() });
+        writeln!(writer, "{}", pad(cells, &widths)).map_err(Error::write)?;
+    }
+
+    Ok(())
+}
+
+/// One row, two spaces between columns, no trailing padding on the last one — a line
+/// that trails whitespace is invisible until something diffs the output.
+fn pad<'a>(cells: impl Iterator<Item = &'a str>, widths: &[usize]) -> String {
+    let mut line = String::new();
+
+    for (column, cell) in cells.enumerate() {
+        if column > 0 {
+            line.push_str("  ");
+        }
+        line.push_str(cell);
+        if column + 1 < widths.len() {
+            let width = widths.get(column).copied().unwrap_or(0);
+            line.push_str(&" ".repeat(width.saturating_sub(cell.chars().count())));
+        }
+    }
+
+    line
+}
+
 /// Writes a label/value block: labels padded to one column, `-` for an empty value.
 ///
 /// The shape `status` and `show` share, and the reason it is not the table renderer of
@@ -218,5 +292,36 @@ mod tests {
             String::from_utf8(out).unwrap(),
             "{\"daemon\":\"running\"}\n"
         );
+    }
+
+    #[test]
+    fn a_table_aligns_columns_from_the_widest_of_header_or_data() {
+        let mut out = Vec::new();
+        table(
+            &mut out,
+            Style::PLAIN,
+            &["ID", "NAME"],
+            &[
+                vec!["brother_net_192".to_owned(), "MFC".to_owned()],
+                vec!["x".to_owned(), String::new()],
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "ID               NAME\n\
+             brother_net_192  MFC\n\
+             x                -\n"
+        );
+    }
+
+    /// Nothing at all for an empty result — the caller is the one who decides what a
+    /// scanner-less `list` says, and it says it on stderr.
+    #[test]
+    fn an_empty_table_prints_nothing() {
+        let mut out = Vec::new();
+        table(&mut out, Style::PLAIN, &["ID", "NAME"], &[]).unwrap();
+        assert!(out.is_empty());
     }
 }

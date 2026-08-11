@@ -61,7 +61,7 @@ pub use select::{
     Button, Job, Match, ObjectKind, Objects, Scanner, SelectError, resolve_button, resolve_job,
     resolve_scanner,
 };
-pub use watch::{PropertyChanges, PropertyWatch, ScannerStates, ScannerWatch};
+pub use watch::{PropertyChanges, PropertyWatch, ScannerAdditions, ScannerStates, ScannerWatch};
 /// The bus connection every proxy here is built on.
 ///
 /// Re-exported because a consumer has to name it — a `Connection` is what

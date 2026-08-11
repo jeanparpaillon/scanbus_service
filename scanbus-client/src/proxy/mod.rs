@@ -36,7 +36,7 @@ mod scanner;
 
 pub use button::Button1Proxy;
 pub use job::Job1Proxy;
-pub use manager::Manager1Proxy;
+pub use manager::{Manager1Proxy, backend_filters};
 pub use profile::Profile1Proxy;
 pub use scanner::Scanner1Proxy;
 

@@ -17,10 +17,12 @@
 
 use std::collections::HashMap;
 
-use scanbus_core::{Capabilities, PairingState, ProfileKind, ScannerId, Status};
+use scanbus_core::{Capabilities, PairingState, ProfileKind, ScannerId, Status, path};
+use zbus::Connection;
 use zbus::zvariant::Value as ZValue;
 
 use crate::convert::{self, DecodeError, Dict};
+use crate::proxy::SCANNER_INTERFACE;
 
 /// Every property of one `Scanner1` object, in the model's types.
 #[derive(Debug, Clone, PartialEq)]
@@ -50,6 +52,36 @@ pub struct ScannerState {
 }
 
 impl ScannerState {
+    /// Reads this scanner's whole `Scanner1` in one `Properties.GetAll` call.
+    ///
+    /// The one-shot counterpart to [`crate::watch::ScannerWatch`]: for a command that
+    /// only needs a snapshot — `list`, `show`, the initial batch of `discover` — there
+    /// is no call to race against, so the subscribe-then-snapshot dance would be pure
+    /// overhead.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Bus`] if the object is not there — ordinary for an unpaired
+    /// scanner whose discovery session just ended — and [`crate::Error::Decode`] for a
+    /// reply this version cannot make sense of.
+    pub async fn fetch(connection: &Connection, id: &ScannerId) -> crate::error::Result<Self> {
+        let properties = crate::proxy::properties(connection, path::scanner(id)).await?;
+        let interface = zbus::names::InterfaceName::try_from(SCANNER_INTERFACE)
+            .expect("SCANNER_INTERFACE is a valid interface name");
+        let snapshot = properties.get_all(interface).await?;
+        Ok(Self::from_properties(&snapshot)?)
+    }
+
+    /// The object path this scanner is exported at.
+    ///
+    /// Named the same as [`crate::select::Scanner::path`] for the same reason: a
+    /// consumer that only has a [`ScannerState`] — `discover`'s stream, in particular —
+    /// must not need to name [`scanbus_core::ScannerId`] or reach for
+    /// `scanbus_core::path` itself just to report which object changed.
+    pub fn path(&self) -> String {
+        path::scanner(&self.id)
+    }
+
     /// Reads a `Properties.GetAll` reply.
     ///
     /// # Errors
