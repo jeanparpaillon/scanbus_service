@@ -52,20 +52,13 @@
 //! this iteration has — every device it supports reports `false` — and the backend that
 //! reports `true` is the one that adds the seam.
 //!
-//! # An assignment does not yet survive a restart
+//! # Assignment persistence
 //!
-//! The host's half lives in the [`ButtonInfo`] below and nowhere else, so a
-//! `systemctl --user restart` loses it — the same limit
-//! [`MemoryPairingStore`](crate::store::MemoryPairingStore) has for pairings, and for the
-//! same reason: [`PairingStore`](scanbus_core::PairingStore) holds a
-//! [`ScannerInfo`](scanbus_core::ScannerInfo), which is the *backend's* half of a scanner
-//! and deliberately carries no assignments. Giving them a file is [4.1], whose title says
-//! so; what it needs from here is already in place, since [`ButtonInfo`] serialises whole
-//! and is the unit a restore would hand to [`Button1::new`].
-//!
-//! Until then the honest reading of a `Profile` write is that it took effect on the
-//! *device* — the vendor config is rewritten and outlives us — and that the daemon's copy
-//! of it does not.
+//! After a successful write, the host-side assignment is also persisted through
+//! [`PairingStore`](scanbus_core::PairingStore) for paired scanners (4.1): `Label`,
+//! `Profile` and `ProfileOptions` are flushed to the same store that records pairings.
+//! This is in addition to rewriting the vendor configuration, which remains the source of
+//! truth for what the firmware itself will trigger.
 //!
 //! [4.1]: https://github.com/jeanparpaillon/scanbus_service/issues/16
 //! [`scanbus-dbus-api.md`]: https://github.com/jeanparpaillon/scanbus_service/blob/master/docs/scanbus-dbus-api.md
@@ -73,7 +66,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use scanbus_core::{ButtonInfo, ProfileKind, ScannerBackend, ScannerId, Value};
+use scanbus_core::{ButtonInfo, PairingStore, ProfileKind, ScannerBackend, ScannerId, Value};
 use tokio::sync::Mutex;
 use tracing::{debug, info, instrument};
 use zbus::fdo;
@@ -98,6 +91,8 @@ pub struct Button1 {
     /// backend list ranks first: a mapping written into the wrong vendor's config is a
     /// key that does nothing.
     backend: Arc<dyn ScannerBackend>,
+    /// Where host-side assignments are persisted.
+    store: Arc<dyn PairingStore>,
     /// Everything about the key, read-only half included.
     ///
     /// One lock rather than one per property, because a `Profile` write reads
@@ -108,10 +103,16 @@ pub struct Button1 {
 
 impl Button1 {
     /// A key of `scanner`, configured through `backend`.
-    pub fn new(scanner: ScannerId, backend: Arc<dyn ScannerBackend>, info: ButtonInfo) -> Self {
+    pub fn new(
+        scanner: ScannerId,
+        backend: Arc<dyn ScannerBackend>,
+        store: Arc<dyn PairingStore>,
+        info: ButtonInfo,
+    ) -> Self {
         Self {
             scanner,
             backend,
+            store,
             info: Mutex::new(info),
         }
     }
@@ -211,7 +212,13 @@ impl Button1 {
         }
 
         info.label = (!value.is_empty()).then_some(value);
+        let snapshot = info.clone();
         debug!(id = %self.scanner, index = info.index, label = %info.effective_label(), "label set");
+
+        self.store
+            .save_button(&self.scanner, &snapshot)
+            .await
+            .map_err(|error| fdo::Error::Failed(error.to_string()))?;
 
         Ok(())
     }
@@ -256,7 +263,13 @@ impl Button1 {
             .map_err(backend_refused)?;
 
         info.profile = profile;
+        let snapshot = info.clone();
         info!(index = info.index, "key assigned");
+
+        self.store
+            .save_button(&self.scanner, &snapshot)
+            .await
+            .map_err(|error| fdo::Error::Failed(error.to_string()))?;
 
         Ok(())
     }
@@ -305,11 +318,17 @@ impl Button1 {
             .map_err(backend_refused)?;
 
         info.profile_options = options;
+        let snapshot = info.clone();
         info!(
             index = info.index,
             options = info.profile_options.len(),
             "key options set"
         );
+
+        self.store
+            .save_button(&self.scanner, &snapshot)
+            .await
+            .map_err(|error| fdo::Error::Failed(error.to_string()))?;
 
         Ok(())
     }
@@ -345,6 +364,8 @@ mod tests {
     use scanbus_core::BackendError;
     use scanbus_core::backend::mock::{ButtonMapping, MockBackend, MockCall};
 
+    use crate::store::MemoryPairingStore;
+
     use super::*;
 
     fn scanner_id() -> ScannerId {
@@ -356,6 +377,7 @@ mod tests {
         Button1::new(
             scanner_id(),
             Arc::new(backend.clone()),
+            Arc::new(MemoryPairingStore::new()),
             ButtonInfo::new(2, "Scan to OCR", false),
         )
     }
@@ -459,6 +481,7 @@ mod tests {
         let key = Button1::new(
             scanner_id(),
             Arc::new(backend),
+            Arc::new(MemoryPairingStore::new()),
             ButtonInfo::new(0, "Scan 1", true),
         );
 

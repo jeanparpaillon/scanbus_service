@@ -69,7 +69,8 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Weak};
 
 use scanbus_core::{
-    ButtonInfo, PairingMachine, PairingStore, ScannerBackend, ScannerId, ScannerInfo, Status,
+    ButtonInfo, PairingMachine, PairingStore, ProfileKind, ScannerBackend, ScannerId,
+    ScannerInfo, Status,
 };
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -692,6 +693,20 @@ impl ScannerRegistry {
         self.state.lock().await.entries.keys().cloned().collect()
     }
 
+    /// Persists `DefaultProfile` for this scanner when the store supports it.
+    pub async fn persist_default_profile(&self, id: &ScannerId, profile: Option<ProfileKind>) {
+        if let Err(error) = self.store.save_default_profile(id, profile).await {
+            warn!(%id, %error, "could not persist DefaultProfile");
+        }
+    }
+
+    /// Persists one `Button1` assignment (`Label`, `Profile`, `ProfileOptions`).
+    pub async fn persist_button_assignment(&self, id: &ScannerId, button: &ButtonInfo) {
+        if let Err(error) = self.store.save_button(id, button).await {
+            warn!(%id, index = button.index, %error, "could not persist button assignment");
+        }
+    }
+
     /// Writes `Connected` on a scanner's object, if it still has one.
     ///
     /// Best effort by design: the listener task is the truth, and an object that has gone
@@ -804,7 +819,12 @@ impl ScannerRegistry {
             self.objects
                 .add(
                     path,
-                    Button1::new(info.id.clone(), Arc::clone(backend), button),
+                    Button1::new(
+                        info.id.clone(),
+                        Arc::clone(backend),
+                        Arc::clone(&self.store),
+                        button,
+                    ),
                 )
                 .await?;
         }

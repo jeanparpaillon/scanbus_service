@@ -10,9 +10,9 @@ use std::sync::Arc;
 
 use scanbus_daemon::dbus::{self, Manager1, ObjectRegistry, Profile1, path};
 use scanbus_daemon::{
-    Backends, Discovery, Error, MemoryPairingStore, ProfileRegistry, ScannerRegistry,
+    Backends, Discovery, Error, JsonPairingStore, ProfileRegistry, ScannerRegistry,
 };
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, fmt};
 
 /// Backends compiled into this binary, in the order they will be probed.
@@ -79,12 +79,9 @@ async fn run() -> Result<&'static str, Error> {
     // workstreams restore or discover gets exported between these two lines.
     let registry = Arc::new(ObjectRegistry::new(connection.clone()).await?);
     let profiles = Arc::new(ProfileRegistry::new());
-    // In memory until 4.1 gives it a file: a pairing made now does not survive a
-    // restart, which is worth saying out loud rather than leaving a user to discover.
-    warn!("pairings are kept in memory only; a restart forgets them (4.1)");
     let scanners = ScannerRegistry::new(
         Arc::clone(&registry),
-        Arc::new(MemoryPairingStore::new()),
+        Arc::new(JsonPairingStore::new()),
         Arc::clone(&profiles),
     );
     let discovery = Arc::new(Discovery::new(backends(), Arc::clone(&scanners)));

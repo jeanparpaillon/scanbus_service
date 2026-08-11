@@ -284,7 +284,7 @@ impl Scanner1 {
     /// setter returns. See [`crate::dbus::error`]. The message names the profile and the
     /// list it had to be in, so a client can still tell this apart from a malformed call.
     #[zbus(property)]
-    fn set_default_profile(&self, value: String) -> zbus::fdo::Result<()> {
+    async fn set_default_profile(&self, value: String) -> zbus::fdo::Result<()> {
         let supported = self.info().supported_profiles();
 
         let profile = ProfileKind::parse_optional(&value).map_err(|_| {
@@ -303,6 +303,13 @@ impl Scanner1 {
             .default_profile
             .lock()
             .expect("default profile lock poisoned") = profile;
+
+        if let Some(scanners) = self.scanners.upgrade() {
+            scanners
+                .persist_default_profile(&self.info().id, profile)
+                .await;
+        }
+
         debug!(id = %self.info().id, profile = %value, "default profile set");
 
         Ok(())

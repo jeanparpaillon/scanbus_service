@@ -27,4 +27,4 @@ pub use jobs::{JobRegistry, JobTrigger};
 pub use listeners::{ButtonEvent, ButtonEventSink, RestartPolicy};
 pub use profiles::ProfileRegistry;
 pub use scanners::ScannerRegistry;
-pub use store::MemoryPairingStore;
+pub use store::{JsonPairingStore, MemoryPairingStore};

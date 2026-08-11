@@ -1154,6 +1154,7 @@ dependencies = [
  "scanbus-backend-hplip",
  "scanbus-client",
  "scanbus-core",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror",

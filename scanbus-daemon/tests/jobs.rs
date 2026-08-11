@@ -214,7 +214,8 @@ fn page(index: u32) -> RawPage {
         index,
         format: PageFormat::Pnm,
         resolution_dpi: 300,
-        data: vec![0x42; 32],
+        // Minimal valid PGM (P5) payload: 1x1 pixel, value 0x42.
+        data: b"P5\n1 1\n255\n\x42".to_vec(),
     }
 }
 
@@ -464,7 +465,13 @@ async fn a_press_publishes_a_job_stamped_with_its_key_and_profile() {
 
     feed.end();
     assert_eq!(next_string(&mut announced, "State").await, "processing");
-    assert_eq!(next_string(&mut announced, "State").await, "done");
+    let terminal = next_string(&mut announced, "State").await;
+    assert_eq!(
+        terminal,
+        "done",
+        "job terminal state={terminal}, error={}",
+        job.error().await.unwrap()
+    );
     let result = job.result().await.unwrap();
     let path = String::try_from(result["path"].clone()).unwrap();
     assert!(

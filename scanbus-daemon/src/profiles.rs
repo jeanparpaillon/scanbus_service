@@ -695,14 +695,13 @@ fn scan_stamp() -> u64 {
 }
 
 fn default_store_path() -> PathBuf {
-    if let Some(path) = std::env::var_os("XDG_STATE_HOME") {
+    if let Some(path) = std::env::var_os("XDG_CONFIG_HOME") {
         return PathBuf::from(path).join("scanbus").join("profiles.json");
     }
 
     home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".local")
-        .join("state")
+        .join(".config")
         .join("scanbus")
         .join("profiles.json")
 }

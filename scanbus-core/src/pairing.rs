@@ -25,7 +25,7 @@ use tokio::task::AbortHandle;
 
 use crate::backend::{PairingProgress, ScannerBackend};
 use crate::error::BackendError;
-use crate::model::{PairingState, ScannerId, ScannerInfo};
+use crate::model::{ButtonInfo, PairingState, ProfileKind, ScannerId, ScannerInfo};
 
 /// How many [`PairingProgress`] steps [`ScannerBackend::ensure_installed`] may have
 /// in flight before the relay that turns them into transitions has to catch up.
@@ -83,6 +83,30 @@ pub trait PairingStore: Send + Sync {
     ///
     /// Whatever the concrete store failed to do.
     async fn forget(&self, scanner_id: &ScannerId) -> Result<(), PairingStoreError>;
+
+    /// Records `DefaultProfile` for a paired scanner.
+    ///
+    /// Default no-op so existing stores keep the 1.4 contract without having to
+    /// persist scanner-side settings yet.
+    async fn save_default_profile(
+        &self,
+        _scanner_id: &ScannerId,
+        _profile: Option<ProfileKind>,
+    ) -> Result<(), PairingStoreError> {
+        Ok(())
+    }
+
+    /// Records one button assignment (`Label`, `Profile`, `ProfileOptions`).
+    ///
+    /// Default no-op for the same reason as
+    /// [`PairingStore::save_default_profile`].
+    async fn save_button(
+        &self,
+        _scanner_id: &ScannerId,
+        _button: &ButtonInfo,
+    ) -> Result<(), PairingStoreError> {
+        Ok(())
+    }
 }
 
 /// A [`PairingStore::save_paired`] failure.
