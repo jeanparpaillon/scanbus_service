@@ -5,7 +5,10 @@ Maintainer: Jean Parpaillon <jean@parpaillon.info>
 Build-Depends: cargo,
  rustc,
  make,
- dpkg-dev
+ dpkg-dev,
+ pkgconf,
+ libgtk-4-dev,
+ libadwaita-1-dev
 Standards-Version: 4.7.0
 
 Package: scanbus

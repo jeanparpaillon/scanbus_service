@@ -35,13 +35,13 @@ install: build
 	install -D -m 0755 debian/postinst "$(BACKEND_ROOT)/DEBIAN/postinst"
 
 control: install
-	dpkg-shlibdeps -T$(FRONTEND_SUBSTVARS) -p$(FRONTEND_PACKAGE) $(FRONTEND_ROOT)/usr/bin/scanbus-gui
-	dpkg-shlibdeps -T$(BACKEND_SUBSTVARS) -p$(BACKEND_PACKAGE) \
+	dpkg-shlibdeps -T$(FRONTEND_SUBSTVARS) $(FRONTEND_ROOT)/usr/bin/scanbus-gui
+	dpkg-shlibdeps -T$(BACKEND_SUBSTVARS) \
 		$(BACKEND_ROOT)/usr/bin/scanbus \
 		$(BACKEND_ROOT)/usr/bin/scanbus-daemon
-	dpkg-gencontrol -p$(FRONTEND_PACKAGE) -P$(FRONTEND_ROOT) -fdebian/control -T$(FRONTEND_SUBSTVARS) -v$(VERSION)
-	dpkg-gencontrol -p$(BACKEND_PACKAGE) -P$(BACKEND_ROOT) -fdebian/control -T$(BACKEND_SUBSTVARS) -v$(VERSION)
-	dpkg-gencontrol -p$(PACKAGE_NAME) -P$(META_ROOT) -fdebian/control -T$(META_SUBSTVARS) -v$(VERSION)
+	dpkg-gencontrol -p$(FRONTEND_PACKAGE) -P$(FRONTEND_ROOT) -cdebian/control -T$(FRONTEND_SUBSTVARS) -v$(VERSION)
+	dpkg-gencontrol -p$(BACKEND_PACKAGE) -P$(BACKEND_ROOT) -cdebian/control -T$(BACKEND_SUBSTVARS) -v$(VERSION)
+	dpkg-gencontrol -p$(PACKAGE_NAME) -P$(META_ROOT) -cdebian/control -T$(META_SUBSTVARS) -v$(VERSION)
 
 binary: binary-arch binary-indep
 
