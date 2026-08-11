@@ -1,13 +1,19 @@
-backends := brother,hplip,mobile
-env := debug
+BACKENDS := brother,hplip,mobile
+CARGO_ENV := debug
+
+ifeq ($(CARGO_ENV),release)
+	profile_opt := --release
+else
+	profile_opt :=
+endif
 
 all: build
 
 build:
-	cargo build --workspace --features $(backends)
+	cargo build --workspace $(profile_opt) --features $(BACKENDS)
 
 test:
-	cargo test --workspace --features $(backends)
+	cargo test --workspace --features $(BACKENDS)
 
 clean:
 	cargo clean
