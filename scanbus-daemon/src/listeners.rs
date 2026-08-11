@@ -2,7 +2,7 @@
 //!
 //! §3 of [`scanbus-dbus-api.md`] says `Connect()` "declares the host ready to receive".
 //! In implementation terms that is a task consuming the
-//! [`ButtonPressedEvent`](scanbus_core::ButtonPressedEvent) stream a backend hands back
+//! [`ScanTrigger`](scanbus_core::ScanTrigger) stream a backend hands back
 //! from [`start_listening`](scanbus_core::ScannerBackend::start_listening). The awkward
 //! part is not starting it — it is that *two* pieces of the daemon would otherwise
 //! believe they own it, because [`PairingMachine`](scanbus_core::PairingMachine) starts
@@ -66,7 +66,7 @@ use async_trait::async_trait;
 use futures_util::StreamExt as _;
 use futures_util::stream::BoxStream;
 use scanbus_core::{
-    BackendError, ButtonPressedEvent, ProfileKind, ScannerBackend, ScannerId, ScannerInfo,
+    BackendError, ProfileKind, ScanTrigger, ScannerBackend, ScannerId, ScannerInfo, TriggerKind,
 };
 use thiserror::Error;
 use tracing::{debug, info, instrument, warn};
@@ -77,16 +77,16 @@ use crate::dbus::path;
 use crate::dbus::scanner::Scanner1;
 use crate::scanners::ScannerRegistry;
 
-/// A press, with the two profiles the host had configured when it arrived.
+/// A trigger, with the two profiles the host had configured when it arrived.
 ///
-/// The press itself carries no profile — a backend that reported one would be reading
-/// back a config file we wrote (see
-/// [`ButtonPressedEvent`](scanbus_core::ButtonPressedEvent)) — so the profile is resolved
-/// on this side, by [`ButtonEvent::profile`].
+/// A button trigger itself carries no profile — a backend that reported one would be
+/// reading back a config file we wrote (see [`ScanTrigger`](scanbus_core::ScanTrigger))
+/// — so the profile is resolved on this side, by [`ButtonEvent::profile`]. A push trigger
+/// does carry one, and wins over every host-side fallback.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ButtonEvent {
     /// What the backend observed.
-    pub press: ButtonPressedEvent,
+    pub trigger: ScanTrigger,
     /// The `{"profile": …}` of the `Connect()` that opened this session, if any.
     pub session_profile: Option<ProfileKind>,
     /// `Scanner1.DefaultProfile` as it stood when the press arrived.
@@ -113,24 +113,40 @@ impl ButtonEvent {
     /// [2.5]: https://github.com/jeanparpaillon/scanbus_service/issues/9
     /// [2.6]: https://github.com/jeanparpaillon/scanbus_service/issues/10
     pub fn profile(&self, button_profile: Option<ProfileKind>) -> Option<ProfileKind> {
-        button_profile
-            .or(self.session_profile)
-            .or(self.default_profile)
+        match self.trigger.kind {
+            TriggerKind::Button { .. } => button_profile
+                .or(self.session_profile)
+                .or(self.default_profile),
+            TriggerKind::Push { profile } => Some(profile),
+        }
     }
 
     /// The scanner the press came from.
     pub fn scanner(&self) -> &ScannerId {
-        &self.press.scanner_id
+        &self.trigger.scanner_id
+    }
+
+    /// The backend-issued id that `fetch_pages` must be called with.
+    pub fn trigger_id(&self) -> &str {
+        &self.trigger.id
     }
 
     /// Position in the physical menu, 0-based.
-    pub fn button_index(&self) -> u32 {
-        self.press.button_index
+    pub fn button_index(&self) -> Option<u32> {
+        match self.trigger.kind {
+            TriggerKind::Button { index } => Some(index),
+            TriggerKind::Push { .. } => None,
+        }
     }
 
     /// When the backend observed the press.
     pub fn timestamp(&self) -> SystemTime {
-        self.press.timestamp
+        self.trigger.timestamp
+    }
+
+    /// What kind of trigger this is.
+    pub fn kind(&self) -> &TriggerKind {
+        &self.trigger.kind
     }
 }
 
@@ -248,27 +264,23 @@ pub(crate) async fn run(
     scanner: ScannerInfo,
     sink: Arc<dyn ButtonEventSink>,
     policy: RestartPolicy,
-    mut stream: BoxStream<'static, ButtonPressedEvent>,
+    mut stream: BoxStream<'static, ScanTrigger>,
 ) {
     let path = path::scanner(&scanner.id);
     let mut attempt = 0u32;
 
     loop {
-        while let Some(press) = stream.next().await {
+        while let Some(trigger) = stream.next().await {
             // A press is the proof that this stream is real, which is what makes it —
             // and not a successful `start_listening` — the thing that clears the budget.
             attempt = 0;
 
             let (session_profile, default_profile) = profiles(&objects, &path).await;
-            debug!(
-                button = press.button_index,
-                profile = ProfileKind::optional_as_str(session_profile.or(default_profile)),
-                "button press received"
-            );
+            debug!(trigger = ?trigger.kind, id = %trigger.id, "scan trigger received");
             sink.button_pressed(
                 Arc::clone(&backend),
                 ButtonEvent {
-                    press,
+                    trigger,
                     session_profile,
                     default_profile,
                 },
@@ -343,8 +355,9 @@ mod tests {
     #[test]
     fn the_button_wins_over_the_session_which_wins_over_the_default() {
         let event = ButtonEvent {
-            press: ButtonPressedEvent::now(
+            trigger: ScanTrigger::button(
                 ScannerId::from_backend("mock", "usb:001:002").unwrap(),
+                "job-1",
                 2,
             ),
             session_profile: Some(ProfileKind::Document),

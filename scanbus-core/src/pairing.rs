@@ -563,7 +563,7 @@ mod tests {
     use tokio::sync::Mutex as AsyncMutex;
 
     use super::*;
-    use crate::backend::ButtonPressedEvent;
+    use crate::backend::ScanTrigger;
     use crate::backend::mock::{MockBackend, sample_scanner};
     use crate::error::BackendError;
     use crate::model::{ProfileKind, ScannerId, Value};
@@ -655,7 +655,7 @@ mod tests {
         async fn start_listening(
             &self,
             scanner: &ScannerInfo,
-        ) -> Result<BoxStream<'static, ButtonPressedEvent>, BackendError> {
+        ) -> Result<BoxStream<'static, ScanTrigger>, BackendError> {
             self.inner.start_listening(scanner).await
         }
 
@@ -947,7 +947,7 @@ mod tests {
             async fn start_listening(
                 &self,
                 scanner: &ScannerInfo,
-            ) -> Result<BoxStream<'static, ButtonPressedEvent>, BackendError> {
+            ) -> Result<BoxStream<'static, ScanTrigger>, BackendError> {
                 self.0.start_listening(scanner).await
             }
 
@@ -1021,7 +1021,7 @@ mod tests {
             async fn start_listening(
                 &self,
                 scanner: &ScannerInfo,
-            ) -> Result<BoxStream<'static, ButtonPressedEvent>, BackendError> {
+            ) -> Result<BoxStream<'static, ScanTrigger>, BackendError> {
                 self.0.start_listening(scanner).await
             }
 
@@ -1164,7 +1164,7 @@ mod tests {
             async fn start_listening(
                 &self,
                 _scanner: &ScannerInfo,
-            ) -> Result<BoxStream<'static, ButtonPressedEvent>, BackendError> {
+            ) -> Result<BoxStream<'static, ScanTrigger>, BackendError> {
                 unreachable!("cancelled before ensure_installed returns")
             }
 

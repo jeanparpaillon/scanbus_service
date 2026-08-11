@@ -188,6 +188,7 @@ impl JobRegistry {
         &self,
         backend: Arc<dyn ScannerBackend>,
         scanner: ScannerId,
+        trigger_id: String,
         trigger: JobTrigger,
         profile: Option<ProfileKind>,
         options: BTreeMap<String, Value>,
@@ -200,6 +201,7 @@ impl JobRegistry {
             backend,
             scanner,
             job_id,
+            trigger_id,
             trigger,
             profile,
             options,
@@ -249,18 +251,23 @@ impl JobRegistry {
 impl ButtonEventSink for JobRegistry {
     async fn button_pressed(&self, backend: Arc<dyn ScannerBackend>, event: ButtonEvent) {
         let scanner = event.scanner().clone();
-        let index = event.button_index();
-
-        // Both halves of the key's configuration, under one read, before anything else
-        // can rewrite it — the "copied at trigger time" of §4.
-        let (button_profile, button_options) = self.assignment(&scanner, index).await;
+        let (trigger, button_profile, button_options) = match event.button_index() {
+            Some(index) => {
+                // Both halves of the key's configuration, under one read, before anything
+                // else can rewrite it — the "copied at trigger time" of §4.
+                let (button_profile, button_options) = self.assignment(&scanner, index).await;
+                (JobTrigger::Button(index), button_profile, button_options)
+            }
+            None => (JobTrigger::Host, None, BTreeMap::new()),
+        };
         let profile = event.profile(button_profile);
         let options = self.resolved_options(profile, button_options).await;
 
         self.start(
             backend,
             scanner,
-            JobTrigger::Button(index),
+            event.trigger_id().to_owned(),
+            trigger,
             profile,
             options,
         )
@@ -283,6 +290,7 @@ async fn run(
     backend: Arc<dyn ScannerBackend>,
     scanner: ScannerId,
     job_id: u64,
+    trigger_id: String,
     trigger: JobTrigger,
     profile: Option<ProfileKind>,
     options: BTreeMap<String, Value>,
@@ -291,7 +299,7 @@ async fn run(
     let path = path::job(&scanner, job_id);
     // The backend is asked for the id *we* minted: `fetch_pages` answers for the daemon's
     // job id rather than inventing one of its own.
-    let mut pages = match backend.fetch_pages(&scanner, &job_id.to_string()).await {
+    let mut pages = match backend.fetch_pages(&scanner, &trigger_id).await {
         Ok(pages) => pages,
         Err(error) => {
             warn!(%error, "the scan produced no data; no job object was published");

@@ -241,7 +241,7 @@ fn jpeg_page(index: u32, fill: u8) -> RawPage {
 
 /// The feed the daemon's *next* job will read, opened under the id it will mint.
 fn open_next_job(handle: &MockHandle, job_id: u64) -> PageFeed {
-    handle.open_pages(job_id.to_string())
+    handle.open_pages(format!("job-{job_id}"))
 }
 
 async fn job_proxy(
@@ -1109,7 +1109,7 @@ async fn a_host_driven_job_reports_button_minus_one() {
         Arc::new(ProfileRegistry::ephemeral()),
         TEST_RETENTION,
     );
-    let feed = open_next_job(&daemon.handle(), JobRegistry::FIRST_ID);
+    let feed = daemon.handle().open_pages("host-1");
 
     let started = tokio::spawn({
         let backend = Arc::clone(&daemon.backend) as Arc<dyn ScannerBackend>;
@@ -1118,6 +1118,7 @@ async fn a_host_driven_job_reports_button_minus_one() {
             jobs.start(
                 backend,
                 id,
+                "host-1".to_owned(),
                 JobTrigger::Host,
                 Some(scanbus_core::ProfileKind::Document),
                 Default::default(),
