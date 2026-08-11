@@ -1,4 +1,4 @@
-backends := brother,hplip
+backends := brother,hplip,mobile
 env := debug
 
 all: build
