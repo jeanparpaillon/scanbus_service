@@ -201,7 +201,12 @@ mod tests {
     #[test]
     fn the_table_reports_the_owner_and_the_profiles_of_a_running_daemon() {
         let mut out = Vec::new();
-        human(&mut out, &context(&["scanbus", "status"]), &running()).unwrap();
+        human(
+            &mut out,
+            &context(&["scanbus", "--no-color", "status"]),
+            &running(),
+        )
+        .unwrap();
         let out = String::from_utf8(out).unwrap();
 
         assert!(out.contains("daemon    running"), "{out}");
@@ -217,7 +222,12 @@ mod tests {
     #[test]
     fn the_table_of_an_absent_daemon_holds_no_daemon_facts() {
         let mut out = Vec::new();
-        human(&mut out, &context(&["scanbus", "status"]), &absent()).unwrap();
+        human(
+            &mut out,
+            &context(&["scanbus", "--no-color", "status"]),
+            &absent(),
+        )
+        .unwrap();
         let out = String::from_utf8(out).unwrap();
 
         assert!(out.contains("daemon    absent"), "{out}");
