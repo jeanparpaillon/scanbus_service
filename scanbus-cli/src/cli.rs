@@ -25,7 +25,7 @@
 
 use std::time::Duration;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand};
 use scanbus_client::{Bus, Match};
 
 use crate::duration::parse_duration;
@@ -309,6 +309,12 @@ pub enum ButtonCommand {
     ///
     /// The engraved label is the firmware's and is read-only on most devices; --label
     /// only works where the device says it is configurable.
+    #[command(group(
+        ArgGroup::new("change")
+            .required(true)
+            .multiple(true)
+            .args(["profile", "label", "options", "option_json"])
+    ))]
     Set {
         #[command(flatten)]
         scanner: ScannerArg,
@@ -327,6 +333,10 @@ pub enum ButtonCommand {
         /// Profile option for this key, repeatable
         #[arg(long = "option", value_name = "K=V")]
         options: Vec<String>,
+
+        /// Profile option with the value parsed as JSON, repeatable
+        #[arg(long = "option-json", value_name = "K=JSON")]
+        option_json: Vec<String>,
     },
 
     /// Unassign a key
@@ -455,7 +465,7 @@ mod tests {
         }
     }
 
-    /// The comma-separated list of §3, and the repeated `--option` of `button set`.
+    /// The comma-separated list of §3, and the repeatable option flags of `button set`.
     #[test]
     fn the_repeatable_options_parse_the_way_the_help_says() {
         let cli = Cli::try_parse_from(["scanbus", "discover", "--backend", "sane,avahi"]).unwrap();
@@ -469,12 +479,36 @@ mod tests {
         ])
         .unwrap();
         let Command::Button {
-            command: ButtonCommand::Set { options, .. },
+            command:
+                ButtonCommand::Set {
+                    options,
+                    option_json,
+                    ..
+                },
         } = cli.command
         else {
             panic!("that is a button set")
         };
         assert_eq!(options, ["dir=/tmp", "dpi=300"]);
+        assert!(option_json.is_empty());
+
+        let cli = Cli::try_parse_from([
+            "scanbus",
+            "button",
+            "set",
+            "MFC",
+            "2",
+            "--option-json",
+            "profile={\"dir\":\"/tmp\"}",
+        ])
+        .unwrap();
+        let Command::Button {
+            command: ButtonCommand::Set { option_json, .. },
+        } = cli.command
+        else {
+            panic!("that is a button set")
+        };
+        assert_eq!(option_json, ["profile={\"dir\":\"/tmp\"}"]);
     }
 
     /// `--paired --unpaired` asks for the empty set; `--watch --for` asks for two
@@ -483,5 +517,22 @@ mod tests {
     fn the_contradictory_flag_pairs_are_refused() {
         assert!(Cli::try_parse_from(["scanbus", "list", "--paired", "--unpaired"]).is_err());
         assert!(Cli::try_parse_from(["scanbus", "discover", "--watch", "--for", "5s"]).is_err());
+    }
+
+    #[test]
+    fn button_set_requires_at_least_one_change() {
+        assert!(Cli::try_parse_from(["scanbus", "button", "set", "MFC", "2"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "scanbus",
+                "button",
+                "set",
+                "MFC",
+                "2",
+                "--profile",
+                "document"
+            ])
+            .is_ok()
+        );
     }
 }
