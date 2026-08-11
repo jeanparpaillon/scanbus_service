@@ -4,6 +4,7 @@ members = [
     "scanbus-core",
     "scanbus-client",
     "scanbus-cli",
+    "scanbus-gui",
     "scanbus-daemon",
     "scanbus-backend-brother",
     "scanbus-backend-hplip",

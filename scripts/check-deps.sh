@@ -52,9 +52,11 @@ check scanbus-core '\bzbus\b|\bdbus\b' --all-features
 # walks what the client depends on, not what depends on it.
 check scanbus-client '\bscanbus-daemon\b'
 check scanbus-client '\bscanbus-daemon\b' --all-features
+check scanbus-gui '\bscanbus-daemon\b'
+check scanbus-gui '\bscanbus-daemon\b' --all-features
 
 if [ "$status" -eq 0 ]; then
-    echo "ok: core's tree has no D-Bus, and the client's has no daemon"
+    echo "ok: core's tree has no D-Bus, and the client/gui trees have no daemon"
 fi
 
 exit "$status"

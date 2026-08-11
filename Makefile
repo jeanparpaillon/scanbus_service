@@ -45,6 +45,9 @@ deb:
 		DEB_STAGE_DIR="$(DEB_STAGE_DIR)" DEB_ROOT="$(DEB_ROOT)" DEB_OUTPUT="$(DEB_OUTPUT)" \
 		$(MAKE) -f debian/rules binary
 
+gui:
+	cargo build -p scanbus-gui $(profile_opt)
+
 test:
 	cargo test --workspace --features $(BACKENDS)
 
@@ -52,3 +55,4 @@ clean:
 	cargo clean
 
 .PHONY: all build release install deb test clean
+.PHONY: all build release install deb gui test clean
