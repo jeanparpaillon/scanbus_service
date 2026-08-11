@@ -428,6 +428,23 @@ impl PairingMachine {
         let _ = self.transitions.send(PairingState::Done);
     }
 
+    /// Restores a scanner as present but not paired, with a startup reconciliation error.
+    ///
+    /// This is the restore-path mirror of a runtime pairing failure: the daemon store
+    /// still names the scanner, so the object has to exist, but the backend is missing
+    /// its half of the association and the user needs a visible "pair again".
+    pub fn restore_failed(&self, message: impl Into<String>) {
+        {
+            let mut inner = self.lock();
+            if let Some(task) = inner.task.take() {
+                task.abort();
+            }
+            inner.paired = false;
+            inner.state = PairingState::Failed(message.into());
+        }
+        let _ = self.transitions.send(self.state());
+    }
+
     fn lock(&self) -> MutexGuard<'_, Inner> {
         self.inner.lock().expect("pairing machine lock poisoned")
     }
@@ -1075,6 +1092,29 @@ mod tests {
         // Idempotent, and `Pair()` on it is §9's AlreadyPaired.
         machine.restore_paired();
         assert_eq!(machine.pair(), PairOutcome::AlreadyPaired);
+    }
+
+    #[tokio::test]
+    async fn restoring_a_failed_pairing_leaves_the_object_unpaired_with_a_message() {
+        let backend = MockBackend::with_scanners([sample_scanner()]);
+        let handle = backend.handle();
+        let store = Arc::new(RecordingStore::default());
+        let machine = PairingMachine::new(sample_scanner(), Arc::new(backend), store.clone());
+        let mut transitions = machine.subscribe();
+
+        machine.restore_failed("the pairing secret is missing; pair the phone again");
+
+        assert!(!machine.is_paired());
+        assert_eq!(
+            machine.state(),
+            PairingState::Failed("the pairing secret is missing; pair the phone again".to_owned())
+        );
+        assert_eq!(
+            transitions.try_recv().unwrap(),
+            PairingState::Failed("the pairing secret is missing; pair the phone again".to_owned())
+        );
+        assert!(handle.calls().is_empty(), "{:?}", handle.calls());
+        assert!(store.saved().await.is_empty());
     }
 
     /// A rediscovery moves the address the next `pair()` will use, and nothing else.

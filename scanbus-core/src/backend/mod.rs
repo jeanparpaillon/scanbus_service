@@ -39,6 +39,15 @@ pub mod mock;
 
 pub use event::{ButtonPressedEvent, PairingProgress};
 
+/// What a backend says about a daemon-store pairing during startup reconciliation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestoreDisposition {
+    /// The backend still has its own half of the pairing.
+    Paired,
+    /// The backend is missing what it needs; the object stays present but unpaired.
+    Failed(String),
+}
+
 /// One way of finding and driving scanners: SANE, eSCL, `brscan-skey`, HPLIP.
 ///
 /// Implementors are held as `Arc<dyn ScannerBackend>` and shared across tasks, hence
@@ -130,6 +139,25 @@ pub trait ScannerBackend: Send + Sync {
     /// [`BackendError::Other`] when the teardown itself failed, e.g. a vendor daemon
     /// that refused to stop.
     async fn stop_listening(&self, scanner_id: &ScannerId) -> Result<(), BackendError>;
+
+    /// Reconciles one daemon-store pairing with the backend's own durable state.
+    ///
+    /// Default `Paired`: backends that keep no private pairing state have nothing to
+    /// disagree with. A backend that does keep some — a token, an app credential —
+    /// returns [`RestoreDisposition::Failed`] when the daemon says paired and it does
+    /// not, which is what lets startup surface "pair again" instead of reviving a
+    /// scanner that can never work.
+    async fn restore_disposition(&self, _scanner: &ScannerInfo) -> RestoreDisposition {
+        RestoreDisposition::Paired
+    }
+
+    /// Drops backend-side pairings for scanners the daemon store no longer names.
+    ///
+    /// Default no-op for the same reason as [`ScannerBackend::restore_disposition`]:
+    /// backends with no private durable state have nothing to prune.
+    async fn prune_unrestored_pairings(&self, _restored: &[ScannerId]) -> Result<(), BackendError> {
+        Ok(())
+    }
 
     /// Revokes whatever backend-side state pairing created — a token, a
     /// `brscan-skey.config` entry — so the device is no longer recognised.

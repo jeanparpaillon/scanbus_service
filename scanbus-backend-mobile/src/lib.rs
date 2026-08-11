@@ -18,7 +18,7 @@ use mdns_sd::{ServiceDaemon, ServiceEvent};
 use rand::Rng;
 use scanbus_core::{
 	BackendError, ButtonsCapability, Capabilities as ScannerCapabilities, ProfileKind, RawPage,
-	ScannerBackend, ScannerId, ScannerInfo, Status, Value,
+	RestoreDisposition, ScannerBackend, ScannerId, ScannerInfo, Status, Value,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -492,6 +492,20 @@ impl MobileBackend {
 		persist_device_store(self.store_path.as_ref(), &store)
 	}
 
+	fn prune_unrestored_locked(
+		&self,
+		restored: &[ScannerId],
+	) -> Result<(), String> {
+		let restored: std::collections::BTreeSet<_> = restored.iter().cloned().collect();
+		let mut paired = self.lock_paired();
+		let before = paired.len();
+		paired.retain(|scanner_id, _| restored.contains(scanner_id));
+		if paired.len() != before {
+			self.persist_paired_locked(&paired)?;
+		}
+		Ok(())
+	}
+
 	async fn connect_to_record(
 		&self,
 		scanner_id: &ScannerId,
@@ -656,6 +670,24 @@ impl ScannerBackend for MobileBackend {
 	/// requires the no-op case to be `Ok(())`, not an error.
 	async fn stop_listening(&self, _scanner_id: &ScannerId) -> Result<(), BackendError> {
 		Ok(())
+	}
+
+	async fn restore_disposition(&self, scanner: &ScannerInfo) -> RestoreDisposition {
+		if self.lock_paired().contains_key(&scanner.id) {
+			RestoreDisposition::Paired
+		} else {
+			RestoreDisposition::Failed(
+				"the pairing secret is missing; pair the phone again".to_owned(),
+			)
+		}
+	}
+
+	async fn prune_unrestored_pairings(
+		&self,
+		restored: &[ScannerId],
+	) -> Result<(), BackendError> {
+		self.prune_unrestored_locked(restored)
+			.map_err(BackendError::Other)
 	}
 
 	/// Revokes the token a pairing issued, so an upload bearing it comes back
@@ -1877,6 +1909,48 @@ mod tests {
 
 		let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
 		assert_eq!(mode, 0o600);
+	}
+
+	#[tokio::test]
+	async fn restore_disposition_is_failed_when_the_backend_store_lost_the_secret() {
+		let tmp = TempDir::new().unwrap();
+		let path = tmp.path().join("devices.json");
+		let backend = MobileBackend::with_store_path(path.clone(), DISCOVERY_TIMEOUT, 0);
+
+		assert_eq!(
+			backend.restore_disposition(&scanner_info()).await,
+			RestoreDisposition::Failed(
+				"the pairing secret is missing; pair the phone again".to_owned()
+			)
+		);
+	}
+
+	#[tokio::test]
+	async fn prune_unrestored_pairings_drops_tokens_the_daemon_store_no_longer_names() {
+		let tmp = TempDir::new().unwrap();
+		let path = tmp.path().join("devices.json");
+		let phone = FakePhone::listen(Answer::Accept {
+			device_id: DEVICE_ID,
+		})
+		.await;
+		let backend = MobileBackend::with_store_path(path.clone(), DISCOVERY_TIMEOUT, 0)
+			.with_pairing_timeouts(Duration::from_millis(200), Duration::from_millis(200));
+		backend.remember(vec![(
+			scanner_id(),
+			DiscoveryRecord {
+				device_id: DEVICE_ID.to_owned(),
+				address: phone.address,
+				seen_at: Instant::now(),
+			},
+		)]);
+		pair_with(&backend).await.0.unwrap();
+		assert!(backend.is_authorized(DEVICE_ID, "phone-token"));
+
+		backend.prune_unrestored_pairings(&[]).await.unwrap();
+
+		assert!(!backend.is_authorized(DEVICE_ID, "phone-token"));
+		let store = load_store(&path).unwrap();
+		assert!(store.devices.is_empty());
 	}
 
 	/// The nonce is the whole security value of the comparison: six digits, every one of
