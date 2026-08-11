@@ -1697,6 +1697,7 @@ dependencies = [
  "futures-util",
  "gtk4",
  "libadwaita",
+ "libc",
  "scanbus-client",
  "scanbus-core",
  "tokio",

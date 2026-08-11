@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use async_channel::{Receiver, Sender};
 use futures_util::StreamExt as _;
-use scanbus_client::proxy::{Button1Proxy, Scanner1Proxy, object_manager};
+use scanbus_client::proxy::{Button1Proxy, Manager1Proxy, Scanner1Proxy, object_manager};
 use scanbus_client::{Bus, Error, connect, owner};
 use scanbus_core::{ProfileKind, path};
 use tokio::runtime::Builder;
@@ -18,19 +18,34 @@ use crate::store::{Dict, ManagedSnapshot, StoreEvent};
 
 #[derive(Debug, Clone)]
 pub enum BusCommand {
+    StartDiscovery,
+    StopDiscovery {
+        quiet: bool,
+    },
     Pair {
         path: String,
     },
+    #[allow(
+        dead_code,
+        reason = "issue 10.7 wires profile editing onto this existing bus path"
+    )]
     SetProfile {
         path: String,
         kind: Option<ProfileKind>,
     },
 }
 
+#[derive(Debug, Clone)]
+pub enum BusEvent {
+    Store(StoreEvent),
+    DiscoveryActive(bool),
+    Toast(String),
+}
+
 #[derive(Clone)]
 pub struct BusHandle {
     commands: Sender<BusCommand>,
-    events: Receiver<StoreEvent>,
+    events: Receiver<BusEvent>,
 }
 
 impl BusHandle {
@@ -58,18 +73,21 @@ impl BusHandle {
         self.commands.clone()
     }
 
-    pub fn events(&self) -> Receiver<StoreEvent> {
+    pub fn events(&self) -> Receiver<BusEvent> {
         self.events.clone()
     }
 }
 
-async fn run(bus: Bus, commands: Receiver<BusCommand>, events: Sender<StoreEvent>) {
+async fn run(bus: Bus, commands: Receiver<BusCommand>, events: Sender<BusEvent>) {
     loop {
         match run_session(&bus, &commands, &events).await {
             Ok(()) => return,
             Err(error) => {
                 warn!(%error, "scanbus-gui bus loop failed; retrying");
-                let _ = events.send(StoreEvent::ServicePresent(false)).await;
+                let _ = events
+                    .send(BusEvent::Store(StoreEvent::ServicePresent(false)))
+                    .await;
+                let _ = events.send(BusEvent::DiscoveryActive(false)).await;
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
         }
@@ -79,14 +97,17 @@ async fn run(bus: Bus, commands: Receiver<BusCommand>, events: Sender<StoreEvent
 async fn run_session(
     bus: &Bus,
     commands: &Receiver<BusCommand>,
-    events: &Sender<StoreEvent>,
+    events: &Sender<BusEvent>,
 ) -> Result<(), Error> {
     let connection = connect(bus, true).await?;
     let mut messages = MessageStream::from(&connection);
 
     loop {
         let Some(current_owner) = owner(&connection).await? else {
-            let _ = events.send(StoreEvent::ServicePresent(false)).await;
+            let _ = events
+                .send(BusEvent::Store(StoreEvent::ServicePresent(false)))
+                .await;
+            let _ = events.send(BusEvent::DiscoveryActive(false)).await;
             wait_for_owner(&mut messages).await?;
             continue;
         };
@@ -94,9 +115,13 @@ async fn run_session(
         debug!(owner = %current_owner, "scanbus owner appeared");
         let manager = object_manager(&connection).await?;
         let managed = manager.get_managed_objects().await?;
-        let _ = events.send(StoreEvent::ServicePresent(true)).await;
         let _ = events
-            .send(StoreEvent::Replace(normalize_snapshot(managed)))
+            .send(BusEvent::Store(StoreEvent::ServicePresent(true)))
+            .await;
+        let _ = events
+            .send(BusEvent::Store(StoreEvent::Replace(normalize_snapshot(
+                managed,
+            ))))
             .await;
 
         loop {
@@ -105,10 +130,8 @@ async fn run_session(
                     let Ok(command) = command else {
                         return Ok(());
                     };
-                    if let Err(error) = handle_command(&connection, command).await {
-                        if let Error::Call(ref refusal) = error {
-                            debug!(message = %crate::error::present(refusal), detail = %refusal, "GUI command failed");
-                        } else {
+                    if let Err(error) = handle_command(&connection, command, events).await {
+                        if !matches!(error, Error::Call(_)) {
                             warn!(%error, "GUI command failed");
                         }
                     }
@@ -142,7 +165,7 @@ async fn wait_for_owner(messages: &mut MessageStream) -> Result<(), Error> {
     Ok(())
 }
 
-async fn dispatch_signal(message: Message, events: &Sender<StoreEvent>) -> Result<bool, Error> {
+async fn dispatch_signal(message: Message, events: &Sender<BusEvent>) -> Result<bool, Error> {
     if message.message_type() != Type::Signal {
         return Ok(false);
     }
@@ -162,7 +185,10 @@ async fn dispatch_signal(message: Message, events: &Sender<StoreEvent>) -> Resul
         && name == scanbus_client::BUS_NAME
     {
         if new_owner.is_empty() {
-            let _ = events.send(StoreEvent::ServicePresent(false)).await;
+            let _ = events
+                .send(BusEvent::Store(StoreEvent::ServicePresent(false)))
+                .await;
+            let _ = events.send(BusEvent::DiscoveryActive(false)).await;
             return Ok(true);
         }
         return Ok(true);
@@ -181,24 +207,30 @@ async fn dispatch_signal(message: Message, events: &Sender<StoreEvent>) -> Resul
             .body()
             .deserialize::<(String, HashMap<String, HashMap<String, OwnedValue>>)>()?;
         let _ = events
-            .send(StoreEvent::InterfacesAdded { path, interfaces })
+            .send(BusEvent::Store(StoreEvent::InterfacesAdded {
+                path,
+                interfaces,
+            }))
             .await;
     } else if interface == "org.freedesktop.DBus.ObjectManager" && member == "InterfacesRemoved" {
         let (path, interfaces) = message.body().deserialize::<(String, Vec<String>)>()?;
         let _ = events
-            .send(StoreEvent::InterfacesRemoved { path, interfaces })
+            .send(BusEvent::Store(StoreEvent::InterfacesRemoved {
+                path,
+                interfaces,
+            }))
             .await;
     } else if interface == "org.freedesktop.DBus.Properties" && member == "PropertiesChanged" {
         let (iface, changed, invalidated) = message
             .body()
             .deserialize::<(String, Dict, Vec<String>)>()?;
         let _ = events
-            .send(StoreEvent::PropertiesChanged {
+            .send(BusEvent::Store(StoreEvent::PropertiesChanged {
                 path,
                 interface: iface,
                 changed,
                 invalidated,
-            })
+            }))
             .await;
     }
 
@@ -232,8 +264,53 @@ fn normalize_snapshot(managed: zbus::fdo::ManagedObjects) -> ManagedSnapshot {
         .collect()
 }
 
-async fn handle_command(connection: &zbus::Connection, command: BusCommand) -> Result<(), Error> {
+async fn handle_command(
+    connection: &zbus::Connection,
+    command: BusCommand,
+    events: &Sender<BusEvent>,
+) -> Result<(), Error> {
     match command {
+        BusCommand::StartDiscovery => {
+            let manager = Manager1Proxy::new(connection).await?;
+            match manager.start_discovery(HashMap::new()).await {
+                Ok(()) => {
+                    let _ = events.send(BusEvent::DiscoveryActive(true)).await;
+                }
+                Err(error) => {
+                    let error = Error::from(error);
+                    let _ = events.send(BusEvent::DiscoveryActive(false)).await;
+                    if let Error::Call(ref refusal) = error {
+                        debug!(
+                            message = %crate::error::present(refusal),
+                            detail = %refusal,
+                            "GUI command failed"
+                        );
+                        let _ = events
+                            .send(BusEvent::Toast(crate::error::present(refusal)))
+                            .await;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        BusCommand::StopDiscovery { quiet } => {
+            let manager = Manager1Proxy::new(connection).await?;
+            match manager.stop_discovery().await {
+                Ok(()) => {
+                    let _ = events.send(BusEvent::DiscoveryActive(false)).await;
+                }
+                Err(error) => {
+                    let error = Error::from(error);
+                    let _ = events.send(BusEvent::DiscoveryActive(false)).await;
+                    if !quiet && let Error::Call(ref refusal) = error {
+                        let _ = events
+                            .send(BusEvent::Toast(crate::error::present(refusal)))
+                            .await;
+                    }
+                    return Err(error);
+                }
+            }
+        }
         BusCommand::Pair { path } => {
             if let Some(id) = path::scanner_id(&path) {
                 let proxy = Scanner1Proxy::for_scanner(connection, &id).await?;

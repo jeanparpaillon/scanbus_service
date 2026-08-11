@@ -12,7 +12,7 @@ use libadwaita::prelude::*;
 use scanbus_core::Status;
 
 use crate::bus::BusCommand;
-use crate::store::{ScannerEntry, ServiceState, Store, StoreEvent};
+use crate::store::{DiscoveryState, ScannerEntry, ServiceState, Store, StoreEvent};
 
 mod scanner_object {
     use super::*;
@@ -125,13 +125,16 @@ pub fn status_line(status: Status, connected: bool, paired: bool) -> String {
 }
 
 type Callback = Box<dyn Fn() + 'static>;
+type ToastCallback = Box<dyn Fn(String) + 'static>;
 
 pub struct ScannerListModel {
     store: RefCell<Store>,
     list: ListStore,
     by_path: RefCell<HashMap<String, ScannerObject>>,
     selected_path: RefCell<Option<String>>,
+    discovery: Cell<DiscoveryState>,
     callbacks: RefCell<Vec<Callback>>,
+    toast_callbacks: RefCell<Vec<ToastCallback>>,
 }
 
 impl ScannerListModel {
@@ -141,7 +144,9 @@ impl ScannerListModel {
             list: ListStore::new::<ScannerObject>(),
             by_path: RefCell::new(HashMap::new()),
             selected_path: RefCell::new(None),
+            discovery: Cell::new(DiscoveryState::Idle),
             callbacks: RefCell::new(Vec::new()),
+            toast_callbacks: RefCell::new(Vec::new()),
         }
     }
 
@@ -157,6 +162,19 @@ impl ScannerListModel {
         self.selected_path.borrow().clone()
     }
 
+    pub fn discovery_state(&self) -> DiscoveryState {
+        self.discovery.get()
+    }
+
+    pub fn discovered_count(&self) -> usize {
+        self.store
+            .borrow()
+            .scanners
+            .values()
+            .filter(|entry| !entry.state.paired)
+            .count()
+    }
+
     pub fn has_scanners(&self) -> bool {
         !self.store.borrow().scanners.is_empty()
     }
@@ -168,6 +186,13 @@ impl ScannerListModel {
         self.callbacks.borrow_mut().push(Box::new(callback));
     }
 
+    pub fn connect_toast<F>(&self, callback: F)
+    where
+        F: Fn(String) + 'static,
+    {
+        self.toast_callbacks.borrow_mut().push(Box::new(callback));
+    }
+
     pub fn set_selected_path(&self, selected_path: Option<String>) {
         if *self.selected_path.borrow() == selected_path {
             return;
@@ -177,8 +202,47 @@ impl ScannerListModel {
         self.notify_changed();
     }
 
+    pub fn begin_discovery_start(&self) -> bool {
+        if self.discovery.get() != DiscoveryState::Idle {
+            return false;
+        }
+
+        self.discovery.set(DiscoveryState::Starting);
+        self.notify_changed();
+        true
+    }
+
+    pub fn mark_discovery_active(&self) {
+        self.set_discovery_state(DiscoveryState::Active);
+    }
+
+    pub fn begin_discovery_stop(&self) -> bool {
+        match self.discovery.get() {
+            DiscoveryState::Starting | DiscoveryState::Active => {
+                self.discovery.set(DiscoveryState::Stopping);
+                self.notify_changed();
+                true
+            }
+            DiscoveryState::Idle | DiscoveryState::Stopping => false,
+        }
+    }
+
+    pub fn mark_discovery_idle(&self) {
+        self.set_discovery_state(DiscoveryState::Idle);
+    }
+
+    pub fn emit_toast(&self, message: impl Into<String>) {
+        let message = message.into();
+        for callback in self.toast_callbacks.borrow().iter() {
+            callback(message.clone());
+        }
+    }
+
     pub fn apply_event(&self, event: StoreEvent) -> Result<(), scanbus_client::DecodeError> {
         self.store.borrow_mut().apply(event)?;
+        if self.store.borrow().service == ServiceState::Absent {
+            self.discovery.set(DiscoveryState::Idle);
+        }
         self.sync_objects();
         self.notify_changed();
         Ok(())
@@ -245,6 +309,12 @@ impl ScannerListModel {
             callback();
         }
     }
+
+    fn set_discovery_state(&self, discovery: DiscoveryState) {
+        if self.discovery.replace(discovery) != discovery {
+            self.notify_changed();
+        }
+    }
 }
 
 pub struct ScannersPane {
@@ -304,6 +374,9 @@ impl ScannersPane {
         let discovered_group = adw::PreferencesGroup::builder()
             .title("Discovered scanners")
             .build();
+        let discovery_caption = gtk::Label::new(None);
+        discovery_caption.add_css_class("dim-label");
+        discovery_caption.set_xalign(0.0);
         let discovered_list = gtk::ListBox::new();
         discovered_list.add_css_class("boxed-list");
         discovered_list.set_selection_mode(gtk::SelectionMode::Single);
@@ -405,10 +478,12 @@ impl ScannersPane {
             let service_banner = service_banner.clone();
             let paired_group = paired_group.clone();
             let discovered_group = discovered_group.clone();
+            let discovery_caption = discovery_caption.clone();
             let selected_path = selected_path.clone();
             model.connect_changed(move || {
                 let paired_count = paired_model.n_items();
                 let discovered_count = discovered_model.n_items();
+                let discovery_state = model_for_callback.discovery_state();
 
                 paired_group.set_visible(paired_count > 0);
                 discovered_group.set_visible(discovered_count > 0);
@@ -425,6 +500,16 @@ impl ScannersPane {
                         .selected_path()
                         .unwrap_or_else(|| "No scanner selected".to_owned()),
                 );
+
+                let caption =
+                    discovery_caption_text(discovery_state, model_for_callback.discovered_count());
+                discovery_caption.set_label(&caption);
+                discovered_group.set_description(match discovery_state {
+                    DiscoveryState::Idle => None,
+                    DiscoveryState::Starting
+                    | DiscoveryState::Active
+                    | DiscoveryState::Stopping => Some(caption.as_str()),
+                });
             });
         }
 
@@ -436,6 +521,20 @@ impl ScannersPane {
 
     pub fn widget(&self) -> &gtk::Box {
         &self.root
+    }
+}
+
+pub fn discovery_caption_text(state: DiscoveryState, discovered_count: usize) -> String {
+    match state {
+        DiscoveryState::Idle => String::new(),
+        DiscoveryState::Starting | DiscoveryState::Active | DiscoveryState::Stopping => {
+            let noun = if discovered_count == 1 {
+                "scanner"
+            } else {
+                "scanners"
+            };
+            format!("Finding scanners... {discovered_count} {noun} found")
+        }
     }
 }
 
@@ -533,6 +632,19 @@ mod tests {
         assert_eq!(
             status_line(Status::Busy, true, false),
             "Discovered • Not paired"
+        );
+    }
+
+    #[test]
+    fn discovery_caption_tracks_count_while_active() {
+        assert_eq!(discovery_caption_text(DiscoveryState::Idle, 2), "");
+        assert_eq!(
+            discovery_caption_text(DiscoveryState::Starting, 0),
+            "Finding scanners... 0 scanners found"
+        );
+        assert_eq!(
+            discovery_caption_text(DiscoveryState::Active, 1),
+            "Finding scanners... 1 scanner found"
         );
     }
 }
