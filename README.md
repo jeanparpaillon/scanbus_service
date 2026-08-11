@@ -75,22 +75,10 @@ RUST_LOG=debug cargo run
 scanbus completions bash > ~/.local/share/bash-completion/completions/scanbus
 ```
 
-Example `~/.bashrc`:
+For a one-shot load in the current shell, keep the command substitution quoted:
 
 ```sh
-# Load system bash-completion, if present.
-if [ -f /usr/share/bash-completion/bash_completion ]; then
-  . /usr/share/bash-completion/bash_completion
-fi
-
-export XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
-
-# Pick up user-local completion scripts such as scanbus.
-if [ -d "$XDG_DATA_HOME/bash-completion/completions" ]; then
-  for completion in "$XDG_DATA_HOME"/bash-completion/completions/*; do
-    [ -f "$completion" ] && . "$completion"
-  done
-fi
+eval "$(scanbus completions bash)"
 ```
 
 Packaging assets for issue 26 live under `packaging/`:

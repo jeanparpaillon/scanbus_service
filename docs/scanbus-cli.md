@@ -117,7 +117,9 @@ timeout is not a conflict, because `--for` bounds the session and `--timeout` bo
 - **`status`** is the only command that tolerates an absent daemon: it reports
   `activatable`/`running`/`absent` and exits 0 for the first two. Everything else exits 3.
 - **`completions`** is local output only: it prints the shell script to stdout and never
-  touches D-Bus, so it works on a machine with no bus or daemon at all.
+  touches D-Bus, so it works on a machine with no bus or daemon at all. For a one-shot
+  load into the current shell, use `eval "$(scanbus completions bash)"` with the command
+  substitution quoted.
 - **`manpage`** is local output too: it renders the `scanbus(1)` document to stdout and
   never touches D-Bus, so packaging can generate it offline from the binary itself.
 - **`list`** reads `GetManagedObjects` and prints what exists *now*. It never starts discovery —

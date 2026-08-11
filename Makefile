@@ -34,13 +34,13 @@ debug:
 	$(MAKE) CARGO_ENV=debug all
 
 $(TARGET_DIR)/scanbus:
-	cargo build -p $(notdir $@) $(profile_opt)
+	cargo build --package scanbus-cli --bin $(notdir $@) $(profile_opt)
 
 $(TARGET_DIR)/scanbus-daemon:
-	cargo build -p $(notdir $@) $(profile_opt) --features $(BACKENDS)
+	cargo build --package scanbus-daemon --bin $(notdir $@) $(profile_opt) --features $(BACKENDS)
 
 $(TARGET_DIR)/scanbus-gui:
-	cargo build -p $(notdir $@) $(profile_opt)
+	cargo build --package scanbus-gui --bin $(notdir $@) $(profile_opt)
 
 install: $(TARGET_DIR)/scanbus $(TARGET_DIR)/scanbus-daemon
 	install -D -m 0755 "$(TARGET_DIR)/scanbus" "$(DESTDIR)$(BINDIR)/scanbus"
