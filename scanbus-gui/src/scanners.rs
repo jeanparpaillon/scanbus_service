@@ -793,7 +793,7 @@ impl ScannersPane {
                     return;
                 };
 
-                let dialog = gtk::Dialog::builder()
+                let window = gtk::Window::builder()
                     .modal(true)
                     .title("Unpair scanner?")
                     .build();
@@ -807,21 +807,34 @@ impl ScannersPane {
                 body.set_margin_bottom(18);
                 body.set_margin_start(18);
                 body.set_margin_end(18);
-                dialog.content_area().append(&body);
-                dialog.add_button("Cancel", gtk::ResponseType::Cancel);
-                let destructive = dialog.add_button("Unpair", gtk::ResponseType::Accept);
+
+                let actions = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+                actions.set_halign(gtk::Align::End);
+                let cancel = gtk::Button::with_label("Cancel");
+                let destructive = gtk::Button::with_label("Unpair");
                 destructive.add_css_class("destructive-action");
-                dialog.connect_response({
+                actions.append(&cancel);
+                actions.append(&destructive);
+
+                let content = gtk::Box::new(gtk::Orientation::Vertical, 18);
+                content.append(&body);
+                content.append(&actions);
+                window.set_child(Some(&content));
+                window.set_transient_for(parent.root().and_downcast_ref::<gtk::Window>());
+
+                cancel.connect_clicked({
+                    let window = window.clone();
+                    move |_| window.close()
+                });
+                destructive.connect_clicked({
                     let commands = commands.clone();
-                    move |dialog, response| {
-                        if response == gtk::ResponseType::Accept {
-                            let _ = commands.try_send(BusCommand::Unpair { path: path.clone() });
-                        }
-                        dialog.close();
+                    let window = window.clone();
+                    move |_| {
+                        let _ = commands.try_send(BusCommand::Unpair { path: path.clone() });
+                        window.close();
                     }
                 });
-                dialog.set_transient_for(parent.root().and_downcast_ref::<gtk::Window>());
-                dialog.present();
+                window.present();
             });
         }
 
@@ -921,13 +934,21 @@ fn scanner_row(
     confirm_box.append(&confirm_label);
     confirm_box.append(&code_label);
 
-    let failure_bar = gtk::InfoBar::new();
-    failure_bar.set_message_type(gtk::MessageType::Error);
-    failure_bar.set_show_close_button(false);
     let failure_message = gtk::Label::new(None);
+    let failure_banner = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    failure_banner.add_css_class("error");
+    failure_banner.add_css_class("card");
+    failure_banner.set_margin_top(6);
+    failure_banner.set_margin_bottom(6);
+    failure_banner.set_margin_start(12);
+    failure_banner.set_margin_end(12);
     failure_message.set_wrap(true);
     failure_message.set_xalign(0.0);
-    failure_bar.add_child(&failure_message);
+    failure_message.set_margin_top(10);
+    failure_message.set_margin_bottom(10);
+    failure_message.set_margin_start(10);
+    failure_message.set_margin_end(10);
+    failure_banner.append(&failure_message);
 
     let failure_details_label = gtk::Label::new(None);
     failure_details_label.set_selectable(true);
@@ -939,7 +960,7 @@ fn scanner_row(
     failure_details.set_expanded(false);
 
     let failure_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
-    failure_box.append(&failure_bar);
+    failure_box.append(&failure_banner);
     failure_box.append(&failure_details);
 
     let state_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
@@ -983,7 +1004,7 @@ fn scanner_row(
         let confirm_box = confirm_box.clone();
         let code_label = code_label.clone();
         let failure_box = failure_box.clone();
-        let failure_bar = failure_bar.clone();
+        let failure_banner = failure_banner.clone();
         let failure_message = failure_message.clone();
         let failure_details_label = failure_details_label.clone();
         move || {
@@ -1000,7 +1021,7 @@ fn scanner_row(
             failure_box.set_visible(false);
             spinner.set_visible(false);
             spinner.set_spinning(false);
-            failure_bar.set_visible(false);
+            failure_banner.set_visible(false);
 
             match pairing.as_str() {
                 "pairing" => {
@@ -1028,7 +1049,7 @@ fn scanner_row(
                 "failed" => {
                     pair_button.set_label("Try again");
                     failure_box.set_visible(true);
-                    failure_bar.set_visible(true);
+                    failure_banner.set_visible(true);
                     failure_message.set_label("Pairing failed");
                     failure_details_label.set_label(&error);
                 }

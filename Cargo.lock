@@ -1598,12 +1598,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "scanbus-backend-common"
+version = "0.1.0"
+dependencies = [
+ "futures-core",
+ "futures-util",
+ "scanbus-core",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "scanbus-backend-hplip"
 version = "0.1.0"
 dependencies = [
  "async-trait",
  "futures-core",
  "futures-util",
+ "scanbus-backend-common",
  "scanbus-core",
  "tempfile",
  "tokio",

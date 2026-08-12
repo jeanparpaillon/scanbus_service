@@ -113,8 +113,7 @@ fn install_actions(
     }
     app.add_action(&open_folder);
 
-    let show_scanner =
-        gio::SimpleAction::new("show-scanner", Some(&String::static_variant_type()));
+    let show_scanner = gio::SimpleAction::new("show-scanner", Some(&String::static_variant_type()));
     {
         let app = app.clone();
         let scanners = Rc::clone(&scanners);
@@ -158,9 +157,16 @@ fn launch_file(path: &str, lifecycle: &Rc<AppLifecycle>, containing_folder: bool
 
 #[derive(Debug, Clone)]
 enum Effect {
-    ScheduleProgress { job_path: String },
-    Send { id: String, notification: PreparedNotification },
-    Withdraw { id: String },
+    ScheduleProgress {
+        job_path: String,
+    },
+    Send {
+        id: String,
+        notification: PreparedNotification,
+    },
+    Withdraw {
+        id: String,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -225,7 +231,7 @@ impl NotificationEngine {
                 invalidated: _,
             } => {
                 if interface == SCANNER_INTERFACE {
-                    if let Some(name) = changed.get("Name").and_then(|value| string_value(value)) {
+                    if let Some(name) = changed.get("Name").and_then(string_value) {
                         self.scanner_names.insert(path.clone(), name);
                     }
                     return Vec::new();
@@ -572,7 +578,10 @@ mod tests {
             interfaces: HashMap::from([(
                 JOB_INTERFACE.to_owned(),
                 HashMap::from([
-                    ("Scanner".to_owned(), owned(ZValue::from(scanner_path().as_str()))),
+                    (
+                        "Scanner".to_owned(),
+                        owned(ZValue::from(scanner_path().as_str())),
+                    ),
                     ("Button".to_owned(), owned(ZValue::from(0i32))),
                     ("Profile".to_owned(), owned(ZValue::from("document"))),
                     ("State".to_owned(), owned(ZValue::from("receiving"))),

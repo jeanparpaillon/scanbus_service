@@ -6,6 +6,7 @@ members = [
     "scanbus-cli",
     "scanbus-gui",
     "scanbus-daemon",
+    "scanbus-backend-common",
     "scanbus-backend-brother",
     "scanbus-backend-hplip",
     "scanbus-backend-mobile",
@@ -35,6 +36,7 @@ repository = "https://github.com/jeanparpaillon/scanbus_service"
 [workspace.dependencies]
 scanbus-core = { path = "scanbus-core", version = "0.1.0" }
 scanbus-client = { path = "scanbus-client", version = "0.1.0" }
+scanbus-backend-common = { path = "scanbus-backend-common", version = "0.1.0" }
 scanbus-backend-brother = { path = "scanbus-backend-brother", version = "0.1.0" }
 scanbus-backend-hplip = { path = "scanbus-backend-hplip", version = "0.1.0" }
 scanbus-backend-mobile = { path = "scanbus-backend-mobile", version = "0.1.0" }

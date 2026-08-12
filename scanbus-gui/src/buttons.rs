@@ -794,7 +794,7 @@ fn open_profile_options(
     profile_options: &BTreeMap<String, Value>,
     overrides: &BTreeMap<String, Value>,
 ) {
-    let dialog = gtk::Dialog::builder()
+    let window = gtk::Window::builder()
         .modal(true)
         .title(format!("{} options", humanize_profile(profile.as_str())))
         .build();
@@ -847,11 +847,19 @@ fn open_profile_options(
     note.set_wrap(true);
     body.append(&note);
 
-    dialog.content_area().append(&body);
-    dialog.add_button("Close", gtk::ResponseType::Close);
-    dialog.connect_response(|dialog, _| dialog.close());
-    dialog.set_transient_for(parent.as_ref().root().and_downcast_ref::<gtk::Window>());
-    dialog.present();
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    actions.set_halign(gtk::Align::End);
+    let close = gtk::Button::with_label("Close");
+    actions.append(&close);
+    body.append(&actions);
+
+    window.set_child(Some(&body));
+    window.set_transient_for(parent.as_ref().root().and_downcast_ref::<gtk::Window>());
+    close.connect_clicked({
+        let window = window.clone();
+        move |_| window.close()
+    });
+    window.present();
 }
 
 #[cfg(test)]

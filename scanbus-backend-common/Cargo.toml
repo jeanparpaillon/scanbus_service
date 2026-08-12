@@ -1,0 +1,17 @@
+[package]
+name = "scanbus-backend-common"
+description = "Shared subprocess helpers for scanbus hardware backends"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+scanbus-core.workspace = true
+futures-core.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "process", "rt", "sync", "time"] }
+tracing.workspace = true
+
+[dev-dependencies]
+futures-util.workspace = true

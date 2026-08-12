@@ -10,12 +10,16 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use futures_core::stream::BoxStream;
 use futures_util::StreamExt as _;
+use scanbus_backend_common::{
+    DEFAULT_SCANIMAGE_HELPER, ScanimageConfig, fetch_pages_via_scanimage,
+};
 use scanbus_core::{
     BackendError, ButtonsCapability, Capabilities, PairingProgress, ProfileKind, RawPage,
     ScanTrigger, ScannerBackend, ScannerId, ScannerInfo, Source, Status, Value,
@@ -50,6 +54,8 @@ pub struct HplipBackend {
     hp_probe_path: PathBuf,
     dpkg_query_path: PathBuf,
     models_dat_path: PathBuf,
+    scanimage_helper_path: PathBuf,
+    fetch_state: Arc<Mutex<FetchState>>,
 }
 
 impl Default for HplipBackend {
@@ -58,6 +64,8 @@ impl Default for HplipBackend {
             hp_probe_path: PathBuf::from("/usr/bin/hp-probe"),
             dpkg_query_path: PathBuf::from("/usr/bin/dpkg-query"),
             models_dat_path: PathBuf::from("/usr/share/hplip/data/models/models.dat"),
+            scanimage_helper_path: PathBuf::from(DEFAULT_SCANIMAGE_HELPER),
+            fetch_state: Arc::new(Mutex::new(FetchState::default())),
         }
     }
 }
@@ -83,15 +91,47 @@ struct DependencyState {
     installed: bool,
 }
 
+#[derive(Debug, Default)]
+struct FetchState {
+    active: Vec<ScannerId>,
+    fetched: Vec<(ScannerId, String)>,
+    device_uris: BTreeMap<ScannerId, String>,
+}
+
 type HplipHistoryEntry = (String, String, i32, String, i32, String, f64);
 
 struct EventStream(mpsc::Receiver<ScanTrigger>);
+
+struct FetchStream {
+    inner: BoxStream<'static, Result<RawPage, BackendError>>,
+    scanner: ScannerId,
+    state: Arc<Mutex<FetchState>>,
+}
 
 impl futures_core::Stream for EventStream {
     type Item = ScanTrigger;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.get_mut().0.poll_recv(cx)
+    }
+}
+
+impl futures_core::Stream for FetchStream {
+    type Item = Result<RawPage, BackendError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        Pin::new(&mut this.inner).poll_next(cx)
+    }
+}
+
+impl Drop for FetchStream {
+    fn drop(&mut self) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("hplip fetch state lock is not poisoned");
+        state.active.retain(|scanner| scanner != &self.scanner);
     }
 }
 
@@ -194,6 +234,19 @@ impl HplipBackend {
                 ))
             })
     }
+
+    fn remember_device_uris(&self, scanners: &[ScannerInfo]) {
+        let mut state = self
+            .fetch_state
+            .lock()
+            .expect("hplip fetch state lock is not poisoned");
+        state.device_uris.clear();
+        for scanner in scanners {
+            if let Ok(uri) = Self::device_uri(scanner) {
+                state.device_uris.insert(scanner.id.clone(), uri.to_owned());
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -204,9 +257,12 @@ impl ScannerBackend for HplipBackend {
 
     async fn discover(&self) -> Result<Vec<ScannerInfo>, BackendError> {
         let backend = self.clone();
-        tokio::task::spawn_blocking(move || backend.discover_once())
+        let scanners = tokio::task::spawn_blocking(move || backend.discover_once())
             .await
-            .map_err(|error| BackendError::Other(format!("hplip discover task failed: {error}")))?
+            .map_err(|error| BackendError::Other(format!("hplip discover task failed: {error}")))?;
+        let scanners = scanners?;
+        self.remember_device_uris(&scanners);
+        Ok(scanners)
     }
 
     async fn ensure_installed(
@@ -249,7 +305,11 @@ impl ScannerBackend for HplipBackend {
             .await
             .map_err(|error| BackendError::Other(format!("could not talk to D-Bus: {error}")))?;
         let owner = bus
-            .get_name_owner(HPLIP_STATUS_SERVICE.try_into().expect("static bus name is valid"))
+            .get_name_owner(
+                HPLIP_STATUS_SERVICE
+                    .try_into()
+                    .expect("static bus name is valid"),
+            )
             .await
             .map_err(|_| BackendError::Other(hpssd_missing_message(&scanner_id)))?;
         let status_proxy = zbus::Proxy::new(
@@ -281,17 +341,25 @@ impl ScannerBackend for HplipBackend {
             .interface(DBUS_INTERFACE)
             .map_err(|error| BackendError::Other(format!("invalid D-Bus interface: {error}")))?
             .member("NameOwnerChanged")
-            .map_err(|error| BackendError::Other(format!("invalid NameOwnerChanged member: {error}")))?
+            .map_err(|error| {
+                BackendError::Other(format!("invalid NameOwnerChanged member: {error}"))
+            })?
             .add_arg(HPLIP_STATUS_SERVICE)
-            .map_err(|error| BackendError::Other(format!("invalid NameOwnerChanged filter: {error}")))?
+            .map_err(|error| {
+                BackendError::Other(format!("invalid NameOwnerChanged filter: {error}"))
+            })?
             .build();
 
         let mut toolbox_stream = MessageStream::for_match_rule(toolbox_rule, &connection, Some(8))
             .await
-            .map_err(|error| BackendError::Other(format!("could not subscribe to hpssd events: {error}")))?;
+            .map_err(|error| {
+                BackendError::Other(format!("could not subscribe to hpssd events: {error}"))
+            })?;
         let mut owner_stream = MessageStream::for_match_rule(owner_rule, &connection, Some(4))
             .await
-            .map_err(|error| BackendError::Other(format!("could not watch hpssd ownership: {error}")))?;
+            .map_err(|error| {
+                BackendError::Other(format!("could not watch hpssd ownership: {error}"))
+            })?;
 
         let (sender, receiver) = mpsc::channel(8);
         tokio::spawn(async move {
@@ -363,15 +431,21 @@ impl ScannerBackend for HplipBackend {
 
     async fn set_button_mapping(
         &self,
-        _scanner_id: &ScannerId,
-        _button_index: u32,
+        scanner_id: &ScannerId,
+        button_index: u32,
         _profile: Option<ProfileKind>,
         _options: &BTreeMap<String, Value>,
     ) -> Result<(), BackendError> {
-        Err(BackendError::Unsupported {
-            backend: ID,
-            operation: "set_button_mapping",
-        })
+        if !scanner_id.as_str().starts_with("hplip_") {
+            return Err(BackendError::UnknownScanner(scanner_id.clone()));
+        }
+        if button_index != HPLIP_BUTTON_INDEX {
+            return Err(BackendError::Other(format!(
+                "scanner {scanner_id} exposes one generic HPLIP walk-up trigger, index {HPLIP_BUTTON_INDEX}; asked to map button {button_index}"
+            )));
+        }
+
+        Ok(())
     }
 
     async fn fetch_pages(
@@ -379,10 +453,67 @@ impl ScannerBackend for HplipBackend {
         scanner_id: &ScannerId,
         trigger_id: &str,
     ) -> Result<BoxStream<'static, Result<RawPage, BackendError>>, BackendError> {
-        Err(BackendError::UnknownJob {
+        let fetch_key = (scanner_id.clone(), trigger_id.to_owned());
+        {
+            let mut state = self
+                .fetch_state
+                .lock()
+                .expect("hplip fetch state lock is not poisoned");
+            if state.fetched.contains(&fetch_key) {
+                return Err(BackendError::UnknownJob {
+                    scanner: scanner_id.clone(),
+                    job: trigger_id.to_owned(),
+                });
+            }
+            if state.active.contains(scanner_id) {
+                return Err(BackendError::Busy(scanner_id.clone()));
+            }
+            state.active.push(scanner_id.clone());
+        }
+
+        let device_name = {
+            let state = self
+                .fetch_state
+                .lock()
+                .expect("hplip fetch state lock is not poisoned");
+            state.device_uris.get(scanner_id).cloned()
+        };
+        let Some(device_name) = device_name else {
+            let mut state = self
+                .fetch_state
+                .lock()
+                .expect("hplip fetch state lock is not poisoned");
+            state.active.retain(|scanner| scanner != scanner_id);
+            return Err(BackendError::UnknownScanner(scanner_id.clone()));
+        };
+
+        let mut config = ScanimageConfig::new(scanner_id.clone(), device_name);
+        config.program = self.scanimage_helper_path.clone();
+        let pages = match fetch_pages_via_scanimage(config).await {
+            Ok(pages) => pages,
+            Err(error) => {
+                let mut state = self
+                    .fetch_state
+                    .lock()
+                    .expect("hplip fetch state lock is not poisoned");
+                state.active.retain(|scanner| scanner != scanner_id);
+                return Err(error);
+            }
+        };
+
+        {
+            let mut state = self
+                .fetch_state
+                .lock()
+                .expect("hplip fetch state lock is not poisoned");
+            state.fetched.push(fetch_key);
+        }
+
+        Ok(Box::pin(FetchStream {
+            inner: pages,
             scanner: scanner_id.clone(),
-            job: trigger_id.to_owned(),
-        })
+            state: Arc::clone(&self.fetch_state),
+        }))
     }
 }
 
@@ -756,7 +887,8 @@ fn scan_waiting_for_pc_trigger(
 }
 
 fn owner_lost(message: &zbus::Message, previous_owner: &str) -> bool {
-    let Ok((_, old_owner, new_owner)) = message.body().deserialize::<(String, String, String)>() else {
+    let Ok((_, old_owner, new_owner)) = message.body().deserialize::<(String, String, String)>()
+    else {
         return false;
     };
     old_owner == previous_owner && new_owner.is_empty()
@@ -771,6 +903,7 @@ fn hpssd_missing_message(scanner_id: &ScannerId) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use std::time::SystemTime;
 
     #[test]
@@ -944,6 +1077,92 @@ plugin-reason=64
                 &history
             )
             .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn set_button_mapping_accepts_the_single_generic_hplip_button() {
+        let backend = HplipBackend::default();
+        let scanner_id = ScannerId::from_backend(ID, "192.168.1.9").unwrap();
+
+        backend
+            .set_button_mapping(
+                &scanner_id,
+                0,
+                Some(ProfileKind::Document),
+                &BTreeMap::new(),
+            )
+            .await
+            .unwrap();
+
+        let error = backend
+            .set_button_mapping(
+                &scanner_id,
+                1,
+                Some(ProfileKind::Document),
+                &BTreeMap::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("one generic HPLIP walk-up trigger")
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_pages_is_busy_while_a_scan_is_running_and_unknown_afterwards() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let script = tempdir.path().join("scanimage.sh");
+        fs::write(
+            &script,
+            "#!/bin/sh\n\
+batch=\n\
+for arg in \"$@\"; do\n\
+  case \"$arg\" in\n\
+    --batch=*) batch=${arg#--batch=} ;;\n\
+  esac\n\
+done\n\
+sleep 0.2\n\
+printf 'P5\\n1 1\\n255\\n\\003' > \"$(printf \"$batch\" 1)\"\n",
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script, perms).unwrap();
+
+        let backend = HplipBackend {
+            scanimage_helper_path: script,
+            ..HplipBackend::default()
+        };
+        let scanner_id = ScannerId::from_backend(ID, "192.168.1.9").unwrap();
+        backend.fetch_state.lock().unwrap().device_uris.insert(
+            scanner_id.clone(),
+            "hp:/net/officejet_pro_9010?ip=192.168.1.9".to_owned(),
+        );
+
+        let mut stream = backend.fetch_pages(&scanner_id, "job-1").await.unwrap();
+        let busy = match backend.fetch_pages(&scanner_id, "job-2").await {
+            Ok(_) => panic!("a concurrent fetch on the same scanner should be busy"),
+            Err(error) => error,
+        };
+        assert_eq!(busy, BackendError::Busy(scanner_id.clone()));
+
+        let page = stream.next().await.unwrap().unwrap();
+        assert_eq!(page.index, 0);
+        assert!(stream.next().await.is_none());
+
+        let unknown = match backend.fetch_pages(&scanner_id, "job-1").await {
+            Ok(_) => panic!("the same trigger id must not be fetchable twice"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            unknown,
+            BackendError::UnknownJob {
+                scanner: scanner_id,
+                job: "job-1".to_owned(),
+            }
         );
     }
 }
