@@ -1,0 +1,177 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+# A release is a single set of artifacts for one commit; a re-run supersedes the one
+# in flight rather than racing it to the same tag.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_VERSION: 1.93.1
+
+jobs:
+  # The version the artifacts are named after comes from Cargo.toml, not from the tag:
+  # debian/rules reads the same field, so anything else would name the .debs one thing
+  # and the tarball another. On a tag push the two must agree, and finding out here
+  # costs a runner start instead of a full release build.
+  version:
+    name: version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: version
+        run: |
+          version=$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^version = "\(.*\)"/\1/p}' \
+            Cargo.toml | head -n 1)
+          if [ -z "$version" ]; then
+            echo "::error::no version in [workspace.package] of Cargo.toml"
+            exit 1
+          fi
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match workspace version $version"
+            exit 1
+          fi
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+          echo "Releasing $version"
+
+  source:
+    name: source tarball
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # `git archive` of the checked-out commit: the tarball is exactly the tracked
+      # tree, so it cannot pick up target/, .worktrees/ or anything else a build left
+      # behind. debian/ is tracked and stays in, which is what makes the tarball
+      # buildable on its own.
+      - name: Build tarball
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          mkdir -p dist
+          git archive --format=tar.gz \
+            --prefix="scanbus-$VERSION/" \
+            -o "dist/scanbus-$VERSION.tar.gz" HEAD
+
+      - name: Check it unpacks and carries debian/
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          tar -tzf "dist/scanbus-$VERSION.tar.gz" \
+            "scanbus-$VERSION/debian/rules" \
+            "scanbus-$VERSION/Cargo.lock" >/dev/null
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: source
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  deb:
+    name: debian packages
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # debian/control's Build-Depends, minus what the runner image already has.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            dpkg-dev pkgconf libgtk-4-dev libadwaita-1-dev
+
+      - name: Install toolchain
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            target
+          key: ${{ runner.os }}-release-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-release-${{ env.RUST_VERSION }}-
+
+      # `make -f debian/rules binary`, not dpkg-buildpackage: these rules stage into
+      # target/debian and build with `dpkg-deb --root-owner-group` (so no fakeroot,
+      # and no root-owned files in the cache), where dpkg-buildpackage would look for
+      # the .debs in the parent directory and would run `clean` first, throwing away
+      # the cargo cache this job restores.
+      - name: Build packages
+        run: make -f debian/rules binary
+
+      - name: Collect packages
+        run: |
+          mkdir -p dist
+          find target/debian -name '*.deb' -exec cp -t dist {} +
+          ls -l dist
+
+      # Catches a staging path that silently produced nothing, and a package whose
+      # dependencies dpkg-shlibdeps failed to fill in.
+      - name: Inspect packages
+        run: |
+          count=$(find dist -name '*.deb' | wc -l)
+          if [ "$count" -ne 3 ]; then
+            echo "::error::expected 3 packages (frontend, backend, meta), got $count"
+            exit 1
+          fi
+          for deb in dist/*.deb; do
+            echo "== $deb"
+            dpkg-deb --info "$deb" | sed -n '/^ Package:/,$p'
+            dpkg-deb --contents "$deb"
+            case "$(dpkg-deb --field "$deb" Depends)" in
+              *'${'*)
+                echo "::error::unsubstituted substvar in $deb's Depends"
+                exit 1
+                ;;
+            esac
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: debian
+          path: dist/*.deb
+          if-no-files-found: error
+
+  publish:
+    name: publish release
+    needs: [version, source, deb]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum ./*.tar.gz ./*.deb | tee SHA256SUMS
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "scanbus $VERSION" \
+            --verify-tag \
+            --generate-notes \
+            dist/*
