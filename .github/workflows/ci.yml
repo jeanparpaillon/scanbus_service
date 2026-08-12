@@ -18,11 +18,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev
-
       - name: Install toolchain
         run: |
           rustup toolchain install "$RUST_VERSION" --profile minimal \
@@ -41,12 +36,42 @@ jobs:
       - run: cargo fmt --all --check
 
       # Default features: neither backend is compiled into the daemon, because both
-      # shell out to hardware-specific tooling no runner has.
-      # `scanbus-gui` is temporarily excluded from CI builds: it pulls in a large GUI
-      # dependency stack that we do not want to provision on runners yet.
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # shell out to hardware-specific tooling no runner has. GUI linting and tests run
+      # in their own job so the headless workspace checks stay that way.
+      - run: cargo clippy --workspace --exclude scanbus-gui --all-targets --locked -- -D warnings
 
-      - run: cargo test --workspace --locked
+      - run: cargo test --workspace --exclude scanbus-gui --locked
+
+  gui:
+    name: gui headless + xvfb
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev xvfb
+
+      - name: Install toolchain
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal \
+            --component clippy
+          rustup default "$RUST_VERSION"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            target
+          key: ${{ runner.os }}-gui-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-gui-${{ env.RUST_VERSION }}-
+
+      - run: cargo clippy -p scanbus-gui --all-targets --locked -- -D warnings
+      - run: env -u DISPLAY -u WAYLAND_DISPLAY cargo test -p scanbus-gui --locked
+      - run: xvfb-run -a env GDK_BACKEND=x11 cargo test -p scanbus-gui --locked --features gtk-tests
+      - run: ./scripts/check-deps.sh
 
   features:
     name: feature matrix

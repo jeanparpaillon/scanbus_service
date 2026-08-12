@@ -6,6 +6,12 @@ edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+# The default suite stays headless; the handful of widget binding assertions run only
+# when CI (or a developer) asks for them explicitly under xvfb-run.
+gtk-tests = []
+
 [[bin]]
 name = "scanbus-gui"
 path = "src/main.rs"

@@ -969,6 +969,7 @@ mod tests {
         assert_ne!(empty_state_text(0), empty_state_text(4));
     }
 
+    #[cfg(feature = "gtk-tests")]
     mod widgets {
         use super::*;
 

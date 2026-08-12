@@ -687,8 +687,53 @@ mod tests {
         });
         assert!(matches!(
             done.as_slice(),
-            [Effect::Send { notification, .. }] if notification.body == "3 files"
+            [Effect::Send { id, notification }]
+                if id == &job_path() && notification.body == "3 files"
         ));
+    }
+
+    #[test]
+    fn progress_and_result_reuse_the_same_notification_id() {
+        let mut engine = NotificationEngine::default();
+        engine.handle_store_event(&scanner_added("ADF"));
+        engine.handle_store_event(&job_added(1));
+
+        let progress = engine.handle_store_event(&StoreEvent::PropertiesChanged {
+            path: job_path(),
+            interface: JOB_INTERFACE.to_owned(),
+            changed: HashMap::from([("PageCount".to_owned(), owned(ZValue::from(2u32)))]),
+            invalidated: Vec::new(),
+        });
+        let done = engine.handle_store_event(&StoreEvent::PropertiesChanged {
+            path: job_path(),
+            interface: JOB_INTERFACE.to_owned(),
+            changed: HashMap::from([
+                ("State".to_owned(), owned(ZValue::from("done"))),
+                (
+                    "Result".to_owned(),
+                    owned(ZValue::from(HashMap::from([(
+                        "path".to_owned(),
+                        owned(ZValue::from("/tmp/scan.pdf")),
+                    )]))),
+                ),
+            ]),
+            invalidated: Vec::new(),
+        });
+
+        let [
+            Effect::Send {
+                id: progress_id, ..
+            },
+        ] = progress.as_slice()
+        else {
+            panic!("expected one progress notification, got {progress:?}");
+        };
+        let [Effect::Send { id: done_id, .. }] = done.as_slice() else {
+            panic!("expected one terminal notification, got {done:?}");
+        };
+
+        assert_eq!(progress_id, done_id);
+        assert_eq!(done_id, &job_path());
     }
 
     #[test]
