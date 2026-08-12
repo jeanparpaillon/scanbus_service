@@ -1,9 +1,11 @@
 //! HP backend: discovery, install checks, and walk-up button listening through HPLIP.
 //!
 //! Discovery and package checks still come from the HPLIP command-line tools. Walk-up
-//! button delivery comes from `hpssd`: it owns `com.hplip.StatusService` on the
-//! session bus, emits `com.hplip.Toolbox.Event` updates there, and keeps the
-//! per-device history behind `GetHistory`.
+//! button delivery comes from HPLIP's status service: `hp-systray --force-startup`
+//! activates the canonical `com.hplip.StatusService` owner on the session bus, and the
+//! resulting `hpssd` process emits `com.hplip.Toolbox.Event` updates there while keeping
+//! the per-device history behind `GetHistory`. Scanbus may request that canonical D-Bus
+//! activation, but it must not become a second process manager for `hpssd.py`.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -28,6 +30,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, warn};
 use zbus::fdo::DBusProxy;
 use zbus::message::Type as MessageType;
+use zbus::names::{BusName, WellKnownName};
 use zbus::{MatchRule, MessageStream};
 
 /// Backend identifier, as it will be reported by [`ScannerBackend::id`].
@@ -247,6 +250,49 @@ impl HplipBackend {
             }
         }
     }
+
+    async fn status_service_owner(
+        scanner_id: &ScannerId,
+        bus: &DBusProxy<'_>,
+    ) -> Result<String, BackendError> {
+        let service_name =
+            WellKnownName::try_from(HPLIP_STATUS_SERVICE).expect("static bus name is valid");
+        let bus_name = BusName::from(service_name.clone());
+        let has_owner = bus.name_has_owner(bus_name).await.map_err(|error| {
+            BackendError::Other(format!(
+                "could not check HPLIP status service ownership: {error}"
+            ))
+        })?;
+        if has_owner {
+            return bus
+                .get_name_owner(BusName::from(service_name.clone()))
+                .await
+                .map(|owner| owner.to_string())
+                .map_err(|error| {
+                    BackendError::Other(format!(
+                        "could not resolve the HPLIP status service owner: {error}"
+                    ))
+                });
+        }
+
+        // Ask the session bus to start HPLIP's canonical owner. This keeps scanbus out of
+        // the business of spawning `hpssd.py` directly while still avoiding a manual
+        // pre-start requirement.
+        let activation_error = bus
+            .start_service_by_name(service_name.clone(), 0)
+            .await
+            .err()
+            .map(|error| error.to_string());
+        bus.get_name_owner(BusName::from(service_name))
+            .await
+            .map(|owner| owner.to_string())
+            .map_err(|_| {
+                BackendError::Other(hpssd_activation_missing_message(
+                    scanner_id,
+                    activation_error.as_deref(),
+                ))
+            })
+    }
 }
 
 #[async_trait]
@@ -304,14 +350,7 @@ impl ScannerBackend for HplipBackend {
         let bus = DBusProxy::new(&connection)
             .await
             .map_err(|error| BackendError::Other(format!("could not talk to D-Bus: {error}")))?;
-        let owner = bus
-            .get_name_owner(
-                HPLIP_STATUS_SERVICE
-                    .try_into()
-                    .expect("static bus name is valid"),
-            )
-            .await
-            .map_err(|_| BackendError::Other(hpssd_missing_message(&scanner_id)))?;
+        let owner = Self::status_service_owner(&scanner_id, &bus).await?;
         let status_proxy = zbus::Proxy::new(
             &connection,
             HPLIP_STATUS_SERVICE,
@@ -894,9 +933,18 @@ fn owner_lost(message: &zbus::Message, previous_owner: &str) -> bool {
     old_owner == previous_owner && new_owner.is_empty()
 }
 
-fn hpssd_missing_message(scanner_id: &ScannerId) -> String {
+fn hpssd_activation_missing_message(
+    scanner_id: &ScannerId,
+    activation_error: Option<&str>,
+) -> String {
+    let activation_detail = activation_error.map_or_else(String::new, |error| {
+        format!(" (activation returned: {error})")
+    });
     format!(
-        "hpssd is not running on the session bus for scanner {scanner_id}; hp-systray normally starts it, and scanbus will not start a competing copy"
+        "com.hplip.StatusService is not running on the session bus for scanner {scanner_id}; \
+scanbus asked D-Bus to activate HPLIP's canonical owner via hp-systray --force-startup, \
+but no owner appeared{activation_detail}; install a session D-Bus service for \
+com.hplip.StatusService, and note that scanbus will not start hpssd.py directly"
     )
 }
 
@@ -1078,6 +1126,29 @@ plugin-reason=64
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn hpssd_activation_message_mentions_dbus_activation_and_no_direct_spawn() {
+        let scanner_id = ScannerId::from_backend(ID, "192.168.1.9").unwrap();
+        let message = hpssd_activation_missing_message(&scanner_id, None);
+
+        assert!(
+            message.contains("activate HPLIP's canonical owner via hp-systray --force-startup")
+        );
+        assert!(message.contains("install a session D-Bus service for com.hplip.StatusService"));
+        assert!(message.contains("will not start hpssd.py directly"));
+    }
+
+    #[test]
+    fn hpssd_activation_message_includes_activation_failure_details() {
+        let scanner_id = ScannerId::from_backend(ID, "192.168.1.9").unwrap();
+        let message = hpssd_activation_missing_message(
+            &scanner_id,
+            Some("org.freedesktop.DBus.Error.ServiceUnknown"),
+        );
+
+        assert!(message.contains("activation returned: org.freedesktop.DBus.Error.ServiceUnknown"));
     }
 
     #[tokio::test]
