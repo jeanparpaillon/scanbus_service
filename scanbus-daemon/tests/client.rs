@@ -19,7 +19,8 @@ use std::time::Duration;
 use futures_util::StreamExt as _;
 use scanbus_client::proxy::{Manager1Proxy, Scanner1Proxy, object_manager};
 use scanbus_client::{
-    Bus, Error, Presence, ScanbusError, ScannerState, ScannerWatch, convert, presence,
+    Bus, Error, OptionType, OptionsSchema, Presence, ScanbusError, ScannerState, ScannerWatch,
+    convert, presence,
 };
 use scanbus_core::backend::mock::MockBackend;
 use scanbus_core::{
@@ -178,6 +179,83 @@ async fn every_proxy_round_trips_against_the_daemon() {
         ),
         other => panic!("expected a named refusal, got {other:?}"),
     }
+
+    daemon.shutdown().await;
+}
+
+/// Acceptance (10.14): the `image` schema this daemon publishes reaches a consumer as
+/// typed entries, with no `zvariant` anywhere in the reading.
+///
+/// That absence is the criterion, not a stylistic preference: the GUI's option rows are
+/// built from `values`, `min`/`max` and `default`, and if it had to reach for the raw
+/// maps to get them it would be a second decoder of the same property — free to disagree
+/// with the CLI's about what a narrow integer or a missing `values` means. So this test
+/// asserts against what a frontend actually sees, and imports nothing from `zbus` to do
+/// it.
+#[tokio::test]
+async fn the_daemons_option_schema_decodes_into_typed_entries() {
+    let Some(bus) = PrivateBus::start().await else {
+        return skipped("the_daemons_option_schema_decodes_into_typed_entries");
+    };
+
+    let daemon = Daemon::start(&bus, backends([brother()])).await;
+    let client = bus.connect().await;
+
+    let schema = OptionsSchema::fetch(&client, ProfileKind::Image)
+        .await
+        .unwrap();
+
+    let format = schema.get("format").expect("image accepts a format");
+    assert_eq!(
+        format.value,
+        OptionType::Str {
+            values: vec!["jpeg".to_owned(), "jpg".to_owned(), "png".to_owned()],
+        },
+        "the three spellings §6 documents, as a list a picker can be built from"
+    );
+    assert_eq!(format.default_str(), Some("jpeg"));
+    assert!(!format.description.is_empty());
+
+    let quality = schema.get("quality").expect("image accepts a quality");
+    assert_eq!(
+        quality.value,
+        OptionType::Integer {
+            min: Some(1),
+            max: Some(100),
+        }
+    );
+    assert_eq!(quality.default_integer(), Some(90));
+
+    let folder = schema
+        .get("output_folder")
+        .expect("image accepts an output folder");
+    assert_eq!(
+        folder.value,
+        OptionType::Path,
+        "a folder chooser, not a text entry"
+    );
+    let published = folder.default_str().expect("the resolved directory");
+    assert!(
+        std::path::Path::new(published).is_absolute(),
+        "the default a client displays as where the next scan lands: {published:?}"
+    );
+
+    // And §6's display rule, over the options the same object holds: `output_folder` is
+    // unset in a fresh store, so the effective value is the daemon's resolved directory
+    // rather than the empty string the store carries.
+    let proxy = scanbus_client::proxy::Profile1Proxy::for_profile(&client, ProfileKind::Image)
+        .await
+        .unwrap();
+    let options = convert::from_dict(&proxy.options().await.unwrap()).unwrap();
+    assert_eq!(
+        schema.effective("output_folder", &options),
+        Some(&Value::Str(published.to_owned()))
+    );
+    assert_eq!(
+        schema.effective("format", &options),
+        Some(&Value::Str("jpeg".to_owned())),
+        "a key the store does hold is what the store holds"
+    );
 
     daemon.shutdown().await;
 }

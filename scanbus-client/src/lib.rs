@@ -48,6 +48,7 @@
 pub mod connect;
 pub mod convert;
 pub mod error;
+pub mod profile;
 pub mod proxy;
 pub mod scanner;
 pub mod select;
@@ -56,6 +57,7 @@ pub mod watch;
 pub use connect::{BUS_NAME, Bus, Presence, connect, owner, presence};
 pub use convert::DecodeError;
 pub use error::{Error, Result, ScanbusError};
+pub use profile::{OptionSchema, OptionType, OptionsSchema};
 pub use scanner::ScannerState;
 pub use select::{
     Button, Job, Match, ObjectKind, Objects, Scanner, SelectError, resolve_button, resolve_job,

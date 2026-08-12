@@ -1,15 +1,15 @@
 //! `org.scanbus.Profile1` — the configurable options of a post-processing profile
 //! ([`scanbus-dbus-api.md`] §6).
 //!
-//! # This one is narrower than the others, on purpose
+//! # Open options, and the property that describes them
 //!
-//! §6 names the objects and gives a table of "typical options" per profile — format and
-//! quality for `image`, language for `ocr` — but never fixes an interface: the options
-//! are per-profile and open, which is exactly what an `a{sv}` is for. So the proxy is
-//! `Name` plus `Options`, which is what `profile list`, `profile show` and `profile set`
-//! ([`scanbus-cli.md`] §3) need and no more. [3.1] is what implements the objects, and if
-//! it finds it needs a typed property per profile, this is where that lands — adding one
-//! now would be inventing a contract from the client side.
+//! The options themselves stay an `a{sv}`: they are per-profile and open, which is what
+//! that signature is for, and the proxy hands them back as the wire carries them. What is
+//! no longer open is *which* keys a profile takes — `OptionsSchema` publishes that, the
+//! daemon generates it from the same table it validates writes against (10.13), and §6
+//! makes it normative over the prose. So the proxy grows the property rather than a typed
+//! getter per profile; the typing is one layer up in [`crate::profile::OptionsSchema`],
+//! for the same reason [`crate::scanner::ScannerState`] is not in the `Scanner1` proxy.
 //!
 //! [`scanbus-dbus-api.md`]: https://github.com/jeanparpaillon/scanbus_service/blob/master/docs/scanbus-dbus-api.md
 //! [`scanbus-cli.md`]: https://github.com/jeanparpaillon/scanbus_service/blob/master/docs/scanbus-cli.md
@@ -43,6 +43,15 @@ pub trait Profile1 {
     /// have, or a value it cannot use.
     #[zbus(property)]
     fn set_options(&self, value: HashMap<String, OwnedValue>) -> zbus::Result<()>;
+
+    /// What this profile accepts: one `a{sv}` entry per option key, as §6 fixes it.
+    ///
+    /// Read-only, but not constant — the effective default of `output_folder` changes
+    /// with the user's XDG directories — so a client that caches it refreshes on
+    /// `PropertiesChanged` rather than reading it once. [`crate::profile::OptionsSchema`]
+    /// is what turns it into something to build widgets from.
+    #[zbus(property)]
+    fn options_schema(&self) -> zbus::Result<HashMap<String, OwnedValue>>;
 }
 
 impl<'a> Profile1Proxy<'a> {

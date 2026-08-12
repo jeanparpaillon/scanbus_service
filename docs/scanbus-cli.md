@@ -37,6 +37,7 @@ scanbus-client/          # zbus proxies + selector resolution. Depends on scanbu
     ├── connect.rs       # bus selection, and --no-activate as a question about the name
     ├── convert.rs       # a{sv} -> model, and back for what a client sends
     ├── scanner.rs       # ScannerState: every Scanner1 property of API §3, typed
+    ├── profile.rs       # OptionsSchema: Profile1.OptionsSchema (API §6), typed
     ├── watch.rs         # subscribe -> call -> snapshot -> stream (§7)
     ├── select.rs        # selector -> object path resolution (§5)
     └── error.rs         # named D-Bus errors (API §8) as a Rust enum
