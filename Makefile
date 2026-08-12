@@ -33,6 +33,10 @@ endif
 binaries := scanbus scanbus-daemon scanbus-gui
 targets := $(patsubst %, $(TARGET_DIR)/%, $(binaries))
 
+ifneq (,$(findstring hplip,$(BACKENDS)))
+hplip_services := install-hplip-services
+endif
+
 all: $(targets)
 
 release:
@@ -61,11 +65,17 @@ install-license:
 install-copyright:
 	install -D -m 0644 debian/copyright "$(DESTDIR)$(DOCDIR)/$(DOC_PACKAGE)/copyright"
 
-install-services:
+install-services: $(hplip_services)
 	install -D -m 0644 packaging/systemd/user/scanbus.service \
 		"$(DESTDIR)$(SYSTEMD_USER_DIR)/scanbus.service"
 	install -D -m 0644 packaging/dbus-1/services/org.scanbus.service \
 		"$(DESTDIR)$(DBUS_SERVICE_DIR)/org.scanbus.service"
+
+# Only meaningful when the HP backend is linked in: it is the sole user of
+# com.hplip.StatusService, and the file starts hp-systray on any bus that reads it.
+install-hplip-services:
+	install -D -m 0644 packaging/dbus-1/services/scanbus-hplip-status.service \
+		"$(DESTDIR)$(DBUS_SERVICE_DIR)/scanbus-hplip-status.service"
 
 install-frontend: $(TARGET_DIR)/scanbus-gui
 	install -D -m 0755 "$(TARGET_DIR)/scanbus-gui" "$(DESTDIR)$(BINDIR)/scanbus-gui"
@@ -118,6 +128,6 @@ clean:
 
 .PHONY: all release debug 
 .PHONY: install install-backend install-frontend install-services install-doc
-.PHONY: install-license install-copyright
+.PHONY: install-license install-copyright install-hplip-services
 .PHONY: deb version version-check version-sync
 .PHONY: reload test clean lint

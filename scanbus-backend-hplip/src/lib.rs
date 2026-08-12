@@ -6,6 +6,19 @@
 //! resulting `hpssd` process emits `com.hplip.Toolbox.Event` updates there while keeping
 //! the per-device history behind `GetHistory`. Scanbus may request that canonical D-Bus
 //! activation, but it must not become a second process manager for `hpssd.py`.
+//!
+//! # Requesting the activation is not enough on its own
+//!
+//! No HPLIP package ships a D-Bus service file for `com.hplip.StatusService`, so on a
+//! stock system `StartServiceByName` answers `ServiceUnknown` and every HP pairing dies
+//! before it can listen. The missing half lives in this repository's packaging, as
+//! `packaging/dbus-1/services/scanbus-hplip-status.service`; the file is what makes the
+//! bus able to run `hp-systray --force-startup` on demand, and the code here only asks.
+//!
+//! Because the activator is HPLIP's tray program, walk-up depends on `hplip-gui` (which
+//! owns `/usr/bin/hp-systray`) and on the session having a `DISPLAY` — `hp-systray` exits
+//! immediately without one. The first is checked up front in [`dependency_states`]; the
+//! second can only be reported after the fact, which is what [`ActivationFailure`] is for.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -31,7 +44,7 @@ use tracing::{debug, warn};
 use zbus::fdo::DBusProxy;
 use zbus::message::Type as MessageType;
 use zbus::names::{BusName, WellKnownName};
-use zbus::{MatchRule, MessageStream};
+use zbus::{DBusError as _, MatchRule, MessageStream};
 
 /// Backend identifier, as it will be reported by [`ScannerBackend::id`].
 pub const ID: &str = "hplip";
@@ -41,6 +54,11 @@ const HPLIP_BUTTON_INDEX: u32 = 0;
 const HPLIP_EVENT_SCAN_WAITING_FOR_PC: i32 = 2006;
 const HPLIP_PACKAGE: &str = "hplip";
 const HPAIO_PACKAGE: &str = "libsane-hpaio";
+const HPLIP_GUI_PACKAGE: &str = "hplip-gui";
+/// The activator named by our D-Bus service file; shipped by [`HPLIP_GUI_PACKAGE`].
+const HP_SYSTRAY_PATH: &str = "/usr/bin/hp-systray";
+/// Where [`crate`]'s packaging installs the activation file HPLIP itself does not ship.
+const HPLIP_ACTIVATION_FILE: &str = "/usr/share/dbus-1/services/scanbus-hplip-status.service";
 const PROPRIETARY_PLUGIN_PACKAGE: &str = "hp-plugin";
 const HPLIP_SCAN_REASON_MASK: u32 = 0x40 | 0x80 | 0x100;
 const HPLIP_STATUS_SERVICE: &str = "com.hplip.StatusService";
@@ -281,15 +299,15 @@ impl HplipBackend {
         let activation_error = bus
             .start_service_by_name(service_name.clone(), 0)
             .await
-            .err()
-            .map(|error| error.to_string());
+            .err();
         bus.get_name_owner(BusName::from(service_name))
             .await
             .map(|owner| owner.to_string())
             .map_err(|_| {
                 BackendError::Other(hpssd_activation_missing_message(
                     scanner_id,
-                    activation_error.as_deref(),
+                    ActivationFailure::classify(activation_error.as_ref()),
+                    activation_error.as_ref().map(ToString::to_string).as_deref(),
                 ))
             })
     }
@@ -793,6 +811,19 @@ fn dependency_states(dpkg_query_path: &Path) -> Result<Vec<DependencyState>, Bac
                 ],
             )?,
         },
+        // Not a cosmetic extra: `hp-systray` lives in `hplip-gui`, and it is the only
+        // thing that ever claims `com.hplip.StatusService`. Without this package the
+        // activation in `status_service_owner` cannot succeed however it is invoked, so
+        // checking it here turns a puzzling "no owner appeared" at listen time into a
+        // named missing package at the start of pairing.
+        DependencyState {
+            package: HPLIP_GUI_PACKAGE,
+            installed: package_installed(
+                dpkg_query_path,
+                HPLIP_GUI_PACKAGE,
+                &[Path::new(HP_SYSTRAY_PATH)],
+            )?,
+        },
     ])
 }
 
@@ -934,18 +965,70 @@ fn owner_lost(message: &zbus::Message, previous_owner: &str) -> bool {
     old_owner == previous_owner && new_owner.is_empty()
 }
 
+/// Why the session bus produced no owner for `com.hplip.StatusService`.
+///
+/// The three cases need three different fixes and only the D-Bus reply tells them apart,
+/// so the failure is classified before it is rendered: an error message naming the wrong
+/// remedy is what sent issue #64 looking for a missing HPLIP feature when the missing
+/// piece was our own activation file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActivationFailure {
+    /// `ServiceUnknown` — no `.service` file on the bus declares the name at all.
+    NoServiceFile,
+    /// `Spawn.*` — the bus tried to run the activator and could not.
+    Spawn,
+    /// Activation reported success, yet nobody holds the name: `hp-systray` gave up.
+    NoOwner,
+}
+
+impl ActivationFailure {
+    fn classify(error: Option<&zbus::fdo::Error>) -> Self {
+        match error {
+            None => Self::NoOwner,
+            Some(zbus::fdo::Error::ServiceUnknown(_)) => Self::NoServiceFile,
+            Some(other) => {
+                if other.name().starts_with("org.freedesktop.DBus.Error.Spawn.") {
+                    Self::Spawn
+                } else {
+                    Self::NoOwner
+                }
+            }
+        }
+    }
+
+    /// The one thing worth doing about this failure, in the operator's terms.
+    fn remedy(self) -> String {
+        match self {
+            Self::NoServiceFile => format!(
+                "no D-Bus activation file on this session declares com.hplip.StatusService — \
+HPLIP ships none, so scanbus provides one at {HPLIP_ACTIVATION_FILE}; install the scanbus \
+backend package (or run `make install-services`) and reload the session bus with `make reload`"
+            ),
+            Self::Spawn => format!(
+                "the session bus could not run the activator; install the hplip-gui package so \
+that {HP_SYSTRAY_PATH} exists and is executable"
+            ),
+            Self::NoOwner => "hp-systray ran but never claimed the name; it refuses to start \
+without DISPLAY, so check the daemon's session environment with \
+`systemctl --user show-environment`"
+                .to_owned(),
+        }
+    }
+}
+
 fn hpssd_activation_missing_message(
     scanner_id: &ScannerId,
+    failure: ActivationFailure,
     activation_error: Option<&str>,
 ) -> String {
     let activation_detail = activation_error.map_or_else(String::new, |error| {
         format!(" (activation returned: {error})")
     });
+    let remedy = failure.remedy();
     format!(
         "com.hplip.StatusService is not running on the session bus for scanner {scanner_id}; \
 scanbus asked D-Bus to activate HPLIP's canonical owner via hp-systray --force-startup, \
-but no owner appeared{activation_detail}; install a session D-Bus service for \
-com.hplip.StatusService, and note that scanbus will not start hpssd.py directly"
+but no owner appeared{activation_detail}; {remedy}; scanbus will not start hpssd.py directly"
     )
 }
 
@@ -1132,12 +1215,12 @@ plugin-reason=64
     #[test]
     fn hpssd_activation_message_mentions_dbus_activation_and_no_direct_spawn() {
         let scanner_id = ScannerId::from_backend(ID, "192.168.1.9").unwrap();
-        let message = hpssd_activation_missing_message(&scanner_id, None);
+        let message =
+            hpssd_activation_missing_message(&scanner_id, ActivationFailure::NoOwner, None);
 
         assert!(
             message.contains("activate HPLIP's canonical owner via hp-systray --force-startup")
         );
-        assert!(message.contains("install a session D-Bus service for com.hplip.StatusService"));
         assert!(message.contains("will not start hpssd.py directly"));
     }
 
@@ -1146,10 +1229,93 @@ plugin-reason=64
         let scanner_id = ScannerId::from_backend(ID, "192.168.1.9").unwrap();
         let message = hpssd_activation_missing_message(
             &scanner_id,
+            ActivationFailure::NoServiceFile,
             Some("org.freedesktop.DBus.Error.ServiceUnknown"),
         );
 
         assert!(message.contains("activation returned: org.freedesktop.DBus.Error.ServiceUnknown"));
+    }
+
+    /// The three failures are told apart by the D-Bus reply, and only by it: issue #64
+    /// read as "HPLIP is broken" when what was missing was the activation file scanbus
+    /// itself ships.
+    #[test]
+    fn activation_failures_are_classified_from_the_dbus_reply() {
+        assert_eq!(
+            ActivationFailure::classify(Some(&zbus::fdo::Error::ServiceUnknown(
+                "The name com.hplip.StatusService was not provided by any .service files"
+                    .to_owned()
+            ))),
+            ActivationFailure::NoServiceFile
+        );
+        assert_eq!(
+            ActivationFailure::classify(Some(&zbus::fdo::Error::SpawnExecFailed(
+                "no such file".to_owned()
+            ))),
+            ActivationFailure::Spawn
+        );
+        assert_eq!(ActivationFailure::classify(None), ActivationFailure::NoOwner);
+    }
+
+    #[test]
+    fn each_activation_failure_names_its_own_remedy() {
+        let scanner_id = ScannerId::from_backend(ID, "192.168.1.9").unwrap();
+
+        let missing_file = hpssd_activation_missing_message(
+            &scanner_id,
+            ActivationFailure::NoServiceFile,
+            None,
+        );
+        assert!(missing_file.contains("scanbus-hplip-status.service"));
+
+        let spawn = hpssd_activation_missing_message(&scanner_id, ActivationFailure::Spawn, None);
+        assert!(spawn.contains(HP_SYSTRAY_PATH));
+
+        let no_owner =
+            hpssd_activation_missing_message(&scanner_id, ActivationFailure::NoOwner, None);
+        assert!(no_owner.contains("DISPLAY"));
+    }
+
+    /// `hplip-gui` owns `/usr/bin/hp-systray`, the only process that ever claims
+    /// `com.hplip.StatusService`. Pairing has to name it as a missing package rather than
+    /// let listening fail later with a bus error nobody can act on.
+    #[test]
+    fn pairing_reports_a_missing_hplip_gui_by_name() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let dpkg_query = tempdir.path().join("dpkg-query");
+        fs::write(
+            &dpkg_query,
+            "#!/bin/sh\n\
+for package; do :; done\n\
+if [ \"$package\" = \"hplip-gui\" ]; then exit 1; fi\n\
+printf 'installed\\n'\n",
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&dpkg_query).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&dpkg_query, perms).unwrap();
+
+        let backend = HplipBackend {
+            dpkg_query_path: dpkg_query,
+            ..HplipBackend::default()
+        };
+        let record = ProbeRecord {
+            device_uri: "hp:/net/officejet_pro_9010?ip=192.168.1.9".to_owned(),
+            model_name: "HP OfficeJet Pro 9010".to_owned(),
+            display_name: "OfficeJet Pro 9010".to_owned(),
+        };
+        let scanner = scanner_from_probe(record, &BTreeMap::new()).unwrap();
+
+        let error = backend.ensure_installed_once(&scanner).unwrap_err();
+        assert_eq!(
+            error,
+            BackendError::InstallFailed {
+                package: HPLIP_GUI_PACKAGE.to_owned(),
+                detail: format!(
+                    "{HPLIP_GUI_PACKAGE} is not installed; install it with your distribution package manager"
+                ),
+            }
+        );
     }
 
     #[tokio::test]

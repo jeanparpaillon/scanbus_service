@@ -1,0 +1,22 @@
+# scanbus ships this activation file because HPLIP does not.
+#
+# `hpssd` owns com.hplip.StatusService on the session bus, but no HPLIP package
+# makes the bus able to *start* it: the name only appears once something runs
+# hp-systray. Without this file, StartServiceByName() answers ServiceUnknown and
+# HP walk-up pairing fails before it can subscribe to com.hplip.Toolbox.Event.
+#
+# The activator must stay `hp-systray --force-startup`, never hpssd.py directly:
+# hp-systray is HPLIP's own startup path and is what forks hpssd with the helper
+# pipes it expects, and the forked child is what claims the name.
+#
+# No SystemdService= on purpose. hp-systray's *parent* process is the Qt tray UI
+# and hpssd is its forked child, so a Type=dbus unit would tie the name to the
+# tray and take hpssd down with it whenever the tray exits.
+#
+# The file name is deliberately not com.hplip.StatusService.service: dbus-daemon
+# indexes on Name= below, not on the file name, and keeping our own name out of
+# HPLIP's file namespace means this can never collide with an hplip package that
+# starts shipping its own.
+[D-BUS Service]
+Name=com.hplip.StatusService
+Exec=/usr/bin/hp-systray --force-startup
