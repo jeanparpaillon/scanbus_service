@@ -14,7 +14,8 @@ const PROFILE_INTERFACE: &str = "org.scanbus.Profile1";
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum StoreEvent {
-    ServicePresent(bool),
+    ServiceState(ServiceState),
+    ServiceDetails(ServiceDetails),
     Replace(ManagedSnapshot),
     InterfacesAdded {
         path: String,
@@ -37,6 +38,7 @@ pub enum ServiceState {
     #[default]
     Unknown,
     Running,
+    Activatable,
     Absent,
 }
 
@@ -50,8 +52,17 @@ pub enum DiscoveryState {
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
+pub struct ServiceDetails {
+    pub version: Option<String>,
+    pub backends: Vec<String>,
+    pub profile_types: Vec<String>,
+    pub output_folders: BTreeMap<ProfileKind, String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Store {
     pub service: ServiceState,
+    pub details: ServiceDetails,
     pub scanners: BTreeMap<ScannerId, ScannerEntry>,
     pub profiles: BTreeMap<ProfileKind, ProfileEntry>,
 }
@@ -94,11 +105,16 @@ pub struct ProfileEntry {
 impl Store {
     pub fn apply(&mut self, event: StoreEvent) -> Result<(), DecodeError> {
         match event {
-            StoreEvent::ServicePresent(true) => self.service = ServiceState::Running,
-            StoreEvent::ServicePresent(false) => {
-                self.service = ServiceState::Absent;
-                self.scanners.clear();
-                self.profiles.clear();
+            StoreEvent::ServiceState(state) => {
+                self.service = state;
+                if state != ServiceState::Running {
+                    self.details = ServiceDetails::default();
+                    self.scanners.clear();
+                    self.profiles.clear();
+                }
+            }
+            StoreEvent::ServiceDetails(details) => {
+                self.details = details;
             }
             StoreEvent::Replace(snapshot) => self.replace(snapshot)?,
             StoreEvent::InterfacesAdded { path, interfaces } => {
@@ -260,9 +276,9 @@ impl Store {
             PROFILE_INTERFACE => {
                 if let Some(kind) = path::profile_kind(object_path)
                     && let Some(profile) = self.profiles.get_mut(&kind)
-                    && let Some(options) = changed.get("Options")
+                    && let Some(value) = changed.get("Options")
                 {
-                    profile.options = dict_value(options, "Options")?;
+                    profile.options = dict_value(value, "Options")?;
                 }
             }
             _ => {}
@@ -541,6 +557,7 @@ mod tests {
     fn properties_changed_updates_only_the_named_scanner_fields() {
         let mut store = Store {
             service: ServiceState::Running,
+            details: ServiceDetails::default(),
             scanners: BTreeMap::from([(
                 scanner_id(),
                 ScannerEntry {
@@ -572,6 +589,7 @@ mod tests {
     fn marking_the_service_absent_clears_the_store() {
         let mut store = Store {
             service: ServiceState::Running,
+            details: ServiceDetails::default(),
             scanners: BTreeMap::from([(
                 scanner_id(),
                 ScannerEntry {
@@ -584,7 +602,9 @@ mod tests {
             profiles: BTreeMap::new(),
         };
 
-        store.apply(StoreEvent::ServicePresent(false)).unwrap();
+        store
+            .apply(StoreEvent::ServiceState(ServiceState::Absent))
+            .unwrap();
 
         assert_eq!(store.service, ServiceState::Absent);
         assert!(store.scanners.is_empty());

@@ -13,7 +13,9 @@ use scanbus_core::{PairingState, ProfileKind, Status};
 
 use crate::bus::BusCommand;
 use crate::buttons::ButtonsPage;
-use crate::store::{DiscoveryState, ProfileEntry, ScannerEntry, ServiceState, Store, StoreEvent};
+use crate::store::{
+    DiscoveryState, ProfileEntry, ScannerEntry, ServiceDetails, ServiceState, Store, StoreEvent,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToastAction {
@@ -264,6 +266,10 @@ impl ScannerListModel {
 
     pub fn service_state(&self) -> ServiceState {
         self.store.borrow().service
+    }
+
+    pub fn service_details(&self) -> ServiceDetails {
+        self.store.borrow().details.clone()
     }
 
     pub fn selected_path(&self) -> Option<String> {

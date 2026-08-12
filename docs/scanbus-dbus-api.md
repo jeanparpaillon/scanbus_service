@@ -27,6 +27,13 @@ Object: `/org/scanbus`
 | `StopDiscovery` | `() → ()` | Releases the caller's share of the discovery in progress; the probing stops once nobody holds one. |
 | `GetProfileTypes` | `() → (as)` | Returns the available profile types: `["image","document","email","ocr"]`. |
 
+### Properties
+
+| Property | Type | Access | Description |
+|---|---|---|---|
+| `Version` | `s` | read | The daemon package version answering on this bus. |
+| `Backends` | `as` | read | The backend ids this daemon will probe, in precedence order. |
+
 **Discovery is shared between clients, and reference-counted by caller.** One session at a time, owned by every client that asked for it — tracked by unique bus name, so neither method needs an argument for it:
 
 - A second `StartDiscovery` **joins** the running session: it restarts nothing, applies none of its `filters` to what is already running — restarting would remove and re-add every unpaired object the first client is watching — and returns successfully.

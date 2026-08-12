@@ -12,7 +12,7 @@ use crate::autostart;
 use crate::bus::BusCommand;
 use crate::lifecycle::AppLifecycle;
 use crate::scanners::{ScannerListModel, ScannersPane, ToastAction};
-use crate::store::DiscoveryState;
+use crate::store::{DiscoveryState, ServiceState};
 
 pub fn build_window(
     app: &adw::Application,
@@ -80,13 +80,11 @@ pub fn build_window(
     content.append(&gtk::Separator::new(gtk::Orientation::Vertical));
     content.append(&page_stack);
 
+    let overlay = adw::ToastOverlay::new();
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     root.append(&header);
     root.append(&content);
-
-    let overlay = adw::ToastOverlay::new();
     overlay.set_child(Some(&root));
-    page_stack.add_named(&settings_page(&overlay), Some("settings"));
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
@@ -95,6 +93,17 @@ pub fn build_window(
         .default_height(720)
         .content(&overlay)
         .build();
+
+    page_stack.add_named(
+        &settings_page(
+            &window,
+            &page_stack,
+            Rc::clone(&scanners),
+            commands.clone(),
+            &overlay,
+        ),
+        Some("settings"),
+    );
 
     {
         let footer = footer.clone();
@@ -221,8 +230,45 @@ pub fn build_window(
     window
 }
 
-fn settings_page(overlay: &adw::ToastOverlay) -> gtk::ScrolledWindow {
+fn settings_page(
+    window: &adw::ApplicationWindow,
+    page_stack: &gtk::Stack,
+    model: Rc<ScannerListModel>,
+    commands: Sender<BusCommand>,
+    overlay: &adw::ToastOverlay,
+) -> gtk::ScrolledWindow {
     let page = adw::PreferencesPage::new();
+    let daemon_group = adw::PreferencesGroup::builder()
+        .title("Daemon")
+        .description("Read the scanbus daemon state without starting it, then start it explicitly when it is only activatable.")
+        .build();
+
+    let daemon_row = adw::ActionRow::builder().title("Service").build();
+    let start_button = gtk::Button::with_label("Start");
+    start_button.set_valign(gtk::Align::Center);
+    daemon_row.add_suffix(&start_button);
+    daemon_group.add(&daemon_row);
+
+    let version_row = adw::ActionRow::builder().title("Version").build();
+    daemon_group.add(&version_row);
+
+    let backends_row = adw::ActionRow::builder().title("Backends").build();
+    daemon_group.add(&backends_row);
+
+    let profiles_row = adw::ActionRow::builder().title("Profile types").build();
+    daemon_group.add(&profiles_row);
+    page.add(&daemon_group);
+
+    let output_group = adw::PreferencesGroup::builder()
+        .title("Default output folders")
+        .description("These folders are read-only here. Use Profiles to change them.")
+        .build();
+    let image_row = profile_folder_row("Image");
+    let document_row = profile_folder_row("Document");
+    output_group.add(&image_row);
+    output_group.add(&document_row);
+    page.add(&output_group);
+
     let group = adw::PreferencesGroup::builder()
         .title("Background mode")
         .description("The packaged GNOME session starts scanbus-gui in the background at login through XDG autostart.")
@@ -247,6 +293,37 @@ fn settings_page(overlay: &adw::ToastOverlay) -> gtk::ScrolledWindow {
             toggle.set_sensitive(false);
             row.set_subtitle(&format!("Could not read the autostart override: {error}"));
         }
+    }
+
+    let about_group = adw::PreferencesGroup::builder().title("About").build();
+    let about_row = adw::ActionRow::builder()
+        .title("About Scanbus")
+        .subtitle("GUI version, daemon version, repository and licence")
+        .activatable(true)
+        .build();
+    about_row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+    about_group.add(&about_row);
+    page.add(&about_group);
+
+    {
+        let commands = commands.clone();
+        start_button.connect_clicked(move |_| {
+            let _ = commands.try_send(BusCommand::StartService);
+        });
+    }
+
+    {
+        let page_stack = page_stack.clone();
+        image_row.connect_activated(move |_| {
+            page_stack.set_visible_child_name("profiles");
+        });
+    }
+
+    {
+        let page_stack = page_stack.clone();
+        document_row.connect_activated(move |_| {
+            page_stack.set_visible_child_name("profiles");
+        });
     }
 
     {
@@ -274,6 +351,83 @@ fn settings_page(overlay: &adw::ToastOverlay) -> gtk::ScrolledWindow {
         });
     }
 
+    {
+        let window = window.clone();
+        let model = Rc::clone(&model);
+        about_row.connect_activated(move |_| {
+            let details = model.service_details();
+            let daemon_version = details.version.unwrap_or_else(|| "unknown".to_owned());
+            let about = gtk::AboutDialog::builder()
+                .program_name("Scanbus")
+                .logo_icon_name("org.scanbus.Gui")
+                .version(env!("CARGO_PKG_VERSION"))
+                .website(env!("CARGO_PKG_REPOSITORY"))
+                .website_label("Repository")
+                .license_type(gtk::License::Unknown)
+                .comments(format!(
+                    "GUI version: {}.\nDaemon version: {}.\nLicence: Unknown.",
+                    env!("CARGO_PKG_VERSION"),
+                    daemon_version
+                ))
+                .transient_for(&window)
+                .modal(true)
+                .build();
+            about.present();
+        });
+    }
+
+    {
+        let model = Rc::clone(&model);
+        let refresh_model = Rc::clone(&model);
+        let daemon_row = daemon_row.clone();
+        let start_button = start_button.clone();
+        let version_row = version_row.clone();
+        let backends_row = backends_row.clone();
+        let profiles_row = profiles_row.clone();
+        let image_row = image_row.clone();
+        let document_row = document_row.clone();
+        let refresh = move || {
+            let details = refresh_model.service_details();
+            match refresh_model.service_state() {
+                ServiceState::Running => {
+                    daemon_row.set_subtitle("Running");
+                    start_button.set_visible(false);
+                }
+                ServiceState::Activatable => {
+                    daemon_row.set_subtitle("Installed, but not running");
+                    start_button.set_visible(true);
+                    start_button.set_sensitive(true);
+                }
+                ServiceState::Absent => {
+                    daemon_row.set_subtitle("Absent from this session bus");
+                    start_button.set_visible(false);
+                }
+                ServiceState::Unknown => {
+                    daemon_row.set_subtitle("Checking the bus…");
+                    start_button.set_visible(false);
+                }
+            }
+
+            version_row.set_subtitle(details.version.as_deref().unwrap_or("Unknown"));
+            backends_row.set_subtitle(&joined(&details.backends));
+            profiles_row.set_subtitle(&joined(&details.profile_types));
+            set_folder_row(
+                &image_row,
+                details
+                    .output_folders
+                    .get(&scanbus_core::ProfileKind::Image),
+            );
+            set_folder_row(
+                &document_row,
+                details
+                    .output_folders
+                    .get(&scanbus_core::ProfileKind::Document),
+            );
+        };
+        refresh();
+        model.connect_changed(refresh);
+    }
+
     let scroller = gtk::ScrolledWindow::new();
     scroller.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
     scroller.set_child(Some(&page));
@@ -292,6 +446,27 @@ fn autostart_subtitle(enabled: bool) -> String {
             autostart::DESKTOP_FILE_NAME
         )
     }
+}
+
+fn joined(values: &[String]) -> String {
+    if values.is_empty() {
+        "-".to_owned()
+    } else {
+        values.join(", ")
+    }
+}
+
+fn profile_folder_row(title: &str) -> adw::ActionRow {
+    let row = adw::ActionRow::builder()
+        .title(title)
+        .activatable(true)
+        .build();
+    row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+    row
+}
+
+fn set_folder_row(row: &adw::ActionRow, folder: Option<&String>) {
+    row.set_subtitle(folder.map(String::as_str).unwrap_or("Unknown"));
 }
 
 fn row(title: &str, page: &str) -> gtk::ListBoxRow {

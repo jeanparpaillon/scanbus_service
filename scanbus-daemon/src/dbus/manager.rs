@@ -1,4 +1,4 @@
-//! [`Manager1`]: the three methods of §2, at `/org/scanbus`.
+//! [`Manager1`]: the discovery methods and service properties of §2, at `/org/scanbus`.
 //!
 //! Thin on purpose. `StartDiscovery` and `StopDiscovery` are a session
 //! ([`crate::discovery`]) and everything they publish reaches clients through the
@@ -47,6 +47,23 @@ impl Manager1 {
 
 #[zbus::interface(name = "org.scanbus.Manager1")]
 impl Manager1 {
+    /// The daemon version answering on this bus.
+    #[zbus(property(emits_changed_signal = "const"))]
+    fn version(&self) -> String {
+        env!("CARGO_PKG_VERSION").to_owned()
+    }
+
+    /// The backend ids this daemon will probe, in precedence order.
+    #[zbus(property(emits_changed_signal = "const"))]
+    fn backends(&self) -> Vec<String> {
+        self.discovery
+            .backends()
+            .ids()
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
     /// Starts discovery through every active backend, or the subset `filters` names.
     ///
     /// Returns as soon as the session is running — the scanners arrive afterwards, as

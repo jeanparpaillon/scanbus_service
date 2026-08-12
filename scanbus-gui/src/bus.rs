@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::thread;
@@ -5,8 +6,13 @@ use std::time::Duration;
 
 use async_channel::{Receiver, Sender};
 use futures_util::StreamExt as _;
-use scanbus_client::proxy::{Button1Proxy, Manager1Proxy, Scanner1Proxy, object_manager};
-use scanbus_client::{Bus, Error, ScanbusError, connect, owner};
+use scanbus_client::profile::is_unset;
+use scanbus_client::proxy::{
+    Button1Proxy, Manager1Proxy, Profile1Proxy, Scanner1Proxy, object_manager,
+};
+use scanbus_client::{
+    Bus, Error, OptionsSchema, Presence, ScanbusError, connect, convert, presence,
+};
 use scanbus_core::{ProfileKind, path};
 use tokio::runtime::Builder;
 use tokio::select;
@@ -16,10 +22,11 @@ use zbus::zvariant::OwnedValue;
 use zbus::{Message, MessageStream};
 
 use crate::scanners::ToastSpec;
-use crate::store::{Dict, ManagedSnapshot, StoreEvent};
+use crate::store::{Dict, ManagedSnapshot, ServiceDetails, ServiceState, StoreEvent};
 
 #[derive(Debug, Clone)]
 pub enum BusCommand {
+    StartService,
     StartDiscovery,
     StopDiscovery {
         quiet: bool,
@@ -108,7 +115,9 @@ async fn run(bus: Bus, commands: Receiver<BusCommand>, events: Sender<BusEvent>)
             Err(error) => {
                 warn!(%error, "scanbus-gui bus loop failed; retrying");
                 let _ = events
-                    .send(BusEvent::Store(StoreEvent::ServicePresent(false)))
+                    .send(BusEvent::Store(StoreEvent::ServiceState(
+                        ServiceState::Unknown,
+                    )))
                     .await;
                 let _ = events.send(BusEvent::DiscoveryActive(false)).await;
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -122,30 +131,55 @@ async fn run_session(
     commands: &Receiver<BusCommand>,
     events: &Sender<BusEvent>,
 ) -> Result<(), Error> {
-    let connection = connect(bus, true).await?;
+    let connection = bus.connect().await?;
     let mut leases = DiscoveryLeases::default();
     let mut messages = MessageStream::from(&connection);
 
     loop {
-        let Some(current_owner) = owner(&connection).await? else {
-            let _ = events
-                .send(BusEvent::Store(StoreEvent::ServicePresent(false)))
-                .await;
-            let _ = events.send(BusEvent::DiscoveryActive(false)).await;
-            wait_for_owner(&mut messages).await?;
-            continue;
-        };
+        match presence(&connection).await? {
+            Presence::Running => {}
+            Presence::Activatable => {
+                let _ = events
+                    .send(BusEvent::Store(StoreEvent::ServiceState(
+                        ServiceState::Activatable,
+                    )))
+                    .await;
+                let _ = events.send(BusEvent::DiscoveryActive(false)).await;
+                if !wait_for_owner(bus, &connection, commands, events, &mut messages).await? {
+                    return Ok(());
+                }
+                continue;
+            }
+            Presence::Absent => {
+                let _ = events
+                    .send(BusEvent::Store(StoreEvent::ServiceState(
+                        ServiceState::Absent,
+                    )))
+                    .await;
+                let _ = events.send(BusEvent::DiscoveryActive(false)).await;
+                if !wait_for_owner(bus, &connection, commands, events, &mut messages).await? {
+                    return Ok(());
+                }
+                continue;
+            }
+        }
 
-        debug!(owner = %current_owner, "scanbus owner appeared");
+        debug!("scanbus owner appeared");
         let manager = object_manager(&connection).await?;
         let managed = manager.get_managed_objects().await?;
+        let details = load_service_details(&connection).await?;
         let _ = events
-            .send(BusEvent::Store(StoreEvent::ServicePresent(true)))
+            .send(BusEvent::Store(StoreEvent::ServiceState(
+                ServiceState::Running,
+            )))
             .await;
         let _ = events
             .send(BusEvent::Store(StoreEvent::Replace(normalize_snapshot(
                 managed,
             ))))
+            .await;
+        let _ = events
+            .send(BusEvent::Store(StoreEvent::ServiceDetails(details)))
             .await;
 
         loop {
@@ -175,20 +209,41 @@ async fn run_session(
     }
 }
 
-async fn wait_for_owner(messages: &mut MessageStream) -> Result<(), Error> {
-    while let Some(message) = messages.next().await {
-        let message = message?;
-        if is_signal(&message, "org.freedesktop.DBus", "NameOwnerChanged")
-            && let Ok((name, _old_owner, new_owner)) =
-                message.body().deserialize::<(String, String, String)>()
-            && name == scanbus_client::BUS_NAME
-            && !new_owner.is_empty()
-        {
-            return Ok(());
+async fn wait_for_owner(
+    _bus: &Bus,
+    connection: &zbus::Connection,
+    commands: &Receiver<BusCommand>,
+    events: &Sender<BusEvent>,
+    messages: &mut MessageStream,
+) -> Result<bool, Error> {
+    loop {
+        select! {
+            command = commands.recv() => {
+                let Ok(command) = command else {
+                    return Ok(false);
+                };
+                if let BusCommand::StartService = command
+                    && let Err(error) = start_service(connection, events).await
+                {
+                    warn!(%error, "could not start the scanbus service");
+                }
+            }
+            message = messages.next() => {
+                let Some(message) = message else {
+                    return Ok(false);
+                };
+                let message = message?;
+                if is_signal(&message, "org.freedesktop.DBus", "NameOwnerChanged")
+                    && let Ok((name, _old_owner, new_owner)) =
+                        message.body().deserialize::<(String, String, String)>()
+                    && name == scanbus_client::BUS_NAME
+                    && !new_owner.is_empty()
+                {
+                    return Ok(true);
+                }
+            }
         }
     }
-
-    Ok(())
 }
 
 async fn dispatch_signal(
@@ -217,7 +272,9 @@ async fn dispatch_signal(
         if new_owner.is_empty() {
             leases.clear();
             let _ = events
-                .send(BusEvent::Store(StoreEvent::ServicePresent(false)))
+                .send(BusEvent::Store(StoreEvent::ServiceState(
+                    ServiceState::Unknown,
+                )))
                 .await;
             let _ = events.send(BusEvent::DiscoveryActive(false)).await;
             return Ok(true);
@@ -306,6 +363,7 @@ async fn handle_command(
     leases: &mut DiscoveryLeases,
 ) -> Result<(), Error> {
     match command {
+        BusCommand::StartService => start_service(connection, events).await?,
         BusCommand::StartDiscovery => {
             let manager = Manager1Proxy::new(connection).await?;
             match manager.start_discovery(HashMap::new()).await {
@@ -492,6 +550,73 @@ async fn handle_command(
     }
 
     Ok(())
+}
+
+async fn start_service(
+    connection: &zbus::Connection,
+    events: &Sender<BusEvent>,
+) -> Result<(), Error> {
+    if presence(connection).await? == Presence::Absent {
+        let _ = events
+            .send(BusEvent::Toast(ToastSpec::new(
+                "Scanbus is not installed on this session bus",
+            )))
+            .await;
+        return Ok(());
+    }
+
+    let manager = Manager1Proxy::new(connection).await?;
+    if let Err(error) = manager.get_profile_types().await {
+        let error = Error::from(error);
+        if let Error::Call(ref refusal) = error {
+            let _ = events
+                .send(BusEvent::Toast(ToastSpec::new(crate::error::present(
+                    refusal,
+                ))))
+                .await;
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+async fn load_service_details(connection: &zbus::Connection) -> Result<ServiceDetails, Error> {
+    let manager = Manager1Proxy::new(connection).await?;
+    let version = manager.version().await?;
+    let backends = manager.backends().await?;
+    let profile_types = manager.get_profile_types().await?;
+    let mut output_folders = BTreeMap::new();
+
+    for profile in &profile_types {
+        let Ok(kind) = profile.parse::<ProfileKind>() else {
+            continue;
+        };
+        let schema = OptionsSchema::fetch(connection, kind).await?;
+        let options = Profile1Proxy::for_profile(connection, kind)
+            .await?
+            .options()
+            .await?;
+        let options = convert::from_dict(&options)?;
+        if let Some(entry) = schema.get("output_folder") {
+            let folder = entry
+                .effective(
+                    options
+                        .get("output_folder")
+                        .filter(|value| !is_unset(value)),
+                )
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_owned();
+            output_folders.insert(kind, folder);
+        }
+    }
+
+    Ok(ServiceDetails {
+        version: Some(version),
+        backends,
+        profile_types,
+        output_folders,
+    })
 }
 
 /// Turns a rejected property write into a toast.

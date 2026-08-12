@@ -110,8 +110,11 @@ async fn every_proxy_round_trips_against_the_daemon() {
     let daemon = Daemon::start(&bus, backends([found.clone()])).await;
     let client = bus.connect().await;
 
-    // Manager1: a method, and the ObjectManager §2 uses instead of a signal of its own.
+    // Manager1: its global properties, a method, and the ObjectManager §2 uses instead
+    // of a signal of its own.
     let manager = Manager1Proxy::new(&client).await.unwrap();
+    assert_eq!(manager.version().await.unwrap(), env!("CARGO_PKG_VERSION"));
+    assert_eq!(manager.backends().await.unwrap(), ["mock"]);
     assert_eq!(
         manager.get_profile_types().await.unwrap(),
         ["image", "document"]

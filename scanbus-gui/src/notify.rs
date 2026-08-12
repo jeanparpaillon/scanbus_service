@@ -15,7 +15,7 @@ use zbus::zvariant::{OwnedValue, Value as ZValue};
 
 use crate::lifecycle::AppLifecycle;
 use crate::scanners::ScannerListModel;
-use crate::store::{Dict, StoreEvent};
+use crate::store::{Dict, ServiceState, StoreEvent};
 
 const JOB_INTERFACE: &str = "org.scanbus.Job1";
 const SCANNER_INTERFACE: &str = "org.scanbus.Scanner1";
@@ -178,7 +178,9 @@ struct NotificationEngine {
 impl NotificationEngine {
     fn handle_store_event(&mut self, event: &StoreEvent) -> Vec<Effect> {
         match event {
-            StoreEvent::ServicePresent(false) => self.handle_service_absent(),
+            StoreEvent::ServiceState(ServiceState::Unknown)
+            | StoreEvent::ServiceState(ServiceState::Activatable)
+            | StoreEvent::ServiceState(ServiceState::Absent) => self.handle_service_absent(),
             StoreEvent::Replace(snapshot) => {
                 self.scanner_names.clear();
                 self.jobs.clear();
@@ -296,7 +298,9 @@ impl NotificationEngine {
 
                 Vec::new()
             }
-            StoreEvent::ServicePresent(true) => Vec::new(),
+            StoreEvent::ServiceState(ServiceState::Running) | StoreEvent::ServiceDetails(_) => {
+                Vec::new()
+            }
         }
     }
 
@@ -700,7 +704,7 @@ mod tests {
             invalidated: Vec::new(),
         });
 
-        let effects = engine.handle_store_event(&StoreEvent::ServicePresent(false));
+        let effects = engine.handle_store_event(&StoreEvent::ServiceState(ServiceState::Absent));
         assert!(matches!(
             effects.as_slice(),
             [Effect::Withdraw { id }] if id == &job_path()

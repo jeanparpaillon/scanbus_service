@@ -1,4 +1,5 @@
-//! `org.scanbus.Manager1` — the three methods of [`scanbus-dbus-api.md`] §2.
+//! `org.scanbus.Manager1` — the discovery methods and service properties of
+//! [`scanbus-dbus-api.md`] §2.
 //!
 //! [`scanbus-dbus-api.md`]: https://github.com/jeanparpaillon/scanbus_service/blob/master/docs/scanbus-dbus-api.md
 
@@ -17,6 +18,14 @@ use zbus::zvariant::OwnedValue;
     default_path = "/org/scanbus"
 )]
 pub trait Manager1 {
+    /// The daemon version answering on this bus.
+    #[zbus(property)]
+    fn version(&self) -> zbus::Result<String>;
+
+    /// The backend ids this daemon will probe, in precedence order.
+    #[zbus(property)]
+    fn backends(&self) -> zbus::Result<Vec<String>>;
+
     /// Starts discovery through every active backend, or the subset `filters` names.
     ///
     /// `filters` is `{"backends": ["sane","avahi"]}` or empty. Returns as soon as the

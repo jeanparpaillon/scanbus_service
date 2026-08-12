@@ -21,6 +21,16 @@ struct Manager;
 
 #[zbus::interface(name = "org.scanbus.Manager1")]
 impl Manager {
+    #[zbus(property)]
+    fn version(&self) -> String {
+        "1.2.3".to_owned()
+    }
+
+    #[zbus(property)]
+    fn backends(&self) -> Vec<String> {
+        vec!["mobile".to_owned(), "brother".to_owned()]
+    }
+
     fn get_profile_types(&self) -> Vec<String> {
         vec!["image".to_owned(), "document".to_owned()]
     }
@@ -86,9 +96,10 @@ fn an_activatable_daemon_exits_zero_and_is_not_started() {
     assert_eq!(status["daemon"], "activatable");
 }
 
-/// A daemon that is there: the owner and the profile types come back.
+/// A daemon that is there: the owner, the global properties and the profile types come
+/// back.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_running_daemon_reports_its_owner_and_its_profile_types() {
+async fn a_running_daemon_reports_its_owner_properties_and_profile_types() {
     let Some(bus) = PrivateBus::start() else {
         return skipped("a_running_daemon_reports_its_owner_and_its_profile_types");
     };
@@ -97,6 +108,8 @@ async fn a_running_daemon_reports_its_owner_and_its_profile_types() {
     let status = bus.scanbus(&["--json", "status"]).assert_code(0).json();
 
     assert_eq!(status["daemon"], "running");
+    assert_eq!(status["version"], "1.2.3");
+    assert_eq!(status["backends"], serde_json::json!(["mobile", "brother"]));
     assert_eq!(status["profiles"], serde_json::json!(["image", "document"]));
     let owner = status["owner"]
         .as_str()
