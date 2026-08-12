@@ -101,7 +101,7 @@ pub trait ScannerBackend: Send + Sync {
 
 ### `scanbus-backend-brother`
 
-- `discover()`: classic SNMP/mDNS probe + model resolution → determines whether `brscan4` or `brscan5` is required.
+- `discover()`: first implementation wraps `scanimage -L`, parses the Brother and eSCL sightings it already exposes on this machine, and resolves the model from there. That is the pragmatic starting point for the same reason as HP: it reuses the probe the user already has installed, it tells us immediately whether the required driver is already present, and it avoids inventing a parallel discovery path before we have acceptance coverage for the basics. Native SNMP/mDNS remains a likely optimisation later, because it can be faster and can expose model detail SANE omits; when it lands it should be justified as an optimisation rather than replacing a working discovery baseline by default.
 - `ensure_installed()`: checks that the `brscan4`/`brscan5` + `brscan-skey` packages are present, otherwise starts the installation (`.deb` packages downloaded from the Brother website — no standard repository, so the download/checksum verification has to be handled manually).
 - `start_listening()`: starts (or connects to, if already running as a systemd user service) the `brscan-skey` daemon, and parses its output/socket to detect key presses.
 - `set_button_mapping()`: rewrites `/etc/brscan-skey/brscan-skey.conf` (or the user-space equivalent) and sends a reload signal to the daemon.

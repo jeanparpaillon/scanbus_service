@@ -49,12 +49,24 @@ impl ButtonInfo {
 
     /// The `Button1` objects to export for a scanner, from its capabilities.
     ///
-    /// This is the read of `buttons.count` that decides the object tree (2.5). Labels
-    /// come later, from the backend: a device with fixed keys knows them, a generic
-    /// touchscreen has none.
+    /// This is the read of `buttons.count` that decides the object tree (2.5). `count`
+    /// alone decides *how many*; the labels are whatever the backend was able to fill
+    /// into `buttons.labels` — a device with fixed keys knows them, a generic
+    /// touchscreen has none and the entries stay empty.
     pub fn from_capabilities(capabilities: &Capabilities) -> Vec<Self> {
         (0..capabilities.button_count())
-            .map(|index| Self::new(index, "", capabilities.buttons.label_configurable))
+            .map(|index| {
+                let device_label = capabilities
+                    .buttons
+                    .labels
+                    .get(index as usize)
+                    .map_or("", String::as_str);
+                Self::new(
+                    index,
+                    device_label,
+                    capabilities.buttons.label_configurable,
+                )
+            })
             .collect()
     }
 
@@ -78,6 +90,7 @@ mod tests {
             buttons: ButtonsCapability {
                 count: 4,
                 label_configurable: false,
+                labels: Vec::new(),
             },
             ..Capabilities::default()
         };

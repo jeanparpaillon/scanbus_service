@@ -93,7 +93,7 @@ pub enum Source {
 /// `count` is the whole reason `Capabilities` is not passed around as a map — it is read
 /// once at pairing time and decides how many `Button1` objects exist for the scanner's
 /// lifetime.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ButtonsCapability {
     /// Number of entries in the physical menu — dedicated keys, or touchscreen entries.
@@ -103,6 +103,15 @@ pub struct ButtonsCapability {
     /// `false` on classic Brother devices with fixed keys, where only the key→profile
     /// mapping is configurable (§9).
     pub label_configurable: bool,
+    /// The labels the firmware imposes, in menu order, when the backend knows them.
+    ///
+    /// This is the seam [`ButtonInfo::from_capabilities`](super::ButtonInfo::from_capabilities)
+    /// reads: a backend that knows its device has fixed keys — the four Brother keys of
+    /// §5 — publishes their engraved names here, and the `Button1` objects come up with
+    /// `DeviceLabel` already set instead of empty. Shorter than `count` (including
+    /// empty, the default) is not an error: the keys it does not cover get no device
+    /// label, which is exactly the generic-touchscreen case.
+    pub labels: Vec<String>,
 }
 
 #[cfg(test)]
@@ -118,6 +127,7 @@ mod tests {
             buttons: ButtonsCapability {
                 count: 4,
                 label_configurable: false,
+                labels: Vec::new(),
             },
             profiles: Vec::new(),
             extra: BTreeMap::new(),

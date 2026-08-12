@@ -51,6 +51,7 @@ fn brother() -> ScannerInfo {
             buttons: ButtonsCapability {
                 count: 4,
                 label_configurable: false,
+                labels: Vec::new(),
             },
             profiles: Vec::new(),
             // The key this version of the client has no field for: it has to survive the

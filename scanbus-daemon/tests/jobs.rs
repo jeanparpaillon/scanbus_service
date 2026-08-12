@@ -221,6 +221,7 @@ fn brother() -> ScannerInfo {
             buttons: ButtonsCapability {
                 count: 4,
                 label_configurable: false,
+                labels: Vec::new(),
             },
             ..Capabilities::default()
         },

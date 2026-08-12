@@ -167,6 +167,7 @@ fn scanner_with_buttons(address: &str, count: u32) -> ScannerInfo {
             buttons: ButtonsCapability {
                 count,
                 label_configurable: false,
+                labels: Vec::new(),
             },
             ..Capabilities::default()
         },

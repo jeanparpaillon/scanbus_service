@@ -318,6 +318,7 @@ mod tests {
             buttons: ButtonsCapability {
                 count: 4,
                 label_configurable: false,
+                labels: Vec::new(),
             },
             profiles: Vec::new(),
             extra: BTreeMap::new(),

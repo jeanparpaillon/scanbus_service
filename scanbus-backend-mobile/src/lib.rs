@@ -1558,6 +1558,7 @@ fn scanner_from_service(service: &mdns_sd::ServiceInfo) -> Option<(ScannerInfo, 
                 buttons: ButtonsCapability {
                     count: 0,
                     label_configurable: false,
+                    labels: Vec::new(),
                 },
                 ..ScannerCapabilities::default()
             },

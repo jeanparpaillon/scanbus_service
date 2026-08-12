@@ -999,6 +999,7 @@ mod tests {
                         buttons: ButtonsCapability {
                             count,
                             label_configurable,
+                            labels: Vec::new(),
                         },
                         ..Capabilities::default()
                     },

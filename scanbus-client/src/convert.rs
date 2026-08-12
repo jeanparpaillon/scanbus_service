@@ -259,6 +259,12 @@ pub fn capabilities(dict: &Dict) -> Result<Capabilities, DecodeError> {
                         .as_bool()
                         .ok_or_else(|| typed("buttons.label_configurable", "b", flag))?,
                 },
+                // Deliberately not decoded: §3 gives `buttons` exactly `count` and
+                // `label_configurable`, and the engraved names reach clients as
+                // `Button1.DeviceLabel` (§5). `labels` is the daemon-side seam a
+                // backend fills so those objects come up labelled — it never crosses
+                // the bus, so there is nothing here to read back.
+                labels: Vec::new(),
             }
         }
     };

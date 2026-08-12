@@ -682,6 +682,7 @@ fn capabilities_from_model(
         buttons: ButtonsCapability {
             count: 1,
             label_configurable: false,
+            labels: Vec::new(),
         },
         extra: BTreeMap::from([("hplip".to_owned(), Value::Dict(extra))]),
         ..Capabilities::default()

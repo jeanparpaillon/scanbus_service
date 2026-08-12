@@ -65,6 +65,11 @@ fn backends() -> Result<(Backends, u16), String> {
         entries.push(Arc::new(scanbus_backend_hplip::HplipBackend::default()));
     }
 
+    #[cfg(feature = "brother")]
+    {
+        entries.push(Arc::new(scanbus_backend_brother::BrotherBackend::default()));
+    }
+
     Ok((Backends::new(entries), upload_port))
 }
 
