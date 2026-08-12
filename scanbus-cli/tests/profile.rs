@@ -77,6 +77,7 @@ impl Button {
 #[derive(Debug, Clone)]
 struct ProfileData {
     options: HashMap<String, OwnedValue>,
+    options_schema: HashMap<String, OwnedValue>,
 }
 
 impl ProfileData {
@@ -100,6 +101,11 @@ impl Profile {
     #[zbus(property)]
     fn options(&self) -> HashMap<String, OwnedValue> {
         self.state.lock().unwrap().options.clone()
+    }
+
+    #[zbus(property)]
+    fn options_schema(&self) -> HashMap<String, OwnedValue> {
+        self.state.lock().unwrap().options_schema.clone()
     }
 
     #[zbus(property)]
@@ -173,6 +179,7 @@ async fn serve(address: &str) -> (zbus::Connection, FixtureHandle) {
                         Value::Str("/tmp/images".to_owned()),
                     ),
                 ])),
+                options_schema: image_schema(),
             })),
         ),
         (
@@ -186,6 +193,7 @@ async fn serve(address: &str) -> (zbus::Connection, FixtureHandle) {
                         Value::Str("/tmp/documents".to_owned()),
                     ),
                 ])),
+                options_schema: document_schema(),
             })),
         ),
     ]);
@@ -253,6 +261,102 @@ fn validate_options(name: &str, options: &BTreeMap<String, Value>) -> zbus::fdo:
     Ok(())
 }
 
+fn image_schema() -> HashMap<String, OwnedValue> {
+    convert::to_dict(&BTreeMap::from([
+        (
+            "format".to_owned(),
+            Value::Dict(BTreeMap::from([
+                ("type".to_owned(), Value::Str("string".to_owned())),
+                ("default".to_owned(), Value::Str("jpeg".to_owned())),
+                (
+                    "values".to_owned(),
+                    Value::Array(vec![
+                        Value::Str("jpeg".to_owned()),
+                        Value::Str("jpg".to_owned()),
+                        Value::Str("png".to_owned()),
+                    ]),
+                ),
+                (
+                    "description".to_owned(),
+                    Value::Str("Encoding of the written page files".to_owned()),
+                ),
+            ])),
+        ),
+        (
+            "quality".to_owned(),
+            Value::Dict(BTreeMap::from([
+                ("type".to_owned(), Value::Str("integer".to_owned())),
+                ("default".to_owned(), Value::U64(90)),
+                ("min".to_owned(), Value::U64(1)),
+                ("max".to_owned(), Value::U64(100)),
+                (
+                    "description".to_owned(),
+                    Value::Str("JPEG quality; ignored when format is png".to_owned()),
+                ),
+            ])),
+        ),
+        (
+            "output_folder".to_owned(),
+            Value::Dict(BTreeMap::from([
+                ("type".to_owned(), Value::Str("path".to_owned())),
+                ("default".to_owned(), Value::Str("/tmp/images".to_owned())),
+                (
+                    "description".to_owned(),
+                    Value::Str("Directory the pages are written to".to_owned()),
+                ),
+            ])),
+        ),
+    ]))
+}
+
+fn document_schema() -> HashMap<String, OwnedValue> {
+    convert::to_dict(&BTreeMap::from([
+        (
+            "format".to_owned(),
+            Value::Dict(BTreeMap::from([
+                ("type".to_owned(), Value::Str("string".to_owned())),
+                ("default".to_owned(), Value::Str("pdf".to_owned())),
+                (
+                    "values".to_owned(),
+                    Value::Array(vec![
+                        Value::Str("pdf".to_owned()),
+                        Value::Str("jpeg".to_owned()),
+                    ]),
+                ),
+                (
+                    "description".to_owned(),
+                    Value::Str("Encoding of the written document files".to_owned()),
+                ),
+            ])),
+        ),
+        (
+            "multi_page".to_owned(),
+            Value::Dict(BTreeMap::from([
+                ("type".to_owned(), Value::Str("boolean".to_owned())),
+                ("default".to_owned(), Value::Bool(true)),
+                (
+                    "description".to_owned(),
+                    Value::Str("One file for the batch".to_owned()),
+                ),
+            ])),
+        ),
+        (
+            "output_folder".to_owned(),
+            Value::Dict(BTreeMap::from([
+                ("type".to_owned(), Value::Str("path".to_owned())),
+                (
+                    "default".to_owned(),
+                    Value::Str("/tmp/documents".to_owned()),
+                ),
+                (
+                    "description".to_owned(),
+                    Value::Str("Directory the pages are written to".to_owned()),
+                ),
+            ])),
+        ),
+    ]))
+}
+
 fn missing_dir() -> PathBuf {
     std::env::temp_dir().join(format!(
         "scanbus-profile-missing-{}-{}",
@@ -290,6 +394,56 @@ async fn profile_show_lists_global_options_and_button_overrides() {
     assert!(run.stdout.contains(SCANNER), "{}", run.stdout);
     assert!(run.stdout.contains("Scan to OCR"), "{}", run.stdout);
     assert!(run.stdout.contains("/tmp/contracts"), "{}", run.stdout);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn profile_show_json_includes_the_image_option_schema() {
+    let Some((bus, _daemon, _handle)) = fixture().await else {
+        return skipped("profile_show_json_includes_the_image_option_schema");
+    };
+
+    let json = bus
+        .scanbus(&["--json", "profile", "show", "image"])
+        .assert_code(0)
+        .json();
+
+    assert_eq!(json["Options"]["format"], "jpeg");
+    assert_eq!(json["OptionsSchema"]["format"]["type"], "string");
+    assert_eq!(
+        json["OptionsSchema"]["format"]["values"],
+        serde_json::json!(["jpeg", "jpg", "png"])
+    );
+    assert_eq!(json["OptionsSchema"]["quality"]["min"], 1);
+    assert_eq!(json["OptionsSchema"]["quality"]["max"], 100);
+    assert_eq!(
+        json["OptionsSchema"]["output_folder"]["default"],
+        "/tmp/images"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn profile_show_json_includes_the_document_option_schema() {
+    let Some((bus, _daemon, _handle)) = fixture().await else {
+        return skipped("profile_show_json_includes_the_document_option_schema");
+    };
+
+    let json = bus
+        .scanbus(&["--json", "profile", "show", "document"])
+        .assert_code(0)
+        .json();
+
+    assert_eq!(json["Options"]["format"], "pdf");
+    assert_eq!(
+        json["OptionsSchema"]["format"]["values"],
+        serde_json::json!(["pdf", "jpeg"])
+    );
+    assert_eq!(json["OptionsSchema"]["multi_page"]["type"], "boolean");
+    assert_eq!(json["OptionsSchema"]["multi_page"]["default"], true);
+    assert!(
+        json["OptionsSchema"]["quality"].is_null(),
+        "{}",
+        json["OptionsSchema"]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

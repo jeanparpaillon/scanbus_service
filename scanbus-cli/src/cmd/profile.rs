@@ -5,7 +5,8 @@ use std::path::Path;
 use scanbus_client::convert;
 use scanbus_client::proxy::{Button1Proxy, Profile1Proxy, object_manager};
 use scanbus_client::{
-    Button, Connection, Error as ClientError, ObjectKind, Objects, ScanbusError, SelectError,
+    Button, Connection, Error as ClientError, ObjectKind, Objects, OptionSchema, OptionType,
+    OptionsSchema, ScanbusError, SelectError,
 };
 use scanbus_core::{ProfileKind, Value, path};
 use zbus::proxy::CacheProperties;
@@ -26,7 +27,7 @@ pub async fn list(context: &Context) -> Result<u8> {
 pub async fn show(context: &Context, name: &str) -> Result<u8> {
     let connection = context.connect().await?;
     let kind = resolve_profile(context, &connection, name).await?;
-    let profile = read_profile(context, &connection, kind).await?;
+    let profile = read_profile_show(context, &connection, kind).await?;
     let overrides = read_overrides(context, &connection, kind).await?;
     report_show(context, &profile, &overrides)?;
     Ok(0)
@@ -58,7 +59,7 @@ pub async fn set(
         })
         .await?;
 
-    let profile = read_profile(context, &connection, kind).await?;
+    let profile = read_profile_show(context, &connection, kind).await?;
     let overrides = read_overrides(context, &connection, kind).await?;
     report_show(context, &profile, &overrides)?;
     Ok(0)
@@ -68,6 +69,12 @@ pub async fn set(
 struct ProfileView {
     name: String,
     options: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ProfileShowView {
+    profile: ProfileView,
+    options_schema: OptionsSchema,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -114,6 +121,28 @@ async fn read_profile(
     Ok(ProfileView {
         name,
         options: convert::from_dict(&options)
+            .map_err(ClientError::from)
+            .map_err(|error| Error::call(what, error))?,
+    })
+}
+
+async fn read_profile_show(
+    context: &Context,
+    connection: &Connection,
+    kind: ProfileKind,
+) -> Result<ProfileShowView> {
+    let profile = read_profile(context, connection, kind).await?;
+    let proxy = profile_proxy(context, connection, kind).await?;
+    let what = format!("reading profile {}", kind.as_str());
+    let options_schema = context
+        .within(what.clone(), async {
+            proxy.options_schema().await.map_err(ClientError::from)
+        })
+        .await?;
+
+    Ok(ProfileShowView {
+        profile,
+        options_schema: OptionsSchema::decode(&options_schema)
             .map_err(ClientError::from)
             .map_err(|error| Error::call(what, error))?,
     })
@@ -307,14 +336,14 @@ fn report_list(context: &Context, profiles: &[ProfileView]) -> Result<()> {
 
 fn report_show(
     context: &Context,
-    profile: &ProfileView,
+    profile: &ProfileShowView,
     overrides: &[ButtonOverrideView],
 ) -> Result<()> {
     let mut stdout = std::io::stdout().lock();
 
     match context.format {
         Format::Json => {
-            let mut value = profile_json(profile);
+            let mut value = profile_show_json(profile);
             value["ButtonOverrides"] =
                 serde_json::Value::Array(overrides.iter().map(button_override_json).collect());
             output::json(&mut stdout, &value)
@@ -324,9 +353,9 @@ fn report_show(
                 &mut stdout,
                 context.style,
                 &[
-                    ("name", profile.name.clone()),
-                    ("path", path::profile(profile_kind(profile)?)),
-                    ("options", render_options(&profile.options)),
+                    ("name", profile.profile.name.clone()),
+                    ("path", path::profile(profile_kind(&profile.profile)?)),
+                    ("options", render_options(&profile.profile.options)),
                 ],
             )?;
 
@@ -382,6 +411,60 @@ fn profile_json(profile: &ProfileView) -> serde_json::Value {
         "Name": profile.name,
         "Options": profile.options,
     })
+}
+
+fn profile_show_json(profile: &ProfileShowView) -> serde_json::Value {
+    let mut value = profile_json(&profile.profile);
+    value["OptionsSchema"] = options_schema_json(&profile.options_schema);
+    value
+}
+
+fn options_schema_json(schema: &OptionsSchema) -> serde_json::Value {
+    let mut fields = serde_json::Map::new();
+    for entry in schema {
+        fields.insert(entry.key.clone(), option_schema_json(entry));
+    }
+    serde_json::Value::Object(fields)
+}
+
+fn option_schema_json(entry: &OptionSchema) -> serde_json::Value {
+    let mut fields = serde_json::Map::new();
+    fields.insert(
+        "type".to_owned(),
+        serde_json::Value::String(entry.value.type_name().to_owned()),
+    );
+    if let Some(default) = entry.default.as_ref() {
+        fields.insert("default".to_owned(), value_json(default));
+    }
+    fields.insert(
+        "description".to_owned(),
+        serde_json::Value::String(entry.description.clone()),
+    );
+
+    match &entry.value {
+        OptionType::Str { values } if !values.is_empty() => {
+            fields.insert("values".to_owned(), serde_json::json!(values));
+        }
+        OptionType::Integer { min, max } => {
+            if let Some(min) = min {
+                fields.insert("min".to_owned(), serde_json::json!(min));
+            }
+            if let Some(max) = max {
+                fields.insert("max".to_owned(), serde_json::json!(max));
+            }
+        }
+        _ => {}
+    }
+
+    for (key, value) in &entry.extra {
+        fields.insert(key.clone(), value_json(value));
+    }
+
+    serde_json::Value::Object(fields)
+}
+
+fn value_json(value: &Value) -> serde_json::Value {
+    serde_json::to_value(value).expect("scanbus_core::Value serializes to JSON")
 }
 
 fn button_override_json(override_view: &ButtonOverrideView) -> serde_json::Value {
