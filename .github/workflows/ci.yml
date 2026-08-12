@@ -33,6 +33,10 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-${{ env.RUST_VERSION }}-
 
+      # Cargo.toml's version is a copy of VERSION that only a script keeps current, so
+      # nothing else in the build would notice it going stale.
+      - run: ./scripts/version.sh check
+
       - run: cargo fmt --all --check
 
       # Default features: neither backend is compiled into the daemon, because both

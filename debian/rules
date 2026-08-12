@@ -4,7 +4,7 @@ PACKAGE_NAME := scanbus
 FRONTEND_PACKAGE := scanbus-frontend
 BACKEND_PACKAGE := scanbus-backend
 CARGO_ENV := release
-VERSION := $(shell sed -n '/^\[workspace\.package\]/,/^\[/{s/^version = "\(.*\)"/\1/p}' Cargo.toml | head -n 1)
+VERSION := $(shell ./scripts/version.sh)
 DEB_ARCH := $(shell dpkg-architecture -qDEB_HOST_ARCH)
 DEB_STAGE_DIR := target/debian/$(PACKAGE_NAME)
 FRONTEND_STAGE_DIR := $(DEB_STAGE_DIR)/$(FRONTEND_PACKAGE)_$(VERSION)_$(DEB_ARCH)
@@ -32,7 +32,17 @@ install: build
 	mkdir -p $(FRONTEND_ROOT)/DEBIAN $(BACKEND_ROOT)/DEBIAN $(META_ROOT)/DEBIAN
 	$(MAKE) install-frontend DESTDIR=$(abspath $(FRONTEND_ROOT))
 	$(MAKE) install-backend install-services DESTDIR=$(abspath $(BACKEND_ROOT))
+	# The man pages document `scanbus`, which is this package's binary; the frontend
+	# ships none. Policy 12.1 wants them compressed, which `make install` does not do —
+	# an uncompressed page is correct for a plain install and a lintian error in a deb.
+	$(MAKE) install-doc DESTDIR=$(abspath $(BACKEND_ROOT))
+	gzip -9n $(BACKEND_ROOT)/usr/share/man/man1/*.1
 	install -D -m 0755 debian/postinst "$(BACKEND_ROOT)/DEBIAN/postinst"
+	# Policy 12.5: every binary package carries its own /usr/share/doc/<pkg>/copyright,
+	# including the metapackage, which installs no files otherwise.
+	$(MAKE) install-copyright DESTDIR=$(abspath $(FRONTEND_ROOT)) DOC_PACKAGE=$(FRONTEND_PACKAGE)
+	$(MAKE) install-copyright DESTDIR=$(abspath $(BACKEND_ROOT)) DOC_PACKAGE=$(BACKEND_PACKAGE)
+	$(MAKE) install-copyright DESTDIR=$(abspath $(META_ROOT)) DOC_PACKAGE=$(PACKAGE_NAME)
 
 control: install
 	dpkg-shlibdeps -T$(FRONTEND_SUBSTVARS) $(FRONTEND_ROOT)/usr/bin/scanbus-gui

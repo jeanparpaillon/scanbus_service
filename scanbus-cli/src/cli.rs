@@ -23,6 +23,7 @@
 //!
 //! [`scanbus-cli.md`]: https://github.com/jeanparpaillon/scanbus_service/blob/master/docs/scanbus-cli.md
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::{ArgGroup, Args, Parser, Subcommand};
@@ -147,7 +148,17 @@ pub enum Command {
     },
 
     /// Emit a `scanbus(1)` man page on stdout
-    Manpage,
+    ///
+    /// Example: scanbus manpage --output-dir /usr/share/man/man1
+    ///
+    /// `scanbus(1)` cross-references a page per subcommand — scanbus-scan(1),
+    /// scanbus-profile(1) — which `man` resolves against installed files, so
+    /// --output-dir writes the whole tree rather than the one page stdout can carry.
+    Manpage {
+        /// Write one page per command into DIR instead of `scanbus(1)` on stdout
+        #[arg(long, value_name = "DIR")]
+        output_dir: Option<PathBuf>,
+    },
 
     /// Daemon presence, owner, version, backends and profile types
     ///
@@ -569,11 +580,18 @@ mod tests {
         assert_eq!(shell, Shell::Bash);
     }
 
-    /// The man page is a local artifact, like completions, with no extra arguments.
+    /// The man page is a local artifact, like completions: one page on stdout by
+    /// default, the whole tree of pages when a directory is named.
     #[test]
-    fn manpage_parses_as_a_top_level_command() {
+    fn manpage_writes_stdout_unless_given_a_directory() {
         let cli = Cli::try_parse_from(["scanbus", "manpage"]).unwrap();
-        assert!(matches!(cli.command, Command::Manpage));
+        assert!(matches!(cli.command, Command::Manpage { output_dir: None }));
+
+        let cli = Cli::try_parse_from(["scanbus", "manpage", "--output-dir", "/tmp/man1"]).unwrap();
+        let Command::Manpage { output_dir } = cli.command else {
+            panic!("that is a manpage command")
+        };
+        assert_eq!(output_dir, Some(PathBuf::from("/tmp/man1")));
     }
 
     #[test]

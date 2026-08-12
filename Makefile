@@ -18,6 +18,11 @@ DBUS_SERVICE_DIR ?= $(PREFIX)/share/dbus-1/services
 LIBEXECDIR ?= $(PREFIX)/libexec/scanbus
 APPLICATIONS_DIR ?= $(PREFIX)/share/applications
 AUTOSTART_DIR ?= /etc/xdg/autostart
+DOCDIR ?= $(PREFIX)/share/doc
+MANDIR ?= $(PREFIX)/share/man
+# The doc directory is per binary package, so debian/rules overrides this once per
+# package root; a plain `make install` ships a single copy under the project name.
+DOC_PACKAGE ?= scanbus
 
 ifeq ($(CARGO_ENV),release)
 profile_opt := --release
@@ -45,7 +50,16 @@ $(TARGET_DIR)/scanbus-daemon:
 $(TARGET_DIR)/scanbus-gui:
 	cargo build --package scanbus-gui --bin $(notdir $@) $(profile_opt)
 
-install: install-backend install-frontend install-services install-doc
+install: install-backend install-frontend install-services install-doc install-license
+
+# Debian wants the license under the policy-mandated name `copyright`, with the
+# copyright holder stated — the bare Apache text does not carry one — so the deb
+# ships debian/copyright and everyone else gets LICENSE verbatim.
+install-license:
+	install -D -m 0644 LICENSE "$(DESTDIR)$(DOCDIR)/$(DOC_PACKAGE)/LICENSE"
+
+install-copyright:
+	install -D -m 0644 debian/copyright "$(DESTDIR)$(DOCDIR)/$(DOC_PACKAGE)/copyright"
 
 install-services:
 	install -D -m 0644 packaging/systemd/user/scanbus.service \
@@ -66,9 +80,27 @@ install-backend: $(TARGET_DIR)/scanbus $(TARGET_DIR)/scanbus-daemon
 	install -D -m 0755 packaging/libexec/scanbus/scanbus-scanimage \
 		"$(DESTDIR)$(LIBEXECDIR)/scanbus-scanimage"
 
-install-doc: target/$(CARGO_ENV)/scanbus 
-	target/$(CARGO_ENV)/scanbus manpage > \
-		"$(DESTDIR)$(PREFIX)/share/man/man1/scanbus.1"
+# One page per command, not just scanbus.1: the SUBCOMMANDS section of scanbus(1) is a
+# list of scanbus-scan(1)-style references that `man` resolves against installed files,
+# so shipping the top page alone leaves every one of them a dead link.
+install-doc: $(TARGET_DIR)/scanbus
+	install -d "$(DESTDIR)$(MANDIR)/man1"
+	"$(TARGET_DIR)/scanbus" manpage --output-dir "$(DESTDIR)$(MANDIR)/man1"
+
+# The packaged build, and the entry point the release workflow uses. debian/rules
+# recurses back into `make release` here and stages under target/debian.
+deb:
+	$(MAKE) -f debian/rules binary
+
+# VERSION is the release version; Cargo.toml carries a generated copy of it.
+version:
+	@./scripts/version.sh
+
+version-check:
+	./scripts/version.sh check
+
+version-sync:
+	./scripts/version.sh sync
 
 reload:
 	systemctl --user daemon-reload
@@ -86,4 +118,6 @@ clean:
 
 .PHONY: all release debug 
 .PHONY: install install-backend install-frontend install-services install-doc
+.PHONY: install-license install-copyright
+.PHONY: deb version version-check version-sync
 .PHONY: reload test clean lint

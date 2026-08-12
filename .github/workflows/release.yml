@@ -16,10 +16,11 @@ env:
   RUST_VERSION: 1.93.1
 
 jobs:
-  # The version the artifacts are named after comes from Cargo.toml, not from the tag:
-  # debian/rules reads the same field, so anything else would name the .debs one thing
-  # and the tarball another. On a tag push the two must agree, and finding out here
-  # costs a runner start instead of a full release build.
+  # The artifacts are named after VERSION, not after the tag: debian/rules reads the
+  # same file, so anything else would name the .debs one thing and the tarball another.
+  # On a tag push all three — tag, VERSION, and the copies in Cargo.toml and
+  # debian/changelog — have to agree, and finding out here costs a runner start
+  # instead of a full release build.
   version:
     name: version
     runs-on: ubuntu-latest
@@ -30,14 +31,10 @@ jobs:
 
       - id: version
         run: |
-          version=$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^version = "\(.*\)"/\1/p}' \
-            Cargo.toml | head -n 1)
-          if [ -z "$version" ]; then
-            echo "::error::no version in [workspace.package] of Cargo.toml"
-            exit 1
-          fi
+          ./scripts/version.sh check
+          version=$(./scripts/version.sh)
           if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
-            echo "::error::tag $GITHUB_REF_NAME does not match workspace version $version"
+            echo "::error::tag $GITHUB_REF_NAME does not match VERSION ($version)"
             exit 1
           fi
           echo "version=$version" >>"$GITHUB_OUTPUT"
@@ -105,13 +102,13 @@ jobs:
           key: ${{ runner.os }}-release-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-release-${{ env.RUST_VERSION }}-
 
-      # `make -f debian/rules binary`, not dpkg-buildpackage: these rules stage into
-      # target/debian and build with `dpkg-deb --root-owner-group` (so no fakeroot,
-      # and no root-owned files in the cache), where dpkg-buildpackage would look for
-      # the .debs in the parent directory and would run `clean` first, throwing away
-      # the cargo cache this job restores.
+      # `make deb`, i.e. debian/rules directly, not dpkg-buildpackage: these rules
+      # stage into target/debian and build with `dpkg-deb --root-owner-group` (so no
+      # fakeroot, and no root-owned files in the cache), where dpkg-buildpackage would
+      # look for the .debs in the parent directory and would run `clean` first,
+      # throwing away the cargo cache this job restores.
       - name: Build packages
-        run: make -f debian/rules binary
+        run: make deb
 
       - name: Collect packages
         run: |

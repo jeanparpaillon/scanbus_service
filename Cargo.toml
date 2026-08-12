@@ -23,6 +23,10 @@ default-members = [
 ]
 
 [workspace.package]
+# Generated from the VERSION file, which is what a release is cut from — cargo cannot
+# read a version out of a file, so this copy and the pins below are written by
+# `scripts/version.sh sync` and held to VERSION by `scripts/version.sh check` in CI.
+# Bump with `scripts/version.sh set X.Y.Z`, never by editing here.
 version = "0.1.0"
 edition = "2024"
 # MSRV. The development machine runs rustc 1.93.1 installed from a source tarball,
