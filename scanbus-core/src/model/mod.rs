@@ -28,7 +28,7 @@ pub use capabilities::{ButtonsCapability, Capabilities, ColorMode, Source};
 pub use id::{ScannerId, escape_component, unescape_component};
 pub use job::JobState;
 pub use page::{PageFormat, RawPage};
-pub use profile::ProfileKind;
+pub use profile::{ProfileKind, implied_profile};
 pub use state::{PairingState, Status};
 pub use value::Value;
 

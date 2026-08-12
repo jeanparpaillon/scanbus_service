@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 
 use gio::ListStore;
@@ -12,7 +12,8 @@ use libadwaita::prelude::*;
 use scanbus_core::{PairingState, ProfileKind, Status};
 
 use crate::bus::BusCommand;
-use crate::store::{DiscoveryState, ScannerEntry, ServiceState, Store, StoreEvent};
+use crate::buttons::ButtonsPage;
+use crate::store::{DiscoveryState, ProfileEntry, ScannerEntry, ServiceState, Store, StoreEvent};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToastAction {
@@ -92,7 +93,7 @@ glib::wrapper! {
 
 impl ScannerObject {
     fn new(entry: &ScannerEntry) -> Self {
-        let scanner = glib::Object::builder::<Self>()
+        glib::Object::builder::<Self>()
             .property("path", &entry.path)
             .property("name", &entry.state.name)
             .property("address", &entry.state.address)
@@ -115,8 +116,7 @@ impl ScannerObject {
             .property("pairing-state", pairing_state_name(&entry.state.pairing))
             .property("pairing-error", pairing_error(&entry.state.pairing))
             .property("pairing-code", pairing_code(&entry.state.pairing))
-            .build();
-        scanner
+            .build()
     }
 
     fn update_from_entry(&self, entry: &ScannerEntry) {
@@ -177,10 +177,13 @@ pub fn status_line(status: Status, connected: bool, paired: bool) -> String {
 }
 
 fn default_profile_label(profile: Option<ProfileKind>) -> String {
-    profile.map_or_else(|| "None".to_owned(), |profile| humanize_profile(profile.as_str()))
+    profile.map_or_else(
+        || "None".to_owned(),
+        |profile| humanize_profile(profile.as_str()),
+    )
 }
 
-fn humanize_profile(profile: &str) -> String {
+pub fn humanize_profile(profile: &str) -> String {
     let mut chars = profile.chars();
     if let Some(first) = chars.next() {
         let mut label = first.to_uppercase().collect::<String>();
@@ -208,7 +211,7 @@ fn connection_value(connected: bool) -> &'static str {
     }
 }
 
-fn connection_subtitle(status: Status, connected: bool) -> &'static str {
+pub fn connection_subtitle(status: Status, connected: bool) -> &'static str {
     if status == Status::Offline {
         "Unavailable while the scanner is offline"
     } else if connected {
@@ -218,7 +221,7 @@ fn connection_subtitle(status: Status, connected: bool) -> &'static str {
     }
 }
 
-fn connection_banner(status: Status, connected: bool, paired: bool) -> String {
+pub fn connection_banner(status: Status, connected: bool, paired: bool) -> String {
     let paired = if paired { "Paired" } else { "Not paired" };
     let online = status_value(status);
     let listening = if connected {
@@ -349,6 +352,21 @@ impl ScannerListModel {
             .values()
             .find(|entry| entry.path == path)
             .cloned()
+    }
+
+    /// The `Profile1` objects, which the buttons page needs to tell a per-key override
+    /// from a value the profile already had.
+    pub fn profiles(&self) -> BTreeMap<ProfileKind, ProfileEntry> {
+        self.store.borrow().profiles.clone()
+    }
+
+    /// Re-renders every view from the store without changing it.
+    ///
+    /// This is the revert half of a refused write: the widget the user touched showed
+    /// what they picked, the store never moved, and rendering from it again puts the
+    /// widget back. `main.rs` calls it whenever a toast arrives.
+    pub fn refresh(&self) {
+        self.notify_changed();
     }
 
     pub fn apply_event(&self, event: StoreEvent) -> Result<(), scanbus_client::DecodeError> {
@@ -556,10 +574,6 @@ impl ScannersPane {
         detail_default_profile_value.set_xalign(0.0);
         detail_default_profile_value.set_wrap(true);
 
-        let buttons_default_profile_value = gtk::Label::new(None);
-        buttons_default_profile_value.set_xalign(0.0);
-        buttons_default_profile_value.set_wrap(true);
-
         let configure_buttons = gtk::Button::with_label("Configure buttons");
         configure_buttons.set_halign(gtk::Align::Start);
         configure_buttons.add_css_class("flat");
@@ -598,84 +612,12 @@ impl ScannersPane {
             .child(&detail_page)
             .build();
 
-        let back_button = gtk::Button::with_label("Back");
-        back_button.add_css_class("flat");
-
-        let buttons_title = gtk::Label::new(Some("Configure buttons"));
-        buttons_title.add_css_class("title-3");
-        buttons_title.set_xalign(0.0);
-        buttons_title.set_hexpand(true);
-
-        let buttons_header = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-        buttons_header.append(&back_button);
-        buttons_header.append(&buttons_title);
-
-        let buttons_banner_title = gtk::Label::new(None);
-        buttons_banner_title.add_css_class("heading");
-        buttons_banner_title.set_xalign(0.0);
-        buttons_banner_title.set_wrap(true);
-
-        let buttons_banner_address = gtk::Label::new(None);
-        buttons_banner_address.add_css_class("dim-label");
-        buttons_banner_address.set_xalign(0.0);
-        buttons_banner_address.set_wrap(true);
-
-        let buttons_connection_title = gtk::Label::new(Some("Connection"));
-        buttons_connection_title.add_css_class("heading");
-        buttons_connection_title.set_xalign(0.0);
-
-        let buttons_connection_hint = gtk::Label::new(None);
-        buttons_connection_hint.add_css_class("dim-label");
-        buttons_connection_hint.set_xalign(0.0);
-        buttons_connection_hint.set_wrap(true);
-
-        let buttons_connection_text = gtk::Box::new(gtk::Orientation::Vertical, 4);
-        buttons_connection_text.append(&buttons_connection_title);
-        buttons_connection_text.append(&buttons_connection_hint);
-
-        let connection_switch = gtk::Switch::new();
-        connection_switch.set_halign(gtk::Align::End);
-        connection_switch.set_valign(gtk::Align::Center);
-
-        let buttons_connection_row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-        buttons_connection_row.append(&buttons_connection_text);
-        buttons_connection_row.append(&gtk::Box::builder().hexpand(true).build());
-        buttons_connection_row.append(&connection_switch);
-
-        let buttons_banner = gtk::Box::new(gtk::Orientation::Vertical, 12);
-        buttons_banner.add_css_class("card");
-        buttons_banner.set_margin_top(6);
-        buttons_banner.set_margin_bottom(6);
-        buttons_banner.set_margin_start(6);
-        buttons_banner.set_margin_end(6);
-        buttons_banner.append(&buttons_banner_title);
-        buttons_banner.append(&buttons_banner_address);
-        buttons_banner.append(&buttons_connection_row);
-
-        let buttons_placeholder = gtk::Label::new(Some(
-            "Button assignment and default profile editing land here in the next issue.",
-        ));
-        buttons_placeholder.add_css_class("dim-label");
-        buttons_placeholder.set_wrap(true);
-        buttons_placeholder.set_xalign(0.0);
-
-        let buttons_page = gtk::Box::new(gtk::Orientation::Vertical, 18);
-        buttons_page.set_margin_top(24);
-        buttons_page.set_margin_bottom(24);
-        buttons_page.set_margin_start(24);
-        buttons_page.set_margin_end(24);
-        buttons_page.append(&buttons_header);
-        buttons_page.append(&buttons_banner);
-        buttons_page.append(&detail_fact_row(
-            "Default profile",
-            &buttons_default_profile_value,
-        ));
-        buttons_page.append(&buttons_placeholder);
+        let buttons_page = Rc::new(ButtonsPage::new(commands.clone()));
 
         let buttons_scroller = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
             .min_content_width(360)
-            .child(&buttons_page)
+            .child(buttons_page.widget())
             .build();
 
         let detail_stack = gtk::Stack::new();
@@ -742,12 +684,8 @@ impl ScannersPane {
             let detail_address_value = detail_address_value.clone();
             let detail_backend_value = detail_backend_value.clone();
             let detail_default_profile_value = detail_default_profile_value.clone();
-            let buttons_default_profile_value = buttons_default_profile_value.clone();
             let configure_buttons = configure_buttons.clone();
-            let buttons_banner_title = buttons_banner_title.clone();
-            let buttons_banner_address = buttons_banner_address.clone();
-            let buttons_connection_hint = buttons_connection_hint.clone();
-            let connection_switch = connection_switch.clone();
+            let buttons_page = Rc::clone(&buttons_page);
             let unpair_button = unpair_button.clone();
             model.connect_changed(move || {
                 let paired_count = paired_model.n_items();
@@ -770,28 +708,17 @@ impl ScannersPane {
                     detail_name.set_label(&scanner.state.name);
                     detail_status_value.set_label(status_value(scanner.state.status));
                     detail_connection_value.set_label(connection_value(scanner.state.connected));
-                    detail_connection_hint
-                        .set_label(connection_subtitle(scanner.state.status, scanner.state.connected));
+                    detail_connection_hint.set_label(connection_subtitle(
+                        scanner.state.status,
+                        scanner.state.connected,
+                    ));
                     detail_address_value.set_label(&scanner.state.address);
                     detail_backend_value.set_label(&humanize_backend(&scanner.state.backend));
                     detail_default_profile_value
                         .set_label(&default_profile_label(scanner.state.default_profile));
-                    buttons_default_profile_value
-                        .set_label(&default_profile_label(scanner.state.default_profile));
                     configure_buttons.set_visible(scanner.state.paired);
                     configure_buttons.set_sensitive(scanner.state.paired);
-                    buttons_banner_title.set_label(&connection_banner(
-                        scanner.state.status,
-                        scanner.state.connected,
-                        scanner.state.paired,
-                    ));
-                    buttons_banner_address
-                        .set_label(&format!("Address: {}", scanner.state.address));
-                    buttons_connection_hint
-                        .set_label(connection_subtitle(scanner.state.status, scanner.state.connected));
-                    connection_switch.set_active(scanner.state.connected);
-                    connection_switch
-                        .set_sensitive(scanner.state.paired && scanner.state.status != Status::Offline);
+                    buttons_page.render(&scanner, &model_for_callback.profiles());
                     unpair_button.set_visible(scanner.state.paired);
                     unpair_button.set_sensitive(scanner.state.paired);
                     if detail_stack.visible_child_name().as_deref() == Some("placeholder") {
@@ -810,13 +737,8 @@ impl ScannersPane {
                     detail_address_value.set_label("");
                     detail_backend_value.set_label("");
                     detail_default_profile_value.set_label("");
-                    buttons_default_profile_value.set_label("");
                     configure_buttons.set_visible(false);
-                    buttons_banner_title.set_label("");
-                    buttons_banner_address.set_label("");
-                    buttons_connection_hint.set_label("");
-                    connection_switch.set_active(false);
-                    connection_switch.set_sensitive(false);
+                    buttons_page.clear();
                     unpair_button.set_visible(false);
                     unpair_button.set_sensitive(false);
                     detail_stack.set_visible_child_name("placeholder");
@@ -853,31 +775,8 @@ impl ScannersPane {
 
         {
             let detail_stack = detail_stack.clone();
-            back_button.connect_clicked(move |_| {
+            buttons_page.connect_back(move || {
                 detail_stack.set_visible_child_name("details");
-            });
-        }
-
-        {
-            let model = Rc::clone(&model);
-            let commands = commands.clone();
-            connection_switch.connect_state_set(move |_, state| {
-                let Some(path) = model.selected_path() else {
-                    return glib::Propagation::Stop;
-                };
-                let Some(scanner) = model.scanner(&path) else {
-                    return glib::Propagation::Stop;
-                };
-                if !scanner.state.paired || scanner.state.status == Status::Offline {
-                    return glib::Propagation::Stop;
-                }
-                let command = if state {
-                    BusCommand::Connect { path }
-                } else {
-                    BusCommand::Disconnect { path }
-                };
-                let _ = commands.try_send(command);
-                glib::Propagation::Stop
             });
         }
 

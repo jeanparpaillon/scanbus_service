@@ -8,7 +8,7 @@ use std::io::Write as _;
 use scanbus_client::convert;
 use scanbus_client::proxy::{Button1Proxy, Manager1Proxy};
 use scanbus_client::{Button, Connection, Error as ClientError, Objects, ScanbusError, Scanner};
-use scanbus_core::Value;
+use scanbus_core::{ProfileKind, Value, implied_profile};
 
 use crate::cli::ScannerArg;
 use crate::context::Context;
@@ -410,24 +410,12 @@ fn yes_no(value: bool) -> &'static str {
 }
 
 fn label_profile_diverges(button: &ButtonView) -> bool {
-    !button.device_label.is_empty()
-        && !button.profile.is_empty()
+    !button.profile.is_empty()
         && profile_hint(&button.device_label).is_some_and(|hint| hint != button.profile)
 }
 
 fn profile_hint(label: &str) -> Option<&'static str> {
-    let lowered = label.to_ascii_lowercase();
-    if lowered.contains("ocr") {
-        Some("ocr")
-    } else if lowered.contains("e-mail") || lowered.contains("email") {
-        Some("email")
-    } else if lowered.contains("image") {
-        Some("image")
-    } else if lowered.contains("file") || lowered.contains("document") {
-        Some("document")
-    } else {
-        None
-    }
+    implied_profile(label).map(ProfileKind::as_str)
 }
 
 fn is_gone(error: &Error) -> bool {

@@ -1,4 +1,5 @@
 mod bus;
+mod buttons;
 mod error;
 mod scanners;
 mod store;
@@ -39,7 +40,13 @@ fn main() -> glib::ExitCode {
                         }
                         BusEvent::DiscoveryActive(true) => scanners.mark_discovery_active(),
                         BusEvent::DiscoveryActive(false) => scanners.mark_discovery_idle(),
-                        BusEvent::Toast(toast) => scanners.emit_toast_spec(toast),
+                        BusEvent::Toast(toast) => {
+                            // A toast means the daemon refused something a widget had
+                            // already shown as done. The store never moved, so
+                            // re-rendering from it is the revert.
+                            scanners.emit_toast_spec(toast);
+                            scanners.refresh();
+                        }
                     }
                 }
             });

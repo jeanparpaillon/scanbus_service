@@ -18,7 +18,7 @@ pub use backend::{
 pub use error::{BackendError, InvalidScannerId, ParseError};
 pub use model::{
     ButtonInfo, ButtonsCapability, Capabilities, ColorMode, JobState, PageFormat, PairingState,
-    ProfileKind, RawPage, ScannerId, ScannerInfo, Source, Status, Value,
+    ProfileKind, RawPage, ScannerId, ScannerInfo, Source, Status, Value, implied_profile,
 };
 pub use pairing::{
     PairOutcome, PairingMachine, PairingStore, PairingStoreError, Restorable, UnpairError,

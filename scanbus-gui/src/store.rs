@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use scanbus_client::{DecodeError, ScannerState};
-use scanbus_core::{PairingState, ProfileKind, ScannerId, path};
+use scanbus_core::{ProfileKind, ScannerId, path};
 use zbus::zvariant::{OwnedValue, Value as ZValue};
 
 pub type Dict = HashMap<String, OwnedValue>;
@@ -436,7 +436,7 @@ fn wrong_type(key: &str, expected: &'static str, got: &OwnedValue) -> DecodeErro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scanbus_core::{Capabilities, Status};
+    use scanbus_core::{Capabilities, PairingState, Status};
 
     fn owned(value: ZValue<'_>) -> OwnedValue {
         OwnedValue::try_from(value).unwrap()

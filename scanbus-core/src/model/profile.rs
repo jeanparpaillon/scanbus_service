@@ -88,6 +88,35 @@ impl ProfileKind {
     }
 }
 
+/// The profile a firmware key label suggests, when it suggests one at all.
+///
+/// API §5 is explicit that `Button1.DeviceLabel` and `Button1.Profile` are allowed to
+/// diverge — assigning `document` to the key the firmware calls "Scan to OCR" is legal —
+/// and that warning about it "is up to the user interface client". This is the whole of
+/// that opinion, in one place, so the CLI's note and the GUI's caption cannot disagree
+/// about what a divergence is.
+///
+/// It is a heuristic over strings a vendor chose, not a mapping anything can be derived
+/// from, so it holds only the Brother/HP wordings the project has actually seen and
+/// answers [`None`] — *no opinion* — for everything else. Nothing here refuses a write:
+/// the daemon decides what is assignable, and this only decides whether to say something.
+pub fn implied_profile(device_label: &str) -> Option<ProfileKind> {
+    let lowered = device_label.to_ascii_lowercase();
+
+    if lowered.contains("ocr") || lowered.contains("searchable") {
+        Some(ProfileKind::Ocr)
+    } else if lowered.contains("e-mail") || lowered.contains("email") || lowered.contains("mail") {
+        Some(ProfileKind::Email)
+    } else if lowered.contains("image") || lowered.contains("photo") || lowered.contains("picture")
+    {
+        Some(ProfileKind::Image)
+    } else if lowered.contains("file") || lowered.contains("document") || lowered.contains("pdf") {
+        Some(ProfileKind::Document)
+    } else {
+        None
+    }
+}
+
 impl fmt::Display for ProfileKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
@@ -154,5 +183,40 @@ mod tests {
             ProfileKind::optional_as_str(Some(ProfileKind::Document)),
             "document"
         );
+    }
+
+    /// The four keys of the Brother MFC in API §5, which is the device the divergence
+    /// warning exists for.
+    #[test]
+    fn the_brother_mfc_keys_each_imply_their_profile() {
+        assert_eq!(implied_profile("Scan to File"), Some(ProfileKind::Document));
+        assert_eq!(implied_profile("Scan to Image"), Some(ProfileKind::Image));
+        assert_eq!(implied_profile("Scan to OCR"), Some(ProfileKind::Ocr));
+        assert_eq!(implied_profile("Scan to E-mail"), Some(ProfileKind::Email));
+    }
+
+    /// No opinion is the default, and an empty `DeviceLabel` (§5: the generic
+    /// touchscreen case) must never produce one.
+    #[test]
+    fn an_unrecognised_label_has_no_opinion() {
+        assert_eq!(implied_profile(""), None);
+        assert_eq!(implied_profile("Scan"), None);
+        assert_eq!(implied_profile("Shortcut 1"), None);
+        assert_eq!(implied_profile("Numérisation"), None);
+    }
+
+    /// "Scan to OCR" and "Scan to Searchable PDF" both mean OCR; the `pdf` in the second
+    /// must not win and call it a document.
+    #[test]
+    fn the_more_specific_wording_wins_over_the_generic_one() {
+        assert_eq!(
+            implied_profile("Scan to Searchable PDF"),
+            Some(ProfileKind::Ocr)
+        );
+        assert_eq!(
+            implied_profile("Scan to Email Attachment"),
+            Some(ProfileKind::Email)
+        );
+        assert_eq!(implied_profile("SCAN TO FILE"), Some(ProfileKind::Document));
     }
 }

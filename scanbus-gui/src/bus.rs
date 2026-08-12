@@ -39,11 +39,20 @@ pub enum BusCommand {
     Unpair {
         path: String,
     },
-    #[allow(
-        dead_code,
-        reason = "issue 10.7 wires profile editing onto this existing bus path"
-    )]
-    SetProfile {
+    /// `Button1.Profile` on a button object path; `None` writes `""` — unassigned (§5).
+    SetButtonProfile {
+        path: String,
+        kind: Option<ProfileKind>,
+    },
+    /// `Button1.Label` on a button object path. Only ever sent for a button whose
+    /// `LabelConfigurable` is true — §9 is explicit that offering the rename otherwise
+    /// is offering an action that silently fails.
+    SetButtonLabel {
+        path: String,
+        label: String,
+    },
+    /// `Scanner1.DefaultProfile` on a scanner object path; `None` writes `""`.
+    SetDefaultProfile {
         path: String,
         kind: Option<ProfileKind>,
     },
@@ -145,12 +154,12 @@ async fn run_session(
                     let Ok(command) = command else {
                         return Ok(());
                     };
+                    // A refusal has already become a toast; only the rest is a surprise.
                     if let Err(error) =
                         handle_command(bus, &connection, command, events, &mut leases).await
+                        && !matches!(error, Error::Call(_))
                     {
-                        if !matches!(error, Error::Call(_)) {
-                            warn!(%error, "GUI command failed");
-                        }
+                        warn!(%error, "GUI command failed");
                     }
                 }
                 message = messages.next() => {
@@ -454,20 +463,54 @@ async fn handle_command(
                 proxy.unpair().await?;
             }
         }
-        BusCommand::SetProfile { path, kind } => {
-            let value = kind.map_or_else(String::new, |kind| kind.to_string());
-
+        BusCommand::SetButtonProfile { path, kind } => {
+            if let Some((scanner, index)) = path::button_index(&path) {
+                let proxy = Button1Proxy::for_button(connection, &scanner, index).await?;
+                let value = ProfileKind::optional_as_str(kind);
+                if let Err(error) = proxy.set_profile(value).await {
+                    return Err(refused(events, error).await);
+                }
+            }
+        }
+        BusCommand::SetButtonLabel { path, label } => {
+            if let Some((scanner, index)) = path::button_index(&path) {
+                let proxy = Button1Proxy::for_button(connection, &scanner, index).await?;
+                if let Err(error) = proxy.set_label(&label).await {
+                    return Err(refused(events, error).await);
+                }
+            }
+        }
+        BusCommand::SetDefaultProfile { path, kind } => {
             if let Some(id) = path::scanner_id(&path) {
                 let proxy = Scanner1Proxy::for_scanner(connection, &id).await?;
-                proxy.set_default_profile(&value).await?;
-            } else if let Some((scanner, index)) = path::button_index(&path) {
-                let proxy = Button1Proxy::for_button(connection, &scanner, index).await?;
-                proxy.set_profile(&value).await?;
+                let value = ProfileKind::optional_as_str(kind);
+                if let Err(error) = proxy.set_default_profile(value).await {
+                    return Err(refused(events, error).await);
+                }
             }
         }
     }
 
     Ok(())
+}
+
+/// Turns a rejected property write into a toast.
+///
+/// The write is all the client did — API §5 says the daemon rewrites the backend's
+/// configuration and the client "only sees the updated property", so a refusal leaves the
+/// store exactly as it was and the widget must go back to it. That revert is
+/// [`crate::scanners::ScannerListModel::refresh`], driven from the toast in `main.rs`;
+/// here we only name what went wrong.
+async fn refused(events: &Sender<BusEvent>, error: zbus::Error) -> Error {
+    let error = Error::from(error);
+    if let Error::Call(ref refusal) = error {
+        let _ = events
+            .send(BusEvent::Toast(ToastSpec::new(crate::error::present(
+                refusal,
+            ))))
+            .await;
+    }
+    error
 }
 
 #[derive(Default)]
