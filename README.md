@@ -67,6 +67,20 @@ so shutdown can unexport objects and release the name cleanly.
 RUST_LOG=debug cargo run
 ```
 
+`scanbus-gui` is a single-instance `AdwApplication`: launching it again reuses the
+existing process, so the background notifier and the window share one D-Bus connection
+and one store instead of racing each other. `scanbus-gui --background` holds the
+application alive with no window; a later `scanbus-gui` raises a window in that same
+process, and closing the window drops back to no-window mode instead of ending the
+notifier.
+
+The frontend package also installs `org.scanbus.Gui.desktop` in
+`/usr/share/applications` and an XDG autostart entry in `/etc/xdg/autostart` that runs
+`scanbus-gui --background` for GNOME. Compositors that ignore XDG autostart, such as
+sway, should start it from their own session wiring instead; this repo deliberately does
+not use `graphical-session.target`, because the user manager on the development machine is
+shared across sessions.
+
 ## Completion
 
 `scanbus` can generate shell completion scripts locally, without talking to D-Bus:

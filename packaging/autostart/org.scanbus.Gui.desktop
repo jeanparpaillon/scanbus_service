@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Scanbus
+Comment=Receive scan notifications in the background
+Exec=scanbus-gui --background
+TryExec=scanbus-gui
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

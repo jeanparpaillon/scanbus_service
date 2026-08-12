@@ -16,6 +16,8 @@ BINDIR ?= $(PREFIX)/bin
 SYSTEMD_USER_DIR ?= $(PREFIX)/lib/systemd/user
 DBUS_SERVICE_DIR ?= $(PREFIX)/share/dbus-1/services
 LIBEXECDIR ?= $(PREFIX)/libexec/scanbus
+APPLICATIONS_DIR ?= $(PREFIX)/share/applications
+AUTOSTART_DIR ?= /etc/xdg/autostart
 
 ifeq ($(CARGO_ENV),release)
 profile_opt := --release
@@ -53,6 +55,10 @@ install-services:
 
 install-frontend: $(TARGET_DIR)/scanbus-gui
 	install -D -m 0755 "$(TARGET_DIR)/scanbus-gui" "$(DESTDIR)$(BINDIR)/scanbus-gui"
+	install -D -m 0644 packaging/applications/org.scanbus.Gui.desktop \
+		"$(DESTDIR)$(APPLICATIONS_DIR)/org.scanbus.Gui.desktop"
+	install -D -m 0644 packaging/autostart/org.scanbus.Gui.desktop \
+		"$(DESTDIR)$(AUTOSTART_DIR)/org.scanbus.Gui.desktop"
 
 install-backend: $(TARGET_DIR)/scanbus $(TARGET_DIR)/scanbus-daemon
 	install -D -m 0755 "$(TARGET_DIR)/scanbus" "$(DESTDIR)$(BINDIR)/scanbus"

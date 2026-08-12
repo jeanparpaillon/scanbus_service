@@ -1,31 +1,38 @@
+mod autostart;
 mod bus;
 mod buttons;
 mod error;
+mod lifecycle;
 mod scanners;
 mod store;
 mod window;
 
 use std::rc::Rc;
 
+use gtk::gio;
 use gtk::glib;
 use gtk::prelude::*;
 use gtk4 as gtk;
 use libadwaita as adw;
 
 use crate::bus::{BusCommand, BusEvent, BusHandle};
+use crate::lifecycle::AppLifecycle;
 use crate::scanners::ScannerListModel;
 
 fn main() -> glib::ExitCode {
     let app = adw::Application::builder()
         .application_id("org.scanbus.Gui")
+        .flags(gio::ApplicationFlags::HANDLES_COMMAND_LINE)
         .build();
 
     let bus = Rc::new(BusHandle::start(scanbus_client::Bus::Session));
     let scanners = Rc::new(ScannerListModel::new());
+    let lifecycle = Rc::new(AppLifecycle::default());
 
     {
         let scanners = Rc::clone(&scanners);
         let events = bus.events();
+        let app = app.clone();
         app.connect_startup(move |_| {
             let scanners = Rc::clone(&scanners);
             let events = events.clone();
@@ -54,10 +61,43 @@ fn main() -> glib::ExitCode {
     }
 
     {
+        let app = app.clone();
+        let quit = gio::SimpleAction::new("quit", None);
+        let quit_app = app.clone();
+        quit.connect_activate(move |_, _| quit_app.quit());
+        app.add_action(&quit);
+    }
+
+    {
+        let lifecycle = Rc::clone(&lifecycle);
+        app.connect_command_line(move |app, command_line| {
+            if launch_mode(command_line.arguments()) == LaunchMode::Background {
+                lifecycle.hold_background(app);
+                return 0.into();
+            }
+
+            app.activate();
+            0.into()
+        });
+    }
+
+    {
         let bus = Rc::clone(&bus);
         let scanners = Rc::clone(&scanners);
+        let lifecycle = Rc::clone(&lifecycle);
         app.connect_activate(move |app| {
-            let window = window::build_window(app, Rc::clone(&scanners), bus.commands());
+            if let Some(window) = lifecycle.current_window() {
+                window.present();
+                return;
+            }
+
+            let window = window::build_window(
+                app,
+                Rc::clone(&scanners),
+                bus.commands(),
+                Rc::clone(&lifecycle),
+            );
+            lifecycle.track_window(&window);
             window.present();
         });
     }
@@ -78,6 +118,24 @@ fn main() -> glib::ExitCode {
     app.run()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaunchMode {
+    Activate,
+    Background,
+}
+
+fn launch_mode(arguments: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>) -> LaunchMode {
+    if arguments
+        .into_iter()
+        .skip(1)
+        .any(|argument| argument.as_ref() == "--background")
+    {
+        LaunchMode::Background
+    } else {
+        LaunchMode::Activate
+    }
+}
+
 fn install_signal_stop(
     app: &adw::Application,
     commands: &async_channel::Sender<BusCommand>,
@@ -93,4 +151,21 @@ fn install_signal_stop(
         }
         glib::ControlFlow::Break
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LaunchMode, launch_mode};
+
+    #[test]
+    fn background_flag_selects_background_mode() {
+        let mode = launch_mode(["scanbus-gui", "--background"]);
+        assert_eq!(mode, LaunchMode::Background);
+    }
+
+    #[test]
+    fn plain_launch_activates_the_window() {
+        let mode = launch_mode(["scanbus-gui"]);
+        assert_eq!(mode, LaunchMode::Activate);
+    }
 }

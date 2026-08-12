@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Scanbus
+Comment=Browse scanners and receive scan notifications
+Exec=scanbus-gui
+TryExec=scanbus-gui
+Terminal=false
+StartupNotify=true
+Categories=Utility;GTK;
