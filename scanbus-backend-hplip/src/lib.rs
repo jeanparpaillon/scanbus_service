@@ -1,33 +1,48 @@
-//! HP backend: discovery and install checks through the HPLIP command-line tools.
+//! HP backend: discovery, install checks, and walk-up button listening through HPLIP.
 //!
-//! Issue 6.1 deliberately stops short of button delivery and page capture. HPLIP
-//! already knows how to enumerate supported devices, their transport, and whether a
-//! proprietary plugin is part of the bargain, so this backend shells out to those
-//! binaries first and leaves the deeper `hpssd` and scan-transfer work to later issues.
+//! Discovery and package checks still come from the HPLIP command-line tools. Walk-up
+//! button delivery comes from `hpssd`: it owns `com.hplip.StatusService` on the
+//! session bus, emits `com.hplip.Toolbox.Event` updates there, and keeps the
+//! per-device history behind `GetHistory`.
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::Command;
+use std::task::{Context, Poll};
+use std::time::{Duration, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use futures_core::stream::BoxStream;
-use futures_util::stream;
+use futures_util::StreamExt as _;
 use scanbus_core::{
     BackendError, ButtonsCapability, Capabilities, PairingProgress, ProfileKind, RawPage,
-    ScannerBackend, ScannerId, ScannerInfo, Source, Status, Value,
+    ScanTrigger, ScannerBackend, ScannerId, ScannerInfo, Source, Status, Value,
 };
 use tokio::sync::mpsc;
-use tracing::warn;
+use tracing::{debug, warn};
+use zbus::fdo::DBusProxy;
+use zbus::message::Type as MessageType;
+use zbus::{MatchRule, MessageStream};
 
 /// Backend identifier, as it will be reported by [`ScannerBackend::id`].
 pub const ID: &str = "hplip";
 
 const DISCOVERY_ID: &str = "discovery";
+const HPLIP_BUTTON_INDEX: u32 = 0;
+const HPLIP_EVENT_SCAN_WAITING_FOR_PC: i32 = 2006;
 const HPLIP_PACKAGE: &str = "hplip";
 const HPAIO_PACKAGE: &str = "libsane-hpaio";
 const PROPRIETARY_PLUGIN_PACKAGE: &str = "hp-plugin";
 const HPLIP_SCAN_REASON_MASK: u32 = 0x40 | 0x80 | 0x100;
+const HPLIP_STATUS_SERVICE: &str = "com.hplip.StatusService";
+const HPLIP_STATUS_PATH: &str = "/com/hplip/StatusService";
+const HPLIP_STATUS_INTERFACE: &str = "com.hplip.StatusService";
+const HPLIP_TOOLBOX_INTERFACE: &str = "com.hplip.Toolbox";
+const DBUS_SERVICE: &str = "org.freedesktop.DBus";
+const DBUS_PATH: &str = "/org/freedesktop/DBus";
+const DBUS_INTERFACE: &str = "org.freedesktop.DBus";
 
 /// Walk-up HP backend backed by `hp-probe` and HPLIP's model database.
 #[derive(Debug, Clone)]
@@ -66,6 +81,18 @@ struct ModelInfo {
 struct DependencyState {
     package: &'static str,
     installed: bool,
+}
+
+type HplipHistoryEntry = (String, String, i32, String, i32, String, f64);
+
+struct EventStream(mpsc::Receiver<ScanTrigger>);
+
+impl futures_core::Stream for EventStream {
+    type Item = ScanTrigger;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.get_mut().0.poll_recv(cx)
+    }
 }
 
 impl HplipBackend {
@@ -148,6 +175,25 @@ impl HplipBackend {
 
         Ok(())
     }
+
+    fn device_uri(scanner: &ScannerInfo) -> Result<&str, BackendError> {
+        scanner
+            .capabilities
+            .extra
+            .get("hplip")
+            .and_then(as_dict)
+            .and_then(|dict| dict.get("device_uri"))
+            .and_then(|value| match value {
+                Value::Str(uri) => Some(uri.as_str()),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                BackendError::Other(format!(
+                    "scanner {} is missing the HPLIP device URI from discovery",
+                    scanner.id
+                ))
+            })
+    }
 }
 
 #[async_trait]
@@ -192,10 +238,123 @@ impl ScannerBackend for HplipBackend {
 
     async fn start_listening(
         &self,
-        _scanner: &ScannerInfo,
-    ) -> Result<BoxStream<'static, scanbus_core::ScanTrigger>, BackendError> {
-        // Button delivery lands in 6.2; for 6.1 pairing must still be able to finish.
-        Ok(Box::pin(stream::pending()))
+        scanner: &ScannerInfo,
+    ) -> Result<BoxStream<'static, ScanTrigger>, BackendError> {
+        let device_uri = Self::device_uri(scanner)?.to_owned();
+        let scanner_id = scanner.id.clone();
+        let connection = zbus::Connection::session().await.map_err(|error| {
+            BackendError::Other(format!("could not connect to the session bus: {error}"))
+        })?;
+        let bus = DBusProxy::new(&connection)
+            .await
+            .map_err(|error| BackendError::Other(format!("could not talk to D-Bus: {error}")))?;
+        let owner = bus
+            .get_name_owner(HPLIP_STATUS_SERVICE.try_into().expect("static bus name is valid"))
+            .await
+            .map_err(|_| BackendError::Other(hpssd_missing_message(&scanner_id)))?;
+        let status_proxy = zbus::Proxy::new(
+            &connection,
+            HPLIP_STATUS_SERVICE,
+            HPLIP_STATUS_PATH,
+            HPLIP_STATUS_INTERFACE,
+        )
+        .await
+        .map_err(|error| BackendError::Other(format!("could not bind to hpssd: {error}")))?;
+
+        let toolbox_rule = MatchRule::builder()
+            .msg_type(MessageType::Signal)
+            .sender(owner.as_str())
+            .map_err(|error| BackendError::Other(format!("invalid hpssd owner name: {error}")))?
+            .path("/")
+            .map_err(|error| BackendError::Other(format!("invalid toolbox path: {error}")))?
+            .interface(HPLIP_TOOLBOX_INTERFACE)
+            .map_err(|error| BackendError::Other(format!("invalid toolbox interface: {error}")))?
+            .member("Event")
+            .map_err(|error| BackendError::Other(format!("invalid toolbox signal name: {error}")))?
+            .build();
+        let owner_rule = MatchRule::builder()
+            .msg_type(MessageType::Signal)
+            .sender(DBUS_SERVICE)
+            .map_err(|error| BackendError::Other(format!("invalid D-Bus service name: {error}")))?
+            .path(DBUS_PATH)
+            .map_err(|error| BackendError::Other(format!("invalid D-Bus path: {error}")))?
+            .interface(DBUS_INTERFACE)
+            .map_err(|error| BackendError::Other(format!("invalid D-Bus interface: {error}")))?
+            .member("NameOwnerChanged")
+            .map_err(|error| BackendError::Other(format!("invalid NameOwnerChanged member: {error}")))?
+            .add_arg(HPLIP_STATUS_SERVICE)
+            .map_err(|error| BackendError::Other(format!("invalid NameOwnerChanged filter: {error}")))?
+            .build();
+
+        let mut toolbox_stream = MessageStream::for_match_rule(toolbox_rule, &connection, Some(8))
+            .await
+            .map_err(|error| BackendError::Other(format!("could not subscribe to hpssd events: {error}")))?;
+        let mut owner_stream = MessageStream::for_match_rule(owner_rule, &connection, Some(4))
+            .await
+            .map_err(|error| BackendError::Other(format!("could not watch hpssd ownership: {error}")))?;
+
+        let (sender, receiver) = mpsc::channel(8);
+        tokio::spawn(async move {
+            let mut last_trigger_id = None::<String>;
+
+            loop {
+                tokio::select! {
+                    _ = sender.closed() => break,
+                    message = owner_stream.next() => match message {
+                        Some(Ok(message)) => {
+                            if owner_lost(&message, owner.as_str()) {
+                                debug!(scanner = %scanner_id, "hpssd left the session bus; ending the HP listener stream");
+                                break;
+                            }
+                        }
+                        Some(Err(error)) => {
+                            warn!(scanner = %scanner_id, %error, "could not watch hpssd ownership");
+                            break;
+                        }
+                        None => break,
+                    },
+                    message = toolbox_stream.next() => match message {
+                        Some(Ok(message)) => {
+                            let Ok((event_device_uri, _, _, _, _, _, _)) =
+                                message.body().deserialize::<HplipHistoryEntry>() else {
+                                continue;
+                            };
+                            if event_device_uri != device_uri {
+                                continue;
+                            }
+
+                            let history = match status_proxy
+                                .call::<_, _, (String, Vec<HplipHistoryEntry>)>("GetHistory", &(device_uri.as_str(),))
+                                .await
+                            {
+                                Ok((_, history)) => history,
+                                Err(error) => {
+                                    warn!(scanner = %scanner_id, %error, "could not refresh hpssd history");
+                                    break;
+                                }
+                            };
+
+                            if let Some(trigger) = scan_waiting_for_pc_trigger(&scanner_id, &device_uri, &history) {
+                                if last_trigger_id.as_deref() == Some(trigger.id.as_str()) {
+                                    continue;
+                                }
+                                last_trigger_id = Some(trigger.id.clone());
+                                if sender.send(trigger).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        Some(Err(error)) => {
+                            warn!(scanner = %scanner_id, %error, "the toolbox event stream failed");
+                            break;
+                        }
+                        None => break,
+                    },
+                }
+            }
+        });
+
+        Ok(Box::pin(EventStream(receiver)))
     }
 
     async fn stop_listening(&self, _scanner_id: &ScannerId) -> Result<(), BackendError> {
@@ -351,7 +510,7 @@ fn capabilities_from_model(
         sources: sources_from_scan_src(model.scan_src),
         duplex: model.scan_type == 6,
         buttons: ButtonsCapability {
-            count: 0,
+            count: 1,
             label_configurable: false,
         },
         extra: BTreeMap::from([("hplip".to_owned(), Value::Dict(extra))]),
@@ -571,9 +730,48 @@ fn command_output(stdout: &[u8], stderr: &[u8]) -> String {
     }
 }
 
+fn scan_waiting_for_pc_trigger(
+    scanner_id: &ScannerId,
+    device_uri: &str,
+    history: &[HplipHistoryEntry],
+) -> Option<ScanTrigger> {
+    let (event_device_uri, _, event_code, _, job_id, _, timedate) = history.last()?;
+    if event_device_uri != device_uri || *event_code != HPLIP_EVENT_SCAN_WAITING_FOR_PC {
+        return None;
+    }
+
+    let millis = (*timedate * 1000.0).round();
+    if !millis.is_finite() || millis < 0.0 {
+        return None;
+    }
+
+    Some(ScanTrigger {
+        id: format!("hpssd:{event_code}:{job_id}:{}", millis as u64),
+        scanner_id: scanner_id.clone(),
+        kind: scanbus_core::TriggerKind::Button {
+            index: HPLIP_BUTTON_INDEX,
+        },
+        timestamp: UNIX_EPOCH + Duration::from_millis(millis as u64),
+    })
+}
+
+fn owner_lost(message: &zbus::Message, previous_owner: &str) -> bool {
+    let Ok((_, old_owner, new_owner)) = message.body().deserialize::<(String, String, String)>() else {
+        return false;
+    };
+    old_owner == previous_owner && new_owner.is_empty()
+}
+
+fn hpssd_missing_message(scanner_id: &ScannerId) -> String {
+    format!(
+        "hpssd is not running on the session bus for scanner {scanner_id}; hp-systray normally starts it, and scanbus will not start a competing copy"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::SystemTime;
 
     #[test]
     fn hp_probe_network_table_is_parsed() {
@@ -647,7 +845,7 @@ hp:/usb/officejet_8710_series?serial=CN1234ABCDE        HP OfficeJet 8710 series
 
         assert_eq!(capabilities.sources, vec![Source::Flatbed, Source::Adf]);
         assert!(capabilities.duplex);
-        assert_eq!(capabilities.buttons.count, 0);
+        assert_eq!(capabilities.buttons.count, 1);
         assert!(requires_plugin(&ScannerInfo {
             id: ScannerId::from_backend(ID, "192.168.1.9").unwrap(),
             name: record.display_name,
@@ -683,6 +881,69 @@ plugin-reason=64
                 plugin: 1,
                 plugin_reason: 64,
             })
+        );
+    }
+
+    #[test]
+    fn scan_waiting_for_pc_history_becomes_button_zero() {
+        let scanner_id = ScannerId::from_backend(ID, "192.168.1.9").unwrap();
+        let history = vec![(
+            "hp:/net/officejet_pro_9010?ip=192.168.1.9".to_owned(),
+            String::new(),
+            HPLIP_EVENT_SCAN_WAITING_FOR_PC,
+            "jean".to_owned(),
+            0,
+            String::new(),
+            1_723_472_000.125,
+        )];
+
+        let trigger = scan_waiting_for_pc_trigger(
+            &scanner_id,
+            "hp:/net/officejet_pro_9010?ip=192.168.1.9",
+            &history,
+        )
+        .expect("the waiting-for-pc event should become a trigger");
+
+        assert_eq!(trigger.scanner_id, scanner_id);
+        assert_eq!(trigger.kind, scanbus_core::TriggerKind::Button { index: 0 });
+        assert_eq!(trigger.id, "hpssd:2006:0:1723472000125");
+        assert_eq!(
+            trigger.timestamp,
+            SystemTime::UNIX_EPOCH + Duration::from_millis(1_723_472_000_125)
+        );
+    }
+
+    #[test]
+    fn only_the_latest_waiting_for_pc_event_triggers() {
+        let scanner_id = ScannerId::from_backend(ID, "192.168.1.9").unwrap();
+        let history = vec![
+            (
+                "hp:/net/officejet_pro_9010?ip=192.168.1.9".to_owned(),
+                String::new(),
+                HPLIP_EVENT_SCAN_WAITING_FOR_PC,
+                "jean".to_owned(),
+                0,
+                String::new(),
+                1.0,
+            ),
+            (
+                "hp:/net/officejet_pro_9010?ip=192.168.1.9".to_owned(),
+                String::new(),
+                2000,
+                "jean".to_owned(),
+                0,
+                String::new(),
+                2.0,
+            ),
+        ];
+
+        assert!(
+            scan_waiting_for_pc_trigger(
+                &scanner_id,
+                "hp:/net/officejet_pro_9010?ip=192.168.1.9",
+                &history
+            )
+            .is_none()
         );
     }
 }
