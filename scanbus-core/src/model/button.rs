@@ -61,11 +61,7 @@ impl ButtonInfo {
                     .labels
                     .get(index as usize)
                     .map_or("", String::as_str);
-                Self::new(
-                    index,
-                    device_label,
-                    capabilities.buttons.label_configurable,
-                )
+                Self::new(index, device_label, capabilities.buttons.label_configurable)
             })
             .collect()
     }

@@ -172,13 +172,18 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert!(page.contains("\\fBscanbus\\-profile\\fR(1), \\fBscanbus\\fR(1)"), "{page}");
+        assert!(
+            page.contains("\\fBscanbus\\-profile\\fR(1), \\fBscanbus\\fR(1)"),
+            "{page}"
+        );
 
-        let page = String::from_utf8(
-            render(clap::Command::new("status").about("x"), &[root]).unwrap(),
-        )
-        .unwrap();
-        assert!(page.contains(".SH SEE ALSO\n\\fBscanbus\\fR(1)\n"), "{page}");
+        let page =
+            String::from_utf8(render(clap::Command::new("status").about("x"), &[root]).unwrap())
+                .unwrap();
+        assert!(
+            page.contains(".SH SEE ALSO\n\\fBscanbus\\fR(1)\n"),
+            "{page}"
+        );
 
         let page =
             String::from_utf8(render(clap::Command::new("scanbus").about("x"), &[]).unwrap())

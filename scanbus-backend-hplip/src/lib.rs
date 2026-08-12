@@ -307,7 +307,10 @@ impl HplipBackend {
                 BackendError::Other(hpssd_activation_missing_message(
                     scanner_id,
                     ActivationFailure::classify(activation_error.as_ref()),
-                    activation_error.as_ref().map(ToString::to_string).as_deref(),
+                    activation_error
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .as_deref(),
                 ))
             })
     }
@@ -987,7 +990,10 @@ impl ActivationFailure {
             None => Self::NoOwner,
             Some(zbus::fdo::Error::ServiceUnknown(_)) => Self::NoServiceFile,
             Some(other) => {
-                if other.name().starts_with("org.freedesktop.DBus.Error.Spawn.") {
+                if other
+                    .name()
+                    .starts_with("org.freedesktop.DBus.Error.Spawn.")
+                {
                     Self::Spawn
                 } else {
                     Self::NoOwner
@@ -1254,18 +1260,18 @@ plugin-reason=64
             ))),
             ActivationFailure::Spawn
         );
-        assert_eq!(ActivationFailure::classify(None), ActivationFailure::NoOwner);
+        assert_eq!(
+            ActivationFailure::classify(None),
+            ActivationFailure::NoOwner
+        );
     }
 
     #[test]
     fn each_activation_failure_names_its_own_remedy() {
         let scanner_id = ScannerId::from_backend(ID, "192.168.1.9").unwrap();
 
-        let missing_file = hpssd_activation_missing_message(
-            &scanner_id,
-            ActivationFailure::NoServiceFile,
-            None,
-        );
+        let missing_file =
+            hpssd_activation_missing_message(&scanner_id, ActivationFailure::NoServiceFile, None);
         assert!(missing_file.contains("scanbus-hplip-status.service"));
 
         let spawn = hpssd_activation_missing_message(&scanner_id, ActivationFailure::Spawn, None);

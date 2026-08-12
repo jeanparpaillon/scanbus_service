@@ -153,18 +153,19 @@ impl BrotherBackend {
         }
 
         let installed = installed_state(&self.dpkg_query_path)?;
-        scanners_from_sightings(parse_scanimage_output(&String::from_utf8_lossy(&output.stdout)), installed)
+        scanners_from_sightings(
+            parse_scanimage_output(&String::from_utf8_lossy(&output.stdout)),
+            installed,
+        )
     }
 
     fn ensure_installed_once(&self, scanner: &ScannerInfo) -> Result<(), BackendError> {
-        let metadata = brother_metadata(scanner).ok_or_else(|| {
-            BackendError::InstallFailed {
-                package: "brother-driver".to_owned(),
-                detail: format!(
-                    "scanner {} is missing Brother discovery metadata; rediscover it first",
-                    scanner.id
-                ),
-            }
+        let metadata = brother_metadata(scanner).ok_or_else(|| BackendError::InstallFailed {
+            package: "brother-driver".to_owned(),
+            detail: format!(
+                "scanner {} is missing Brother discovery metadata; rediscover it first",
+                scanner.id
+            ),
         })?;
         let driver = metadata.driver.ok_or_else(|| BackendError::InstallFailed {
             package: "brother-driver".to_owned(),
@@ -209,7 +210,9 @@ impl ScannerBackend for BrotherBackend {
         let backend = self.clone();
         tokio::task::spawn_blocking(move || backend.discover_once())
             .await
-            .map_err(|error| BackendError::Other(format!("brother discover task failed: {error}")))?
+            .map_err(|error| {
+                BackendError::Other(format!("brother discover task failed: {error}"))
+            })?
     }
 
     async fn ensure_installed(
@@ -290,11 +293,9 @@ trait UnsupportedWithScanner {
 impl UnsupportedWithScanner for BackendError {
     fn with_scanner(self, scanner: ScannerId) -> BackendError {
         match self {
-            BackendError::Unsupported { backend, operation } => {
-                BackendError::Other(format!(
-                    "{operation} is not supported by backend {backend} for scanner {scanner}"
-                ))
-            }
+            BackendError::Unsupported { backend, operation } => BackendError::Other(format!(
+                "{operation} is not supported by backend {backend} for scanner {scanner}"
+            )),
             other => other,
         }
     }
@@ -461,11 +462,7 @@ fn enrichments_by_model(sightings: &[Sighting]) -> BTreeMap<String, Enrichment> 
 }
 
 fn unique_entry(set: &BTreeSet<String>) -> Option<&String> {
-    if set.len() == 1 {
-        set.first()
-    } else {
-        None
-    }
+    if set.len() == 1 { set.first() } else { None }
 }
 
 fn required_driver(sighting: &Sighting) -> Option<Driver> {
@@ -571,7 +568,11 @@ struct BrotherMetadata {
 }
 
 fn brother_metadata(scanner: &ScannerInfo) -> Option<BrotherMetadata> {
-    let dict = scanner.capabilities.extra.get("brother").and_then(as_dict)?;
+    let dict = scanner
+        .capabilities
+        .extra
+        .get("brother")
+        .and_then(as_dict)?;
     let driver = dict.get("driver").and_then(|value| match value {
         Value::Str(package) if package == "brscan4" => Some(Driver::Brscan4),
         Value::Str(package) if package == "brscan5" => Some(Driver::Brscan5),
@@ -614,8 +615,13 @@ fn normalize_model(model: &str) -> String {
 fn physical_address_from_uri(uri: &str) -> Option<String> {
     url_host(uri)
         .or_else(|| query_value(uri, "ip").map(|value| value.to_ascii_lowercase()))
-        .or_else(|| query_value(uri, "hostname").map(|value| value.trim_end_matches('.').to_ascii_lowercase()))
-        .or_else(|| query_value(uri, "zc").map(|value| value.trim_end_matches('.').to_ascii_lowercase()))
+        .or_else(|| {
+            query_value(uri, "hostname")
+                .map(|value| value.trim_end_matches('.').to_ascii_lowercase())
+        })
+        .or_else(|| {
+            query_value(uri, "zc").map(|value| value.trim_end_matches('.').to_ascii_lowercase())
+        })
         .or_else(|| usb_endpoint(uri))
         .or_else(|| ipv4(uri))
 }
@@ -623,8 +629,13 @@ fn physical_address_from_uri(uri: &str) -> Option<String> {
 fn stable_hint_from_uri(uri: &str) -> Option<String> {
     query_value(uri, "serial")
         .map(str::to_owned)
-        .or_else(|| query_value(uri, "hostname").map(|value| value.trim_end_matches('.').to_ascii_lowercase()))
-        .or_else(|| query_value(uri, "zc").map(|value| value.trim_end_matches('.').to_ascii_lowercase()))
+        .or_else(|| {
+            query_value(uri, "hostname")
+                .map(|value| value.trim_end_matches('.').to_ascii_lowercase())
+        })
+        .or_else(|| {
+            query_value(uri, "zc").map(|value| value.trim_end_matches('.').to_ascii_lowercase())
+        })
         .or_else(|| url_host(uri))
         .or_else(|| usb_endpoint(uri))
 }
@@ -782,28 +793,35 @@ device 'airscan:escl:Brother MFC-L2710DW http://BRW001122334455.local:80/eSCL/' 
         assert_eq!(scanners.len(), 1);
         assert_eq!(scanners[0].name, "MFC-L2710DW");
         assert_eq!(scanners[0].address, "brw001122334455.local:80");
-        assert_eq!(scanners[0].id.as_str(), "brother_brw001122334455_2Elocal_3A80");
+        assert_eq!(
+            scanners[0].id.as_str(),
+            "brother_brw001122334455_2Elocal_3A80"
+        );
         let brother = scanners[0]
             .capabilities
             .extra
             .get("brother")
             .and_then(as_dict)
             .unwrap();
-        assert_eq!(brother.get("driver"), Some(&Value::Str("brscan4".to_owned())));
+        assert_eq!(
+            brother.get("driver"),
+            Some(&Value::Str("brscan4".to_owned()))
+        );
         assert_eq!(brother.get("driver_installed"), Some(&Value::Bool(true)));
         assert_eq!(scanners[0].capabilities.buttons.count, 4);
     }
 
     #[test]
     fn unknown_models_keep_zero_buttons_and_no_driver_guess() {
-        let scanners = scanners_from_sightings(
-            vec![parse_scanimage_line(
+        let scanners =
+            scanners_from_sightings(
+                vec![parse_scanimage_line(
                 "device 'airscan:escl:http://192.168.1.23:80/eSCL/' is 'Brother Scanner XYZ'",
             )
             .unwrap()],
-            InstalledState::default(),
-        )
-        .unwrap();
+                InstalledState::default(),
+            )
+            .unwrap();
 
         assert_eq!(scanners.len(), 1);
         assert_eq!(scanners[0].capabilities.buttons.count, 0);
