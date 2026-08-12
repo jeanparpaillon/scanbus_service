@@ -28,6 +28,8 @@ use scanbus_core::{Capabilities, Value};
 use thiserror::Error;
 use zbus::zvariant::{OwnedValue, Value as ZValue};
 
+use crate::profiles::options::SchemaEntry;
+
 /// A `a{sv}` map, the shape every open-ended property in §3 has.
 pub type Dict = HashMap<String, OwnedValue>;
 
@@ -253,6 +255,47 @@ pub fn capabilities(capabilities: &Capabilities) -> Dict {
     rendered
 }
 
+/// Renders the resolved option table as the `OptionsSchema` property of §6.
+///
+/// The entries go through here rather than through [`dict`] because §6 fixes their
+/// signatures and [`Value`] cannot express one of them: `values` is `as`, and a
+/// [`Value::Array`] renders as `av` by construction — right for an option map whose
+/// element types this daemon does not decide, wrong for a list that is strings and only
+/// ever strings. The typed fields of [`SchemaEntry`] are what let this be `as` without
+/// weakening [`value`].
+///
+/// `min` and `max` are emitted together or not at all, so a client never has to handle a
+/// half-bounded range that no declaration can produce.
+pub fn options_schema(entries: &[SchemaEntry]) -> Dict {
+    entries
+        .iter()
+        .map(|entry| {
+            let mut rendered = Dict::from([
+                ("type".to_owned(), owned(ZValue::from(entry.type_name))),
+                ("default".to_owned(), value(&entry.default)),
+                (
+                    "description".to_owned(),
+                    owned(ZValue::from(entry.description)),
+                ),
+            ]);
+
+            if !entry.values.is_empty() {
+                rendered.insert(
+                    "values".to_owned(),
+                    owned(ZValue::from(entry.values.to_vec())),
+                );
+            }
+
+            if let (Some(min), Some(max)) = (&entry.min, &entry.max) {
+                rendered.insert("min".to_owned(), value(min));
+                rendered.insert("max".to_owned(), value(max));
+            }
+
+            (entry.key.to_owned(), owned(ZValue::from(rendered)))
+        })
+        .collect()
+}
+
 /// Same infallibility as in [`value`], for the values built from typed fields.
 fn owned(value: ZValue<'_>) -> OwnedValue {
     OwnedValue::try_from(value).expect("a value built from a typed field holds no file descriptor")
@@ -435,6 +478,56 @@ mod tests {
         let error = from_value(&ZValue::from(keyed_by_int))
             .expect_err("every map in the API is keyed by strings");
         assert_eq!(error, FromValueError::DictKey("i".to_owned()), "{error}");
+    }
+
+    /// §6's shape, on the wire: an entry per option, `values` as `as` rather than the
+    /// `av` a [`Value::Array`] would have produced, and bounds only where they exist.
+    #[test]
+    fn a_schema_entry_has_the_signatures_the_api_fixes() {
+        let entries = crate::profiles::options::schema(
+            scanbus_core::ProfileKind::Image,
+            std::path::Path::new("/home/user/Pictures/scanbus/image"),
+        );
+        let rendered = options_schema(&entries);
+
+        let format = Dict::try_from(rendered["format"].clone()).unwrap();
+        assert_eq!(String::try_from(format["type"].clone()).unwrap(), "string");
+        assert_eq!(String::try_from(format["default"].clone()).unwrap(), "jpeg");
+        assert_eq!(
+            format["values"].value_signature().to_string(),
+            "as",
+            "a client decoding the documented signature has to find it"
+        );
+        assert_eq!(
+            Vec::<String>::try_from(format["values"].clone()).unwrap(),
+            ["jpeg", "jpg", "png"]
+        );
+        assert!(
+            !String::try_from(format["description"].clone())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!format.contains_key("min"), "a string option has no bounds");
+
+        let quality = Dict::try_from(rendered["quality"].clone()).unwrap();
+        assert_eq!(
+            String::try_from(quality["type"].clone()).unwrap(),
+            "integer"
+        );
+        assert_eq!(u64::try_from(quality["min"].clone()).unwrap(), 1);
+        assert_eq!(u64::try_from(quality["max"].clone()).unwrap(), 100);
+        assert!(
+            !quality.contains_key("values"),
+            "a bounded integer is not a closed set"
+        );
+
+        let folder = Dict::try_from(rendered["output_folder"].clone()).unwrap();
+        assert_eq!(String::try_from(folder["type"].clone()).unwrap(), "path");
+        assert_eq!(
+            String::try_from(folder["default"].clone()).unwrap(),
+            "/home/user/Pictures/scanbus/image",
+            "the resolved directory, not the empty stored value"
+        );
     }
 
     /// The integer variants keep the signature core chose for them.

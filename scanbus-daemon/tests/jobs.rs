@@ -86,11 +86,14 @@ trait Button {
     fn set_profile(&self, value: &str) -> zbus::Result<()>;
 }
 
-/// Just enough of `org.scanbus.Profile1` to override image defaults for a test.
+/// Just enough of `org.scanbus.Profile1` to override image defaults, and to ask where a
+/// scan with no `output_folder` would land.
 #[zbus::proxy(interface = "org.scanbus.Profile1", default_service = "org.scanbus")]
 trait Profile {
     #[zbus(property)]
     fn set_options(&self, value: HashMap<String, OwnedValue>) -> zbus::Result<()>;
+    #[zbus(property)]
+    fn options_schema(&self) -> zbus::Result<HashMap<String, OwnedValue>>;
 }
 
 /// Just enough of `org.scanbus.Scanner1` to connect and to set the fallback profile.
@@ -113,10 +116,26 @@ struct Daemon {
 
 impl Daemon {
     async fn start(bus: &PrivateBus, scanners: impl IntoIterator<Item = ScannerInfo>) -> Self {
+        Self::start_writing_under(bus, scanners, None).await
+    }
+
+    /// The same daemon, with the XDG user directories replaced by `output_root`.
+    ///
+    /// The one test that scans *without* an `output_folder` needs this: it is asserting
+    /// about where the daemon writes when nothing tells it to, and the honest answer on a
+    /// developer's machine is `~/Pictures`.
+    async fn start_writing_under(
+        bus: &PrivateBus,
+        scanners: impl IntoIterator<Item = ScannerInfo>,
+        output_root: Option<std::path::PathBuf>,
+    ) -> Self {
         let connection = bus.connect().await;
         let objects = Arc::new(ObjectRegistry::new(connection.clone()).await.unwrap());
         let backend = Arc::new(MockBackend::with_scanners(scanners));
-        let profiles = Arc::new(ProfileRegistry::ephemeral());
+        let profiles = Arc::new(match output_root {
+            Some(root) => ProfileRegistry::ephemeral_with_output_root(root),
+            None => ProfileRegistry::ephemeral(),
+        });
 
         // The real sink, with the real lifecycle — only the window is a test's. Anything
         // else here would be testing a stand-in.
@@ -550,6 +569,76 @@ async fn document_profile_multi_page_false_reports_paths() {
 
     await_removed(&client, &path).await;
     let _ = fs::remove_dir_all(out);
+    daemon.shutdown().await;
+}
+
+/// Acceptance (10.13): the folder `Profile1.OptionsSchema` reports as the effective
+/// default is the folder a scan with no `output_folder` really writes to.
+///
+/// This is the criterion the property is worth having for. A client shows that path to
+/// the user as "where the next scan lands"; if the daemon's own directory logic and the
+/// published default were two computations, the GUI would be confidently wrong the first
+/// time they diverged. So the scan runs with `output_folder` unset — the state a fresh
+/// profile store is in — and the assertion is against the file the job reports.
+#[tokio::test]
+async fn an_unset_output_folder_lands_where_the_schema_says_it_will() {
+    let Some(bus) = PrivateBus::start().await else {
+        return skipped("an_unset_output_folder_lands_where_the_schema_says_it_will");
+    };
+    let root = std::env::temp_dir().join(format!(
+        "scanbus-schema-output-root-{}-{}",
+        std::process::id(),
+        JobRegistry::FIRST_ID
+    ));
+    let info = brother();
+    let daemon = Daemon::start_writing_under(&bus, [info.clone()], Some(root.clone())).await;
+    let client = bus.connect().await;
+    daemon.ready(&info).await;
+
+    // Read first, scan second: the client's rule in §6 is "display the default when the
+    // key is absent", and this is that read.
+    let schema = profile_proxy(&client, scanbus_core::ProfileKind::Image)
+        .await
+        .options_schema()
+        .await
+        .unwrap();
+    let folder = HashMap::<String, OwnedValue>::try_from(schema["output_folder"].clone()).unwrap();
+    let published = String::try_from(folder["default"].clone()).unwrap();
+    assert!(!published.is_empty());
+
+    button_proxy(&client, &info.id, 1)
+        .await
+        .set_profile("image")
+        .await
+        .unwrap();
+
+    let feed = open_next_job(&daemon.handle(), JobRegistry::FIRST_ID);
+    daemon.press(&info.id, 1);
+    feed.page(jpeg_page(0, 40)).unwrap();
+    let path = await_job(&client, &info.id, JobRegistry::FIRST_ID).await;
+    let job = job_proxy(&client, &info.id, JobRegistry::FIRST_ID).await;
+    let mut announced = changes(&client, path.clone()).await;
+    feed.end();
+
+    assert_eq!(next_string(&mut announced, "State").await, "processing");
+    let terminal = next_string(&mut announced, "State").await;
+    assert_eq!(terminal, "done", "error={}", job.error().await.unwrap());
+
+    let result = job.result().await.unwrap();
+    let written = Vec::<String>::try_from(result["paths"].clone()).unwrap();
+    let parent = std::path::Path::new(&written[0])
+        .parent()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    assert_eq!(
+        parent, published,
+        "the page landed somewhere the schema did not announce"
+    );
+    assert!(std::path::Path::new(&written[0]).exists());
+
+    await_removed(&client, &path).await;
+    let _ = fs::remove_dir_all(&root);
     daemon.shutdown().await;
 }
 

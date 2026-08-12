@@ -18,18 +18,25 @@ use lopdf::{Document as LoDocument, Object, Stream, dictionary};
 use scanbus_core::{PageFormat, ProfileKind, ProfileProcessor, ProfileResult, RawPage, Value};
 use tempfile::Builder as TempDirBuilder;
 use tokio::sync::Mutex;
+use tracing::warn;
 
-const IMAGE_FORMAT: &str = "format";
-const IMAGE_QUALITY: &str = "quality";
-const DOCUMENT_FORMAT: &str = "format";
-const DOCUMENT_MULTI_PAGE: &str = "multi_page";
-const OUTPUT_FOLDER: &str = "output_folder";
+pub mod options;
+
+use options::{FORMAT, MULTI_PAGE, OUTPUT_FOLDER, QUALITY, SchemaEntry};
+
 const DOCUMENT_SPOOL_DIR: &str = "scanbus-document-spool";
 
 /// Profile defaults, persistence and processors.
 pub struct ProfileRegistry {
     store_path: Option<PathBuf>,
     options: Mutex<BTreeMap<ProfileKind, BTreeMap<String, Value>>>,
+    /// What replaces the XDG user directory when resolving an unset `output_folder`.
+    ///
+    /// `None` — the daemon's own case — means "ask XDG". A test sets it so that a scan
+    /// with no `output_folder` lands somewhere it may delete, rather than in the
+    /// developer's real `~/Pictures`; the schema and the processors both read it, which
+    /// is what makes the comparison between them meaningful.
+    output_root: Option<PathBuf>,
     image: Arc<ImageProcessor>,
     document: Arc<DocumentProcessor>,
 }
@@ -42,28 +49,38 @@ impl ProfileRegistry {
 
     /// Test registry that never writes to disk.
     pub fn ephemeral() -> Self {
-        Self {
-            store_path: None,
-            options: Mutex::new(default_options()),
-            image: Arc::new(ImageProcessor),
-            document: Arc::new(DocumentProcessor::new()),
-        }
+        Self::build(None, default_options(), None)
+    }
+
+    /// Test registry that also writes its scans under `output_root` instead of the XDG
+    /// user directories.
+    pub fn ephemeral_with_output_root(output_root: PathBuf) -> Self {
+        Self::build(None, default_options(), Some(output_root))
     }
 
     pub fn with_store_path(store_path: PathBuf) -> Self {
         let loaded = load_options(&store_path).unwrap_or_else(|_| default_options());
 
+        Self::build(Some(store_path), loaded, None)
+    }
+
+    fn build(
+        store_path: Option<PathBuf>,
+        options: BTreeMap<ProfileKind, BTreeMap<String, Value>>,
+        output_root: Option<PathBuf>,
+    ) -> Self {
         Self {
-            store_path: Some(store_path),
-            options: Mutex::new(loaded),
-            image: Arc::new(ImageProcessor),
-            document: Arc::new(DocumentProcessor::new()),
+            store_path,
+            options: Mutex::new(options),
+            image: Arc::new(ImageProcessor::new(output_root.clone())),
+            document: Arc::new(DocumentProcessor::new(output_root.clone())),
+            output_root,
         }
     }
 
     /// Profiles currently registered as `Profile1` objects.
     pub fn registered_profiles(&self) -> Vec<ProfileKind> {
-        vec![ProfileKind::Image, ProfileKind::Document]
+        options::REGISTERED.to_vec()
     }
 
     pub async fn profile_types(&self) -> Vec<String> {
@@ -77,12 +94,36 @@ impl ProfileRegistry {
         self.options.lock().await.get(&kind).cloned()
     }
 
+    /// What `Profile1.OptionsSchema` publishes for `kind` (§6).
+    ///
+    /// Recomputed on every read rather than cached, because `output_folder`'s effective
+    /// default follows the XDG user directories and this daemon does not watch them: a
+    /// client that reads the property gets the truth, a client that caches it is the one
+    /// §6 warns to refresh.
+    ///
+    /// A `$HOME`-less environment is the one case with nothing to report; the entry then
+    /// carries an empty default rather than disappearing, so a client's key set does not
+    /// change shape under it.
+    pub fn options_schema(&self, kind: ProfileKind) -> Vec<SchemaEntry> {
+        let folder =
+            default_output_dir(kind, self.output_root.as_deref()).unwrap_or_else(|error| {
+                warn!(
+                    profile = kind.as_str(),
+                    %error,
+                    "cannot resolve the default output folder; publishing an empty default"
+                );
+                PathBuf::new()
+            });
+
+        options::schema(kind, &folder)
+    }
+
     pub async fn set_options(
         &self,
         kind: ProfileKind,
         options: BTreeMap<String, Value>,
     ) -> Result<(), String> {
-        validate_options(kind, &options)?;
+        options::validate(kind, &options)?;
 
         {
             let mut state = self.options.lock().await;
@@ -149,7 +190,15 @@ impl Default for ProfileRegistry {
     }
 }
 
-struct ImageProcessor;
+struct ImageProcessor {
+    output_root: Option<PathBuf>,
+}
+
+impl ImageProcessor {
+    fn new(output_root: Option<PathBuf>) -> Self {
+        Self { output_root }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OutputFormat {
@@ -175,7 +224,7 @@ impl ProfileProcessor for ImageProcessor {
     ) -> Result<ProfileResult, String> {
         let format = image_format(options)?;
         let quality = image_quality(options)?;
-        let output_dir = output_dir(options, ProfileKind::Image)?;
+        let output_dir = output_dir(options, ProfileKind::Image, self.output_root.as_deref())?;
         ensure_output_dir(&output_dir)?;
 
         let stamp = scan_stamp();
@@ -250,6 +299,7 @@ const fn image_format_from_page(format: PageFormat) -> ImageFormat {
 
 struct DocumentProcessor {
     spool_root: PathBuf,
+    output_root: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -277,13 +327,16 @@ struct SpoolPage {
 }
 
 impl DocumentProcessor {
-    fn new() -> Self {
+    fn new(output_root: Option<PathBuf>) -> Self {
         let spool_root = std::env::temp_dir().join(DOCUMENT_SPOOL_DIR);
         static SWEEP_ON_START: Once = Once::new();
         SWEEP_ON_START.call_once(|| {
             let _ = sweep_spool_root(&spool_root);
         });
-        Self { spool_root }
+        Self {
+            spool_root,
+            output_root,
+        }
     }
 }
 
@@ -299,7 +352,7 @@ impl ProfileProcessor for DocumentProcessor {
         }
 
         let multi_page = document_multi_page(options)?;
-        let output_dir = output_dir(options, ProfileKind::Document)?;
+        let output_dir = output_dir(options, ProfileKind::Document, self.output_root.as_deref())?;
         ensure_output_dir(&output_dir)?;
 
         fs::create_dir_all(&self.spool_root).map_err(|error| {
@@ -548,124 +601,61 @@ fn sweep_spool_root(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_options(kind: ProfileKind, options: &BTreeMap<String, Value>) -> Result<(), String> {
-    match kind {
-        ProfileKind::Image => {
-            for (key, value) in options {
-                match key.as_str() {
-                    IMAGE_FORMAT => {
-                        let Value::Str(format) = value else {
-                            return Err("image option format must be a string".to_owned());
-                        };
-                        if !matches!(format.as_str(), "jpeg" | "jpg" | "png") {
-                            return Err(format!(
-                                "image format must be one of jpeg/jpg/png, got {format:?}"
-                            ));
-                        }
-                    }
-                    IMAGE_QUALITY => {
-                        let quality = as_u64(value)
-                            .ok_or_else(|| "image option quality must be an integer".to_owned())?;
-                        if !(1..=100).contains(&quality) {
-                            return Err(format!("image quality must be in 1..=100, got {quality}"));
-                        }
-                    }
-                    OUTPUT_FOLDER => {
-                        if !matches!(value, Value::Str(_)) {
-                            return Err("image option output_folder must be a string".to_owned());
-                        }
-                    }
-                    other => return Err(format!("unknown image option {other:?}")),
-                }
-            }
-        }
-        ProfileKind::Document => {
-            for (key, value) in options {
-                match key.as_str() {
-                    DOCUMENT_FORMAT => {
-                        let Value::Str(format) = value else {
-                            return Err("document option format must be a string".to_owned());
-                        };
-                        if format != "pdf" {
-                            return Err(format!("document format must be \"pdf\", got {format:?}"));
-                        }
-                    }
-                    DOCUMENT_MULTI_PAGE => {
-                        if !matches!(value, Value::Bool(_)) {
-                            return Err("document option multi_page must be a boolean".to_owned());
-                        }
-                    }
-                    OUTPUT_FOLDER => {
-                        if !matches!(value, Value::Str(_)) {
-                            return Err("document option output_folder must be a string".to_owned());
-                        }
-                    }
-                    other => return Err(format!("unknown document option {other:?}")),
-                }
-            }
-        }
-        ProfileKind::Email | ProfileKind::Ocr => {
-            return Err(format!("profile {} is not implemented", kind.as_str()));
-        }
-    }
-
-    Ok(())
-}
-
+/// The output encoding, as the enum the encoder switches on.
+///
+/// The accepted spellings are the table's; this only maps them onto the two encoders,
+/// and `jpg` collapsing into `jpeg` is the alias §6 talks about. The last arm is
+/// unreachable while the two agree — and a test walks every declared value through here
+/// so that a format added to the table without an encoder is a failing test rather than a
+/// scan that dies half way.
 fn image_format(options: &BTreeMap<String, Value>) -> Result<OutputFormat, String> {
-    let Some(value) = options.get(IMAGE_FORMAT) else {
-        return Ok(OutputFormat::Jpeg);
-    };
-
-    let Value::Str(format) = value else {
-        return Err("image option format must be a string".to_owned());
-    };
-
-    match format.as_str() {
+    match options::string_value(ProfileKind::Image, FORMAT, options)? {
         "jpeg" | "jpg" => Ok(OutputFormat::Jpeg),
         "png" => Ok(OutputFormat::Png),
-        other => Err(format!(
-            "image format must be one of jpeg/jpg/png, got {other:?}"
-        )),
+        other => Err(format!("image format {other:?} has no encoder")),
     }
 }
 
 fn image_quality(options: &BTreeMap<String, Value>) -> Result<u8, String> {
-    let Some(value) = options.get(IMAGE_QUALITY) else {
-        return Ok(90);
-    };
-
-    let quality =
-        as_u64(value).ok_or_else(|| "image option quality must be an integer".to_owned())?;
+    let quality = options::integer_value(ProfileKind::Image, QUALITY, options)?;
     u8::try_from(quality).map_err(|_| format!("image quality must be in 1..=100, got {quality}"))
 }
 
 fn document_is_pdf(options: &BTreeMap<String, Value>) -> bool {
-    match options.get(DOCUMENT_FORMAT) {
-        Some(Value::Str(format)) => format == "pdf",
-        Some(_) => false,
-        None => true,
-    }
+    options::string_value(ProfileKind::Document, FORMAT, options)
+        .is_ok_and(|format| format == "pdf")
 }
 
 fn document_multi_page(options: &BTreeMap<String, Value>) -> Result<bool, String> {
-    match options.get(DOCUMENT_MULTI_PAGE) {
-        Some(Value::Bool(value)) => Ok(*value),
-        Some(_) => Err("document option multi_page must be a boolean".to_owned()),
-        None => Ok(true),
-    }
+    options::boolean_value(ProfileKind::Document, MULTI_PAGE, options)
 }
 
-fn output_dir(options: &BTreeMap<String, Value>, kind: ProfileKind) -> Result<PathBuf, String> {
+fn output_dir(
+    options: &BTreeMap<String, Value>,
+    kind: ProfileKind,
+    output_root: Option<&Path>,
+) -> Result<PathBuf, String> {
     if let Some(Value::Str(path)) = options.get(OUTPUT_FOLDER)
         && !path.trim().is_empty()
     {
         return Ok(PathBuf::from(path));
     }
 
-    let root = default_output_root(kind)?;
-    let profile_name = kind.as_str();
-    Ok(root.join("scanbus").join(profile_name))
+    default_output_dir(kind, output_root)
+}
+
+/// Where `kind` writes when `output_folder` is unset — the value `OptionsSchema`
+/// publishes as its default, and the directory a scan really uses.
+///
+/// One function for both, on purpose: a client that displays the property is told this is
+/// where the next scan lands, and §6 makes that a promise rather than a hint.
+fn default_output_dir(kind: ProfileKind, output_root: Option<&Path>) -> Result<PathBuf, String> {
+    let root = match output_root {
+        Some(root) => root.to_path_buf(),
+        None => default_output_root(kind)?,
+    };
+
+    Ok(root.join("scanbus").join(kind.as_str()))
 }
 
 fn ensure_output_dir(path: &Path) -> Result<(), String> {
@@ -754,22 +744,10 @@ fn persist_options(
 }
 
 fn default_options() -> BTreeMap<ProfileKind, BTreeMap<String, Value>> {
-    BTreeMap::from([
-        (
-            ProfileKind::Image,
-            BTreeMap::from([
-                (IMAGE_FORMAT.to_owned(), Value::Str("jpeg".to_owned())),
-                (IMAGE_QUALITY.to_owned(), Value::U64(90)),
-            ]),
-        ),
-        (
-            ProfileKind::Document,
-            BTreeMap::from([
-                (DOCUMENT_FORMAT.to_owned(), Value::Str("pdf".to_owned())),
-                (DOCUMENT_MULTI_PAGE.to_owned(), Value::Bool(true)),
-            ]),
-        ),
-    ])
+    options::REGISTERED
+        .iter()
+        .map(|&kind| (kind, options::stored_defaults(kind)))
+        .collect()
 }
 
 fn default_output_root(kind: ProfileKind) -> Result<PathBuf, String> {
@@ -817,14 +795,6 @@ fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
-fn as_u64(value: &Value) -> Option<u64> {
-    match value {
-        Value::U64(v) => Some(*v),
-        Value::I64(v) if *v >= 0 => Some(*v as u64),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -838,6 +808,64 @@ mod tests {
         let defaults = default_options();
         assert!(defaults.contains_key(&ProfileKind::Image));
         assert!(defaults.contains_key(&ProfileKind::Document));
+    }
+
+    /// Every format the table declares has an encoder behind it.
+    ///
+    /// The mapping onto [`OutputFormat`] is the one place the option table cannot
+    /// generate, so it is the one place a new value could be published and then refused
+    /// at the end of a scan. Walking the declared values through it is what stops that.
+    #[test]
+    fn every_declared_image_format_reaches_an_encoder() {
+        let entries = options::schema(ProfileKind::Image, Path::new("/tmp"));
+        let formats = entries
+            .iter()
+            .find(|entry| entry.key == FORMAT)
+            .expect("image declares a format");
+
+        assert!(!formats.values.is_empty(), "format is a closed set");
+        for value in formats.values {
+            let options = BTreeMap::from([(FORMAT.to_owned(), Value::Str((*value).to_owned()))]);
+            image_format(&options).unwrap_or_else(|error| {
+                panic!("declared format {value:?} has no encoder: {error}")
+            });
+        }
+    }
+
+    /// The processors' fallbacks are the table's, so what `OptionsSchema` calls the
+    /// effective default is what an empty `Options` really produces.
+    #[test]
+    fn an_empty_option_map_processes_with_the_published_defaults() {
+        let empty = BTreeMap::new();
+        assert_eq!(image_format(&empty).unwrap(), OutputFormat::Jpeg);
+        assert_eq!(image_quality(&empty).unwrap(), 90);
+        assert!(document_is_pdf(&empty));
+        assert!(document_multi_page(&empty).unwrap());
+    }
+
+    /// The schema's `output_folder` default is the directory the processors write to —
+    /// the same resolution, not two that happen to agree today.
+    #[test]
+    fn the_published_output_folder_is_the_one_a_scan_would_use() {
+        let root = std::env::temp_dir().join("scanbus-schema-default");
+        let registry = ProfileRegistry::ephemeral_with_output_root(root.clone());
+
+        for kind in registry.registered_profiles() {
+            let published = registry
+                .options_schema(kind)
+                .into_iter()
+                .find(|entry| entry.key == OUTPUT_FOLDER)
+                .map(|entry| entry.default)
+                .expect("every profile declares output_folder");
+
+            let used = output_dir(&BTreeMap::new(), kind, Some(&root)).unwrap();
+            assert_eq!(published, Value::Str(used.to_string_lossy().to_string()));
+
+            // An option that is present but blank is an absent one (§6), so the same
+            // default still applies.
+            let blank = BTreeMap::from([(OUTPUT_FOLDER.to_owned(), Value::Str("  ".to_owned()))]);
+            assert_eq!(output_dir(&blank, kind, Some(&root)).unwrap(), used);
+        }
     }
 
     #[test]
@@ -863,15 +891,12 @@ mod tests {
         let resolved = profiles
             .resolve_options(
                 Some(ProfileKind::Image),
-                BTreeMap::from([(IMAGE_FORMAT.to_owned(), Value::Str("png".to_owned()))]),
+                BTreeMap::from([(FORMAT.to_owned(), Value::Str("png".to_owned()))]),
             )
             .await;
 
-        assert_eq!(
-            resolved.get(IMAGE_FORMAT),
-            Some(&Value::Str("png".to_owned()))
-        );
-        assert_eq!(resolved.get(IMAGE_QUALITY), Some(&Value::U64(90)));
+        assert_eq!(resolved.get(FORMAT), Some(&Value::Str("png".to_owned())));
+        assert_eq!(resolved.get(QUALITY), Some(&Value::U64(90)));
     }
 
     fn tiny_jpeg() -> Vec<u8> {
@@ -913,14 +938,14 @@ mod tests {
         };
 
         let options = BTreeMap::from([
-            (IMAGE_FORMAT.to_owned(), Value::Str("jpeg".to_owned())),
+            (FORMAT.to_owned(), Value::Str("jpeg".to_owned())),
             (
                 OUTPUT_FOLDER.to_owned(),
                 Value::Str(dir.to_string_lossy().to_string()),
             ),
         ]);
 
-        let result = ImageProcessor
+        let result = ImageProcessor::new(None)
             .process(Box::pin(stream::iter([page])), &options)
             .await
             .unwrap();
@@ -947,7 +972,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
 
         let options = BTreeMap::from([
-            (IMAGE_FORMAT.to_owned(), Value::Str("png".to_owned())),
+            (FORMAT.to_owned(), Value::Str("png".to_owned())),
             (
                 OUTPUT_FOLDER.to_owned(),
                 Value::Str(dir.to_string_lossy().to_string()),
@@ -960,7 +985,7 @@ mod tests {
             data: tiny_jpeg(),
         };
 
-        let result = ImageProcessor
+        let result = ImageProcessor::new(None)
             .process(Box::pin(stream::iter([page])), &options)
             .await
             .unwrap();
@@ -985,7 +1010,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
 
         let options = BTreeMap::from([
-            (IMAGE_FORMAT.to_owned(), Value::Str("png".to_owned())),
+            (FORMAT.to_owned(), Value::Str("png".to_owned())),
             (
                 OUTPUT_FOLDER.to_owned(),
                 Value::Str(dir.to_string_lossy().to_string()),
@@ -999,7 +1024,7 @@ mod tests {
             data: tiny_png(),
         });
 
-        let result = ImageProcessor
+        let result = ImageProcessor::new(None)
             .process(Box::pin(stream::iter(pages)), &options)
             .await
             .unwrap();
@@ -1071,7 +1096,7 @@ mod tests {
             data: jpeg_with_dimensions(300, 600, [60, 100, 200, 255]),
         };
 
-        let result = DocumentProcessor::new()
+        let result = DocumentProcessor::new(None)
             .process(Box::pin(stream::iter([page])), &options)
             .await
             .unwrap();
@@ -1123,7 +1148,7 @@ mod tests {
             Value::Str(dir.to_string_lossy().to_string()),
         )]);
 
-        let result = DocumentProcessor::new()
+        let result = DocumentProcessor::new(None)
             .process(Box::pin(stream::iter([page])), &options)
             .await
             .unwrap();
@@ -1172,7 +1197,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
 
         let options = BTreeMap::from([
-            (DOCUMENT_MULTI_PAGE.to_owned(), Value::Bool(false)),
+            (MULTI_PAGE.to_owned(), Value::Bool(false)),
             (
                 OUTPUT_FOLDER.to_owned(),
                 Value::Str(dir.to_string_lossy().to_string()),
@@ -1185,7 +1210,7 @@ mod tests {
             data: jpeg_with_dimensions(32, 48, [20 + index as u8, 80, 140, 255]),
         });
 
-        let result = DocumentProcessor::new()
+        let result = DocumentProcessor::new(None)
             .process(Box::pin(stream::iter(pages)), &options)
             .await
             .unwrap();
