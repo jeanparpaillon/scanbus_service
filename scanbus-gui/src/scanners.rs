@@ -756,8 +756,9 @@ impl ScannersPane {
             });
         }
 
-        // Seed the derived visibility once the widgets exist.
-        model.set_selected_path(None);
+        // Seed the derived visibility once the widgets exist without erasing a
+        // programmatic selection that may already have been requested.
+        model.refresh();
 
         {
             let detail_stack = detail_stack.clone();

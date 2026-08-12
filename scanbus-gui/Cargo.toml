@@ -15,7 +15,7 @@ scanbus-client.workspace = true
 scanbus-core.workspace = true
 async-channel = "2"
 futures-util.workspace = true
-gtk4 = "0.10"
+gtk4 = { version = "0.10", features = ["v4_10"] }
 libc = "0.2"
 libadwaita = "0.8"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }

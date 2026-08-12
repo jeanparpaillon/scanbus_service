@@ -3,6 +3,7 @@ mod bus;
 mod buttons;
 mod error;
 mod lifecycle;
+mod notify;
 mod scanners;
 mod store;
 mod window;
@@ -17,6 +18,7 @@ use libadwaita as adw;
 
 use crate::bus::{BusCommand, BusEvent, BusHandle};
 use crate::lifecycle::AppLifecycle;
+use crate::notify::Notifier;
 use crate::scanners::ScannerListModel;
 
 fn main() -> glib::ExitCode {
@@ -28,19 +30,27 @@ fn main() -> glib::ExitCode {
     let bus = Rc::new(BusHandle::start(scanbus_client::Bus::Session));
     let scanners = Rc::new(ScannerListModel::new());
     let lifecycle = Rc::new(AppLifecycle::default());
+    let notifier = Rc::new(Notifier::new(
+        &app,
+        Rc::clone(&scanners),
+        Rc::clone(&lifecycle),
+    ));
 
     {
         let scanners = Rc::clone(&scanners);
+        let notifier = Rc::clone(&notifier);
         let events = bus.events();
         let app = app.clone();
         app.connect_startup(move |_| {
             let scanners = Rc::clone(&scanners);
+            let notifier = Rc::clone(&notifier);
             let events = events.clone();
 
             glib::spawn_future_local(async move {
                 while let Ok(event) = events.recv().await {
                     match event {
                         BusEvent::Store(event) => {
+                            notifier.handle_store_event(&event);
                             if let Err(error) = scanners.apply_event(event) {
                                 eprintln!("scanbus-gui: dropping store event: {error}");
                             }
