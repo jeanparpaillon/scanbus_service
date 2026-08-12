@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 
-use scanbus_client::{DecodeError, ScannerState};
+use scanbus_client::{DecodeError, OptionsSchema, ScannerState};
 use scanbus_core::{ProfileKind, ScannerId, path};
 use zbus::zvariant::{OwnedValue, Value as ZValue};
 
@@ -100,6 +100,7 @@ pub struct JobEntry {
 pub struct ProfileEntry {
     pub kind: ProfileKind,
     pub options: Dict,
+    pub schema: OptionsSchema,
 }
 
 impl Store {
@@ -203,6 +204,7 @@ impl Store {
                 ProfileEntry {
                     kind,
                     options: dict(properties, "Options")?,
+                    schema: schema(properties)?,
                 },
             );
         }
@@ -276,9 +278,13 @@ impl Store {
             PROFILE_INTERFACE => {
                 if let Some(kind) = path::profile_kind(object_path)
                     && let Some(profile) = self.profiles.get_mut(&kind)
-                    && let Some(value) = changed.get("Options")
                 {
-                    profile.options = dict_value(value, "Options")?;
+                    if let Some(value) = changed.get("Options") {
+                        profile.options = dict_value(value, "Options")?;
+                    }
+                    if let Some(value) = changed.get("OptionsSchema") {
+                        profile.schema = schema_value(value, "OptionsSchema")?;
+                    }
                 }
             }
             _ => {}
@@ -394,6 +400,21 @@ fn dict(properties: &Dict, key: &str) -> Result<Dict, DecodeError> {
     dict_value(get(properties, key)?, key)
 }
 
+/// `Profile1.OptionsSchema`, or an empty schema when the profile does not publish one.
+///
+/// Absence is the one thing tolerated here, and only because of what the alternative
+/// costs: a daemon older than API §6's property would fail this decode, and a failed
+/// decode drops the whole `GetManagedObjects` snapshot — every scanner with it. An empty
+/// schema costs the Profiles page instead of the window. A property that *is* published
+/// and does not decode stays an error, the same as a `Options` of the wrong type: that is
+/// a daemon bug, and swallowing it would hide it.
+fn schema(properties: &Dict) -> Result<OptionsSchema, DecodeError> {
+    match properties.get("OptionsSchema") {
+        Some(value) => schema_value(value, "OptionsSchema"),
+        None => Ok(OptionsSchema::default()),
+    }
+}
+
 fn string_value(value: &OwnedValue, key: &str) -> Result<String, DecodeError> {
     match Into::<ZValue<'_>>::into(value.try_clone().map_err(|_| wrong_type(key, "s", value))?) {
         ZValue::Str(text) => Ok(text.as_str().to_owned()),
@@ -439,6 +460,11 @@ fn dict_value(value: &OwnedValue, key: &str) -> Result<Dict, DecodeError> {
         .map_err(|_| wrong_type(key, "a{sv}", value))?
         .try_into()
         .map_err(|_| wrong_type(key, "a{sv}", value))
+}
+
+fn schema_value(value: &OwnedValue, key: &str) -> Result<OptionsSchema, DecodeError> {
+    let dict = dict_value(value, key)?;
+    OptionsSchema::decode(&dict)
 }
 
 fn wrong_type(key: &str, expected: &'static str, got: &OwnedValue) -> DecodeError {
@@ -583,6 +609,136 @@ mod tests {
         assert_eq!(scanner.status, Status::Online);
         assert_eq!(scanner.name, "Brother");
         assert_eq!(scanner.pairing, PairingState::None);
+    }
+
+    fn schema_entry(fields: &[(&str, OwnedValue)]) -> OwnedValue {
+        owned(ZValue::from(
+            fields
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), value.try_clone().unwrap()))
+                .collect::<HashMap<String, OwnedValue>>(),
+        ))
+    }
+
+    fn profile_dict(schema: Option<OwnedValue>) -> Dict {
+        let mut properties = HashMap::from([
+            ("Name".to_owned(), owned(ZValue::from("image"))),
+            (
+                "Options".to_owned(),
+                owned(ZValue::from(HashMap::from([(
+                    "format".to_owned(),
+                    owned(ZValue::from("png")),
+                )]))),
+            ),
+        ]);
+        if let Some(schema) = schema {
+            properties.insert("OptionsSchema".to_owned(), schema);
+        }
+        properties
+    }
+
+    fn quality_schema(max: u64) -> OwnedValue {
+        owned(ZValue::from(HashMap::from([(
+            "quality".to_owned(),
+            schema_entry(&[
+                ("type", owned(ZValue::from("integer"))),
+                ("default", owned(ZValue::from(90u64))),
+                ("min", owned(ZValue::from(1u64))),
+                ("max", owned(ZValue::from(max))),
+            ]),
+        )])))
+    }
+
+    #[test]
+    fn a_profile_arrives_with_its_schema_decoded() {
+        let mut store = Store::default();
+
+        store
+            .apply(StoreEvent::Replace(HashMap::from([(
+                path::profile(ProfileKind::Image),
+                HashMap::from([(
+                    PROFILE_INTERFACE.to_owned(),
+                    profile_dict(Some(quality_schema(100))),
+                )]),
+            )])))
+            .unwrap();
+
+        let profile = &store.profiles[&ProfileKind::Image];
+        assert_eq!(
+            profile
+                .schema
+                .get("quality")
+                .map(|entry| entry.value.clone()),
+            Some(scanbus_client::OptionType::Integer {
+                min: Some(1),
+                max: Some(100),
+            })
+        );
+    }
+
+    /// API §6: the effective default is computed, so the schema is read-only but *not*
+    /// constant — a client that cached it at startup would go stale. Both properties
+    /// therefore update independently.
+    #[test]
+    fn the_schema_changes_without_the_options_changing() {
+        let mut store = Store::default();
+        store
+            .apply(StoreEvent::Replace(HashMap::from([(
+                path::profile(ProfileKind::Image),
+                HashMap::from([(
+                    PROFILE_INTERFACE.to_owned(),
+                    profile_dict(Some(quality_schema(100))),
+                )]),
+            )])))
+            .unwrap();
+
+        store
+            .apply(StoreEvent::PropertiesChanged {
+                path: path::profile(ProfileKind::Image),
+                interface: PROFILE_INTERFACE.to_owned(),
+                changed: HashMap::from([("OptionsSchema".to_owned(), quality_schema(95))]),
+                invalidated: Vec::new(),
+            })
+            .unwrap();
+
+        let profile = &store.profiles[&ProfileKind::Image];
+        assert_eq!(
+            profile
+                .schema
+                .get("quality")
+                .and_then(|entry| match entry.value {
+                    scanbus_client::OptionType::Integer { max, .. } => max,
+                    _ => None,
+                }),
+            Some(95)
+        );
+        assert!(
+            profile.options.contains_key("format"),
+            "a schema change must not clear the stored options"
+        );
+    }
+
+    /// A daemon older than the property costs the Profiles page, not the whole snapshot:
+    /// a failed decode here would drop the scanners that arrived in the same message.
+    #[test]
+    fn a_profile_without_a_schema_still_reaches_the_store() {
+        let mut store = Store::default();
+
+        store
+            .apply(StoreEvent::Replace(HashMap::from([
+                (
+                    path::profile(ProfileKind::Image),
+                    HashMap::from([(PROFILE_INTERFACE.to_owned(), profile_dict(None))]),
+                ),
+                (
+                    scanner_path(),
+                    HashMap::from([(SCANNER_INTERFACE.to_owned(), scanner_dict())]),
+                ),
+            ])))
+            .unwrap();
+
+        assert!(store.profiles[&ProfileKind::Image].schema.is_empty());
+        assert!(store.scanners.contains_key(&scanner_id()));
     }
 
     #[test]

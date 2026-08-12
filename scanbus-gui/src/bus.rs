@@ -63,6 +63,16 @@ pub enum BusCommand {
         path: String,
         kind: Option<ProfileKind>,
     },
+    /// `Profile1.Options` on a profile object path.
+    SetProfileOptions {
+        kind: ProfileKind,
+        options: std::collections::BTreeMap<String, scanbus_core::Value>,
+    },
+    /// `Button1.ProfileOptions` on a button object path.
+    SetButtonProfileOptions {
+        path: String,
+        options: std::collections::BTreeMap<String, scanbus_core::Value>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -543,6 +553,20 @@ async fn handle_command(
                 let proxy = Scanner1Proxy::for_scanner(connection, &id).await?;
                 let value = ProfileKind::optional_as_str(kind);
                 if let Err(error) = proxy.set_default_profile(value).await {
+                    return Err(refused(events, error).await);
+                }
+            }
+        }
+        BusCommand::SetProfileOptions { kind, options } => {
+            let proxy = Profile1Proxy::for_profile(connection, kind).await?;
+            if let Err(error) = proxy.set_options(convert::to_dict(&options)).await {
+                return Err(refused(events, error).await);
+            }
+        }
+        BusCommand::SetButtonProfileOptions { path, options } => {
+            if let Some((scanner, index)) = path::button_index(&path) {
+                let proxy = Button1Proxy::for_button(connection, &scanner, index).await?;
+                if let Err(error) = proxy.set_profile_options(convert::to_dict(&options)).await {
                     return Err(refused(events, error).await);
                 }
             }

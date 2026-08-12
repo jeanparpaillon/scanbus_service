@@ -48,9 +48,10 @@ scanbus-gui/             # binary `scanbus-gui`. Depends on scanbus-client, gtk4
     ├── store.rs         # the object store of §6 — scanners, buttons, jobs, profiles
     ├── notify.rs        # §5, and the only module that may run with no window
     ├── window.rs        # AdwApplicationWindow, sidebar, navigation stack
-    ├── scanners/        # list rows, discovery, the detail pane, the pairing flow
-    ├── buttons/         # the Configure buttons page of design/buttons.png
-    ├── profiles/        # the Profiles view and the option widgets of §11.1
+    ├── scanners.rs      # list rows, discovery, the detail pane, the pairing flow
+    ├── buttons.rs       # the Configure buttons page of design/buttons.png
+    ├── profiles.rs      # the Profiles view: one group per exported Profile1
+    ├── options.rs       # the widget factory OptionsSchema drives (§11.1)
     └── error.rs         # named D-Bus errors (API §8) as user-visible text
 ```
 
@@ -123,9 +124,25 @@ Two things this page must get right, and they are the reason it is its own issue
 
 ### Profiles
 
-One page per `Profile1` object, showing its `Options`. This view is blocked on §11.1: without
-an option schema there is nothing to build the widgets from. [10.7](todo/10_7.md) owns both
-halves.
+One `AdwPreferencesGroup` per `Profile1` object, and every row in it comes from walking that
+profile's `OptionsSchema` (§11.1, now `Profile1.OptionsSchema` in API §6): a closed set of
+values is an `AdwComboRow`, a bounded integer an `AdwSpinRow`, a boolean an `AdwSwitchRow`, a
+`path` a folder chooser. Nothing in `profiles.rs` or `options.rs` names an option key or a
+profile kind, which is the point — an option the daemon adds to its table in
+`scanbus-daemon/src/profiles/options.rs` becomes a row here with no GUI change.
+
+Two cases the factory has to answer explicitly. A `type` this version has no widget for
+becomes a **read-only row naming the type**, because hiding it would make a daemon-side
+extension look like data loss and guessing a widget would offer values the daemon refuses.
+And a profile kind that `GetProfileTypes` advertises with **no `Profile1` object** — `email`
+and `ocr` in API §6 — gets a row saying so, so "this build has no OCR" is distinguishable
+from "the GUI forgot it".
+
+The same factory is what the buttons page opens for a per-key `ProfileOptions` override; the
+only differences are which map the write goes to and that the level below a button is the
+profile's own options rather than the schema default. **Reset** there removes the key instead
+of writing the inherited value back — those look identical and are not: a written-back value
+stops following the profile from that moment on.
 
 ### Settings
 
@@ -308,7 +325,8 @@ one that blocks a whole view.
    it reimplements `default_output_root` and drifts from it. A read-only `OptionsSchema a{sv}`
    on `Profile1`, carrying per-key type, constraint and **effective default**, closes all of
    it, and it is the same information the daemon already has to have in order to reject bad
-   input. [10.7](todo/10_7.md) owns it; it revises [3.1](todo/3_1.md) and API §6.
+   input. **Landed**: `Profile1.OptionsSchema` is API §6, `scanbus-client` decodes it, and the
+   Profiles view of §3 is built from it.
 2. **`Manager1` reports neither a version nor its backends** — the same delta the CLI raises in
    [scanbus-cli.md](scanbus-cli.md) §11.4, with the same two read-only properties as the fix
    (`Version s`, `Backends as`). The Settings page of §3 has two rows that read `–` until they

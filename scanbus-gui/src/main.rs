@@ -2,8 +2,12 @@ mod autostart;
 mod bus;
 mod buttons;
 mod error;
+#[cfg(all(test, feature = "gtk-tests"))]
+mod gtk_tests;
 mod lifecycle;
 mod notify;
+mod options;
+mod profiles;
 mod scanners;
 mod store;
 mod window;

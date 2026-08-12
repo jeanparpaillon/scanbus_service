@@ -25,10 +25,11 @@ use gtk::glib::variant::{StaticVariantType, ToVariant};
 use gtk4 as gtk;
 use libadwaita as adw;
 use libadwaita::prelude::*;
-use scanbus_client::convert;
+use scanbus_client::{OptionsSchema, convert};
 use scanbus_core::{ProfileKind, Status, Value, implied_profile, path};
 
 use crate::bus::BusCommand;
+use crate::options::{OptionsEditor, Scope, humanize_key, render_value};
 use crate::scanners::{connection_banner, connection_subtitle, humanize_profile};
 use crate::store::{ButtonEntry, ProfileEntry, ScannerEntry};
 
@@ -47,6 +48,9 @@ struct RowState {
     profile: Option<ProfileKind>,
     overrides: BTreeMap<String, Value>,
     profile_options: BTreeMap<String, Value>,
+    /// The assigned profile's `OptionsSchema`, which is what the override editor is built
+    /// from — a button has no schema of its own (§6: same key space, same validation).
+    schema: OptionsSchema,
 }
 
 /// The same, for the *Default profile* group and the connection switch.
@@ -57,6 +61,7 @@ struct PageState {
     status: Status,
     default_profile: Option<ProfileKind>,
     profile_options: BTreeMap<String, Value>,
+    schema: OptionsSchema,
 }
 
 struct ButtonRow {
@@ -94,7 +99,30 @@ pub struct ButtonsPage {
     /// The `(scanner path, button indices)` the rows were built for.
     binding: RefCell<Option<(String, Vec<u32>)>>,
     state: Rc<RefCell<PageState>>,
+    dialog: DialogSlot,
     commands: Sender<BusCommand>,
+}
+
+/// The one options dialog this page may have open, shared with the rows that open it.
+type DialogSlot = Rc<RefCell<Option<Rc<OptionsDialog>>>>;
+
+/// An open options editor, and what it is editing.
+///
+/// The page holds on to it so that every render reaches it too: a dialog that rendered
+/// once would keep showing a value the daemon refused, and would miss a change made from
+/// the CLI while it was open. The store is the truth here as much as in a row.
+struct OptionsDialog {
+    window: gtk::Window,
+    editor: OptionsEditor,
+    target: DialogTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DialogTarget {
+    /// `Profile1.Options` — what the *Default profile* group's **Configure** edits.
+    Profile(ProfileKind),
+    /// `Button1.ProfileOptions`, over the options of the profile the key runs.
+    Button { path: String, profile: ProfileKind },
 }
 
 impl ButtonsPage {
@@ -228,6 +256,7 @@ impl ButtonsPage {
         root.insert_action_group("scanner", Some(&actions));
 
         let state = Rc::new(RefCell::new(PageState::default()));
+        let dialog: DialogSlot = Rc::new(RefCell::new(None));
 
         {
             let state = Rc::clone(&state);
@@ -272,12 +301,22 @@ impl ButtonsPage {
         {
             let state = Rc::clone(&state);
             let parent = root.clone();
+            let dialog = Rc::clone(&dialog);
+            let commands = commands.clone();
             default_configure.connect_clicked(move |_| {
                 let state = state.borrow();
                 let Some(profile) = state.default_profile else {
                     return;
                 };
-                open_profile_options(&parent, profile, &state.profile_options, &BTreeMap::new());
+                open_options(
+                    &parent,
+                    &dialog,
+                    &commands,
+                    DialogTarget::Profile(profile),
+                    &state.schema,
+                    &state.profile_options,
+                    &BTreeMap::new(),
+                );
             });
         }
 
@@ -299,6 +338,7 @@ impl ButtonsPage {
             rows: RefCell::new(Vec::new()),
             binding: RefCell::new(None),
             state,
+            dialog,
             commands,
         }
     }
@@ -340,6 +380,7 @@ impl ButtonsPage {
             status: state.status,
             default_profile: state.default_profile,
             profile_options: options_of(profiles, state.default_profile),
+            schema: schema_of(profiles, state.default_profile),
         };
 
         self.render_default_profile(state.default_profile, &supported, profiles);
@@ -358,11 +399,58 @@ impl ButtonsPage {
             self.empty
                 .set_label(empty_state_text(state.capabilities.buttons.count));
         }
+
+        self.render_dialog(scanner, profiles);
+    }
+
+    /// Feeds the store to the open options dialog, if there is one.
+    ///
+    /// A target that no longer exists — the key was unassigned, the profile changed under
+    /// the dialog, the daemon stopped exporting it — closes the window rather than leaving
+    /// an editor whose **Reset** would write into something else.
+    fn render_dialog(
+        &self,
+        scanner: &ScannerEntry,
+        profiles: &BTreeMap<ProfileKind, ProfileEntry>,
+    ) {
+        let Some(dialog) = self.dialog.borrow().clone() else {
+            return;
+        };
+
+        match &dialog.target {
+            DialogTarget::Profile(kind) => match profiles.get(kind) {
+                Some(entry) => {
+                    dialog
+                        .editor
+                        .render(&entry.schema, &decode(&entry.options), &BTreeMap::new())
+                }
+                None => dialog.window.close(),
+            },
+            DialogTarget::Button { path, profile } => {
+                let button = path::button_index(path)
+                    .filter(|(id, _)| *id == scanner.state.id)
+                    .and_then(|(_, index)| scanner.buttons.get(&index));
+
+                match (button, profiles.get(profile)) {
+                    (Some(button), Some(entry)) if button.profile == Some(*profile) => {
+                        dialog.editor.render(
+                            &entry.schema,
+                            &decode(&button.profile_options),
+                            &decode(&entry.options),
+                        )
+                    }
+                    _ => dialog.window.close(),
+                }
+            }
+        }
     }
 
     /// Drops every row. The page keeps its widgets so the stack can hold on to it.
     pub fn clear(&self) {
         self.rebind_to_nothing();
+        if let Some(dialog) = self.dialog.borrow().clone() {
+            dialog.window.close();
+        }
         *self.state.borrow_mut() = PageState::default();
         self.banner_title.set_label("");
         self.banner_address.set_label("");
@@ -409,7 +497,12 @@ impl ButtonsPage {
 
         let mut rows = Vec::with_capacity(indices.len());
         for index in indices {
-            let row = ButtonRow::new(path::button(&id, *index), *index, self.commands.clone());
+            let row = ButtonRow::new(
+                path::button(&id, *index),
+                *index,
+                Rc::clone(&self.dialog),
+                self.commands.clone(),
+            );
             self.list.append(&row.root);
             rows.push(row);
         }
@@ -427,7 +520,7 @@ impl ButtonsPage {
 }
 
 impl ButtonRow {
-    fn new(path: String, index: u32, commands: Sender<BusCommand>) -> Self {
+    fn new(path: String, index: u32, dialog: DialogSlot, commands: Sender<BusCommand>) -> Self {
         let path = Rc::new(path);
         let state = Rc::new(RefCell::new(RowState::default()));
         let pending_label = Rc::new(RefCell::new(false));
@@ -544,12 +637,25 @@ impl ButtonRow {
         {
             let state = Rc::clone(&state);
             let parent = root.clone();
+            let path = Rc::clone(&path);
+            let commands = commands.clone();
             configure.connect_clicked(move |_| {
                 let state = state.borrow();
                 let Some(profile) = state.profile else {
                     return;
                 };
-                open_profile_options(&parent, profile, &state.profile_options, &state.overrides);
+                open_options(
+                    &parent,
+                    &dialog,
+                    &commands,
+                    DialogTarget::Button {
+                        path: path.to_string(),
+                        profile,
+                    },
+                    &state.schema,
+                    &state.overrides,
+                    &state.profile_options,
+                );
             });
         }
 
@@ -634,6 +740,7 @@ impl ButtonRow {
             profile: entry.profile,
             overrides,
             profile_options,
+            schema: schema_of(profiles, entry.profile),
         };
     }
 }
@@ -710,48 +817,6 @@ pub fn summarise(options: &BTreeMap<String, Value>) -> String {
         .join(" · ")
 }
 
-pub fn humanize_key(key: &str) -> String {
-    let spaced = key.replace(['_', '-'], " ");
-    let mut chars = spaced.chars();
-    match chars.next() {
-        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-        None => String::new(),
-    }
-}
-
-pub fn render_value(value: &Value) -> String {
-    match value {
-        Value::Bool(value) => (if *value { "Yes" } else { "No" }).to_owned(),
-        Value::U64(value) => value.to_string(),
-        Value::I64(value) => value.to_string(),
-        Value::F64(value) => value.to_string(),
-        Value::Str(value) => shorten_path(value),
-        Value::Array(items) => items
-            .iter()
-            .map(render_value)
-            .collect::<Vec<_>>()
-            .join(", "),
-        Value::Dict(_) => "…".to_owned(),
-    }
-}
-
-/// `/home/jean/Documents/Scans` reads as `Documents/Scans`, as in the mockup. Anything
-/// that is not under `$HOME` is shown verbatim — an absolute path elsewhere is exactly
-/// the detail the user needs.
-fn shorten_path(value: &str) -> String {
-    let Some(home) = std::env::var_os("HOME") else {
-        return value.to_owned();
-    };
-    let home = home.to_string_lossy().into_owned();
-    if home.is_empty() {
-        return value.to_owned();
-    }
-
-    value
-        .strip_prefix(&format!("{}/", home.trim_end_matches('/')))
-        .map_or_else(|| value.to_owned(), str::to_owned)
-}
-
 /// What a scanner with no `Button1` objects says instead of showing an empty group.
 ///
 /// `Capabilities.buttons.count` is what the objects are created from at pairing time
@@ -779,78 +844,92 @@ fn options_of(
         .unwrap_or_default()
 }
 
+fn schema_of(
+    profiles: &BTreeMap<ProfileKind, ProfileEntry>,
+    profile: Option<ProfileKind>,
+) -> OptionsSchema {
+    profile
+        .and_then(|kind| profiles.get(&kind))
+        .map(|entry| entry.schema.clone())
+        .unwrap_or_default()
+}
+
 fn decode(dict: &crate::store::Dict) -> BTreeMap<String, Value> {
     convert::from_dict(dict).unwrap_or_default()
 }
 
-/// The options the assigned profile will run with — [10.7] owns editing them, and until
-/// it lands this shows what they currently are rather than pretending there is nothing
-/// there.
+/// Opens the options editor, replacing whatever this page had open.
 ///
-/// [10.7]: https://github.com/jeanparpaillon/scanbus_service/issues/54
-fn open_profile_options(
+/// The editor itself is [`crate::options`] and knows nothing about buttons — the only
+/// difference between the two callers is the [`Scope`], the map the write goes to, and
+/// what sits under it in §6's fallback chain.
+fn open_options(
     parent: &impl IsA<gtk::Widget>,
-    profile: ProfileKind,
-    profile_options: &BTreeMap<String, Value>,
-    overrides: &BTreeMap<String, Value>,
+    slot: &DialogSlot,
+    commands: &Sender<BusCommand>,
+    target: DialogTarget,
+    schema: &OptionsSchema,
+    stored: &BTreeMap<String, Value>,
+    inherited: &BTreeMap<String, Value>,
 ) {
+    if let Some(open) = slot.borrow().clone() {
+        open.window.close();
+    }
+
+    let (scope, profile, subtitle) = match &target {
+        DialogTarget::Profile(kind) => (
+            Scope::Profile,
+            *kind,
+            "These options apply to every key that runs this profile.".to_owned(),
+        ),
+        DialogTarget::Button { profile, .. } => (
+            Scope::Button,
+            *profile,
+            format!(
+                "Only this key. An option left inherited follows the {} profile.",
+                profile.as_str()
+            ),
+        ),
+    };
+
     let window = gtk::Window::builder()
         .modal(true)
+        .default_width(520)
         .title(format!("{} options", humanize_profile(profile.as_str())))
         .build();
 
-    let body = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    let editor = OptionsEditor::new(scope);
+    editor.set_description(Some(&subtitle));
+    {
+        let commands = commands.clone();
+        let target = target.clone();
+        editor.connect_write(move |options| {
+            let command = match &target {
+                DialogTarget::Profile(kind) => BusCommand::SetProfileOptions {
+                    kind: *kind,
+                    options,
+                },
+                DialogTarget::Button { path, .. } => BusCommand::SetButtonProfileOptions {
+                    path: path.clone(),
+                    options,
+                },
+            };
+            let _ = commands.try_send(command);
+        });
+    }
+    editor.render(schema, stored, inherited);
+
+    let close = gtk::Button::with_label("Close");
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    actions.set_halign(gtk::Align::End);
+    actions.append(&close);
+
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 18);
     body.set_margin_top(18);
     body.set_margin_bottom(18);
     body.set_margin_start(18);
     body.set_margin_end(18);
-
-    let mut resolved = profile_options.clone();
-    for (key, value) in overrides {
-        resolved.insert(key.clone(), value.clone());
-    }
-
-    if resolved.is_empty() {
-        let empty = gtk::Label::new(Some("This profile has no options set."));
-        empty.set_xalign(0.0);
-        empty.set_wrap(true);
-        body.append(&empty);
-    } else {
-        for (key, value) in &resolved {
-            let name = gtk::Label::new(Some(&humanize_key(key)));
-            name.add_css_class("caption-heading");
-            name.set_xalign(0.0);
-
-            let rendered = if overrides.contains_key(key) {
-                format!("{} (set on this key)", render_value(value))
-            } else {
-                render_value(value)
-            };
-            let shown = gtk::Label::new(Some(&rendered));
-            shown.set_xalign(0.0);
-            shown.set_wrap(true);
-            shown.set_selectable(true);
-
-            let entry = gtk::Box::new(gtk::Orientation::Vertical, 2);
-            entry.append(&name);
-            entry.append(&shown);
-            body.append(&entry);
-        }
-    }
-
-    let note = gtk::Label::new(Some(
-        "Editing these arrives with the Profiles view, which needs an option schema the \
-         daemon does not publish yet.",
-    ));
-    note.add_css_class("dim-label");
-    note.set_xalign(0.0);
-    note.set_wrap(true);
-    body.append(&note);
-
-    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    actions.set_halign(gtk::Align::End);
-    let close = gtk::Button::with_label("Close");
-    actions.append(&close);
+    body.append(editor.widget());
     body.append(&actions);
 
     window.set_child(Some(&body));
@@ -859,6 +938,21 @@ fn open_profile_options(
         let window = window.clone();
         move |_| window.close()
     });
+
+    *slot.borrow_mut() = Some(Rc::new(OptionsDialog {
+        window: window.clone(),
+        editor,
+        target,
+    }));
+
+    window.connect_close_request({
+        let slot = Rc::clone(slot);
+        move |_| {
+            slot.borrow_mut().take();
+            gtk::glib::Propagation::Proceed
+        }
+    });
+
     window.present();
 }
 
@@ -919,47 +1013,6 @@ mod tests {
         assert_eq!(summarise(&BTreeMap::new()), "");
     }
 
-    #[test]
-    fn option_keys_read_as_prose() {
-        assert_eq!(humanize_key("output_folder"), "Output folder");
-        assert_eq!(humanize_key("format"), "Format");
-        assert_eq!(humanize_key("multi-page"), "Multi page");
-        assert_eq!(humanize_key(""), "");
-    }
-
-    #[test]
-    fn values_render_for_a_reader_not_for_a_parser() {
-        assert_eq!(render_value(&Value::Bool(true)), "Yes");
-        assert_eq!(render_value(&Value::U64(300)), "300");
-        assert_eq!(
-            render_value(&Value::Array(vec![
-                Value::Str("eng".to_owned()),
-                Value::Str("fra".to_owned()),
-            ])),
-            "eng, fra"
-        );
-    }
-
-    #[test]
-    fn a_path_under_home_loses_the_home_prefix() {
-        let previous = std::env::var_os("HOME");
-        unsafe {
-            std::env::set_var("HOME", "/home/scanbus");
-        }
-
-        assert_eq!(
-            shorten_path("/home/scanbus/Documents/Scans"),
-            "Documents/Scans"
-        );
-        assert_eq!(shorten_path("/srv/scans"), "/srv/scans");
-        assert_eq!(shorten_path("/home/scanbus"), "/home/scanbus");
-
-        match previous {
-            Some(home) => unsafe { std::env::set_var("HOME", home) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
-    }
-
     /// A `buttons.count` of 0 — a phone, a plain eSCL device — is a different sentence
     /// from keys that have not arrived yet, and neither is an empty group.
     #[test]
@@ -968,257 +1021,337 @@ mod tests {
         assert!(empty_state_text(4).contains("not published them yet"));
         assert_ne!(empty_state_text(0), empty_state_text(4));
     }
+}
 
-    #[cfg(feature = "gtk-tests")]
-    mod widgets {
-        use super::*;
+/// The buttons page's half of the one GTK test — see [`crate::gtk_tests`].
+#[cfg(all(test, feature = "gtk-tests"))]
+pub(crate) mod widget_checks {
+    use super::*;
 
-        use scanbus_client::ScannerState;
-        use scanbus_core::{ButtonsCapability, Capabilities, PairingState, ScannerId, Status};
+    use scanbus_client::ScannerState;
+    use scanbus_core::{ButtonsCapability, Capabilities, PairingState, ScannerId, Status};
 
-        use crate::store::{ButtonEntry, Dict};
+    use crate::options::fixtures::{document_schema, image_schema};
+    use crate::store::{ButtonEntry, Dict};
 
-        fn dict(pairs: &[(&str, &str)]) -> Dict {
-            convert::to_dict(&options(pairs))
-        }
+    fn options(pairs: &[(&str, &str)]) -> BTreeMap<String, Value> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), Value::Str((*value).to_owned())))
+            .collect()
+    }
 
-        fn scanner_id() -> ScannerId {
-            ScannerId::from_backend("mock", "usb:001:002").unwrap()
-        }
+    fn dict(pairs: &[(&str, &str)]) -> Dict {
+        convert::to_dict(&options(pairs))
+    }
 
-        /// The Brother MFC of API §5: four keys, none of them renameable.
-        fn brother(count: u32, label_configurable: bool) -> ScannerEntry {
-            ScannerEntry {
-                path: scanbus_core::path::scanner(&scanner_id()),
-                state: ScannerState {
-                    id: scanner_id(),
-                    name: "Brother MFC-L2710DW".to_owned(),
-                    backend: "proprietary:brother".to_owned(),
-                    address: "192.168.1.23".to_owned(),
-                    capabilities: Capabilities {
-                        buttons: ButtonsCapability {
-                            count,
-                            label_configurable,
-                            labels: Vec::new(),
-                        },
-                        ..Capabilities::default()
+    fn scanner_id() -> ScannerId {
+        ScannerId::from_backend("mock", "usb:001:002").unwrap()
+    }
+
+    /// The Brother MFC of API §5: four keys, none of them renameable.
+    fn brother(count: u32, label_configurable: bool) -> ScannerEntry {
+        ScannerEntry {
+            path: scanbus_core::path::scanner(&scanner_id()),
+            state: ScannerState {
+                id: scanner_id(),
+                name: "Brother MFC-L2710DW".to_owned(),
+                backend: "proprietary:brother".to_owned(),
+                address: "192.168.1.23".to_owned(),
+                capabilities: Capabilities {
+                    buttons: ButtonsCapability {
+                        count,
+                        label_configurable,
+                        labels: Vec::new(),
                     },
-                    supported_profiles: vec![ProfileKind::Image, ProfileKind::Document],
-                    paired: true,
-                    connected: true,
-                    status: Status::Online,
-                    default_profile: Some(ProfileKind::Document),
-                    pairing: PairingState::Done,
+                    ..Capabilities::default()
                 },
-                buttons: BTreeMap::new(),
-                jobs: BTreeMap::new(),
-            }
+                supported_profiles: vec![ProfileKind::Image, ProfileKind::Document],
+                paired: true,
+                connected: true,
+                status: Status::Online,
+                default_profile: Some(ProfileKind::Document),
+                pairing: PairingState::Done,
+            },
+            buttons: BTreeMap::new(),
+            jobs: BTreeMap::new(),
         }
+    }
 
-        fn button(
-            index: u32,
-            device_label: &str,
-            label_configurable: bool,
-            profile: Option<ProfileKind>,
-            overrides: &[(&str, &str)],
-        ) -> ButtonEntry {
-            ButtonEntry {
-                index,
-                device_label: device_label.to_owned(),
-                label_configurable,
-                label: device_label.to_owned(),
-                profile,
-                profile_options: dict(overrides),
-            }
+    fn button(
+        index: u32,
+        device_label: &str,
+        label_configurable: bool,
+        profile: Option<ProfileKind>,
+        overrides: &[(&str, &str)],
+    ) -> ButtonEntry {
+        ButtonEntry {
+            index,
+            device_label: device_label.to_owned(),
+            label_configurable,
+            label: device_label.to_owned(),
+            profile,
+            profile_options: dict(overrides),
         }
+    }
 
-        fn profiles() -> BTreeMap<ProfileKind, ProfileEntry> {
-            BTreeMap::from([
-                (
-                    ProfileKind::Document,
-                    ProfileEntry {
-                        kind: ProfileKind::Document,
-                        options: dict(&[("output_folder", "/srv/scans")]),
-                    },
-                ),
-                (
-                    ProfileKind::Image,
-                    ProfileEntry {
-                        kind: ProfileKind::Image,
-                        options: dict(&[("format", "jpeg")]),
-                    },
-                ),
-            ])
-        }
+    fn profiles() -> BTreeMap<ProfileKind, ProfileEntry> {
+        BTreeMap::from([
+            (
+                ProfileKind::Document,
+                ProfileEntry {
+                    kind: ProfileKind::Document,
+                    options: dict(&[("output_folder", "/srv/scans")]),
+                    schema: document_schema(),
+                },
+            ),
+            (
+                ProfileKind::Image,
+                ProfileEntry {
+                    kind: ProfileKind::Image,
+                    options: dict(&[("format", "jpeg")]),
+                    schema: image_schema(),
+                },
+            ),
+        ])
+    }
 
-        fn visible(widget: &impl IsA<gtk::Widget>) -> bool {
-            widget.as_ref().property::<bool>("visible")
-        }
+    fn visible(widget: &impl IsA<gtk::Widget>) -> bool {
+        widget.as_ref().property::<bool>("visible")
+    }
 
-        /// One test, not six: GTK pins itself to the thread that initialises it, and
-        /// cargo runs test functions on threads of its own. Everything the widgets have
-        /// to get right is asserted here, in order.
-        ///
-        /// Skipped rather than failed with no display — the same deal the daemon's bus
-        /// tests make with `dbus-daemon`: a headless runner should not turn the suite
-        /// red over a dependency that is not a build dependency.
-        #[test]
-        fn the_page_renders_what_the_firmware_and_the_api_allow() {
-            if libadwaita::init().is_err() {
-                eprintln!("skipping: no display for GTK");
-                return;
-            }
+    /// Everything the buttons page has to get right, in order.
+    pub(crate) fn run() {
+        let (commands, sent) = async_channel::unbounded();
+        let page = ButtonsPage::new(commands);
+        let profiles = profiles();
 
-            let (commands, sent) = async_channel::unbounded();
-            let page = ButtonsPage::new(commands);
-            let profiles = profiles();
-
-            // --- A Brother-shaped scanner: four fixed keys, one of them diverging. ---
-            let mut scanner = brother(4, false);
-            scanner.buttons = BTreeMap::from([
-                (
-                    0,
-                    button(0, "Scan to File", false, Some(ProfileKind::Document), &[]),
-                ),
-                (
+        // --- A Brother-shaped scanner: four fixed keys, one of them diverging. ---
+        let mut scanner = brother(4, false);
+        scanner.buttons = BTreeMap::from([
+            (
+                0,
+                button(0, "Scan to File", false, Some(ProfileKind::Document), &[]),
+            ),
+            (
+                1,
+                button(
                     1,
-                    button(
-                        1,
-                        "Scan to Image",
-                        false,
-                        Some(ProfileKind::Image),
-                        &[("format", "png")],
-                    ),
+                    "Scan to Image",
+                    false,
+                    Some(ProfileKind::Image),
+                    &[("format", "png")],
                 ),
-                (
-                    2,
-                    button(2, "Scan to OCR", false, Some(ProfileKind::Document), &[]),
-                ),
-                (3, button(3, "Scan to E-mail", false, None, &[])),
-            ]);
-            page.render(&scanner, &profiles);
+            ),
+            (
+                2,
+                button(2, "Scan to OCR", false, Some(ProfileKind::Document), &[]),
+            ),
+            (3, button(3, "Scan to E-mail", false, None, &[])),
+        ]);
+        page.render(&scanner, &profiles);
 
-            let rows = page.rows.borrow();
-            assert_eq!(rows.len(), 4);
-            assert!(visible(&page.group));
-            assert!(!visible(&page.empty));
+        let rows = page.rows.borrow();
+        assert_eq!(rows.len(), 4);
+        assert!(visible(&page.group));
+        assert!(!visible(&page.empty));
 
-            // §9: no rename action where the firmware refuses one — and no disabled
-            // entry standing in for it either.
-            for row in rows.iter() {
-                assert!(visible(&row.label_text), "row {} lost its label", row.index);
+        // §9: no rename action where the firmware refuses one — and no disabled
+        // entry standing in for it either.
+        for row in rows.iter() {
+            assert!(visible(&row.label_text), "row {} lost its label", row.index);
+            assert!(
+                !visible(&row.label_entry),
+                "row {} offers a rename the device would refuse",
+                row.index
+            );
+        }
+        assert_eq!(rows[0].label_text.label(), "Scan to File");
+
+        // §5: the divergence is a caption on the key that has one, and silence
+        // everywhere else.
+        assert!(visible(&rows[2].caption));
+        assert_eq!(
+            rows[2].caption.label(),
+            "This key is labelled \"Scan to OCR\" but runs the document profile"
+        );
+        for index in [0, 1, 3] {
+            assert!(!visible(&rows[index].caption), "row {index} nags");
+        }
+
+        // The profile column: the assignment, or the way to make one.
+        assert_eq!(rows[0].profile_button.label().as_deref(), Some("Document"));
+        assert_eq!(rows[1].profile_button.label().as_deref(), Some("Image"));
+        assert_eq!(
+            rows[3].profile_button.label().as_deref(),
+            Some("Assign profile")
+        );
+
+        // Only what the key overrides: key 1 changes `format`, key 0 changes nothing.
+        assert_eq!(rows[1].summary.label(), "Format: png");
+        assert!(visible(&rows[1].summary));
+        assert!(!visible(&rows[0].summary));
+
+        // Unassigned keys have no profile options to open.
+        assert!(!rows[3].configure.is_sensitive());
+        assert!(rows[0].configure.is_sensitive());
+
+        // The default profile group writes `Scanner1.DefaultProfile` and shows what
+        // that profile is set to.
+        assert_eq!(page.default_button.label().as_deref(), Some("Document"));
+        assert_eq!(page.default_summary.label(), "Output folder: /srv/scans");
+
+        // Picking a profile is this action, resolved from the row the way a menu
+        // item resolves it — so this is the picker's own wiring, not a shortcut past
+        // it. What it produces is a property write and *nothing else*: the button
+        // still reads "Assign profile" until the daemon says otherwise.
+        rows[3]
+            .root
+            .activate_action(
+                &format!("button.{PROFILE_ACTION}"),
+                Some(&"image".to_variant()),
+            )
+            .expect("the row must carry the action its menu names");
+        assert_eq!(
+            rows[3].profile_button.label().as_deref(),
+            Some("Assign profile"),
+            "the row moved before the daemon confirmed"
+        );
+        match sent.try_recv() {
+            Ok(BusCommand::SetButtonProfile { path, kind }) => {
+                assert!(path.ends_with("/button/3"), "wrote to {path}");
+                assert_eq!(kind, Some(ProfileKind::Image));
+            }
+            other => panic!("expected a Button1.Profile write, got {other:?}"),
+        }
+
+        // Re-picking what is already assigned writes nothing.
+        rows[0]
+            .root
+            .activate_action(
+                &format!("button.{PROFILE_ACTION}"),
+                Some(&"document".to_variant()),
+            )
+            .unwrap();
+        assert!(sent.is_empty(), "a no-op pick still rewrote the config");
+
+        page.root
+            .activate_action(
+                &format!("scanner.{DEFAULT_PROFILE_ACTION}"),
+                Some(&"image".to_variant()),
+            )
+            .expect("the page must carry the default-profile action");
+        match sent.try_recv() {
+            Ok(BusCommand::SetDefaultProfile { path, kind }) => {
+                assert_eq!(path, scanbus_core::path::scanner(&scanner_id()));
+                assert_eq!(kind, Some(ProfileKind::Image));
+            }
+            other => panic!("expected a Scanner1.DefaultProfile write, got {other:?}"),
+        }
+
+        // --- Configure on a key: the override editor of §6's second level. ---
+        rows[1].configure.emit_clicked();
+        drop(rows);
+
+        let dialog = page
+            .dialog
+            .borrow()
+            .clone()
+            .expect("Configure opened nothing");
+        assert_eq!(
+            dialog.target,
+            DialogTarget::Button {
+                path: path::button(&scanner_id(), 1),
+                profile: ProfileKind::Image,
+            }
+        );
+
+        // The key sets `format`; everything else comes from the profile or the schema.
+        assert_eq!(dialog.editor.origin("format").as_deref(), Some("Override"));
+        assert!(dialog.editor.resettable("format"));
+        assert_eq!(
+            dialog.editor.origin("quality").as_deref(),
+            Some("Inherited")
+        );
+        assert!(!dialog.editor.resettable("quality"));
+
+        // Acceptance: a folder differing from the profile's reads as an override, and
+        // **Reset** takes the key out of `ProfileOptions` rather than writing the
+        // inherited value into it.
+        let mut overriding_folder = scanner.clone();
+        overriding_folder.buttons.insert(
+            1,
+            button(
+                1,
+                "Scan to Image",
+                false,
+                Some(ProfileKind::Image),
+                &[("format", "png"), ("output_folder", "/srv/this-key")],
+            ),
+        );
+        page.render(&overriding_folder, &profiles);
+
+        assert_eq!(
+            dialog.editor.origin("output_folder").as_deref(),
+            Some("Override"),
+            "the open dialog must follow the store"
+        );
+        assert_eq!(
+            dialog.editor.subtitle("output_folder").as_deref(),
+            Some("/srv/this-key")
+        );
+
+        dialog.editor.press_reset("output_folder");
+        match sent.try_recv() {
+            Ok(BusCommand::SetButtonProfileOptions { path, options }) => {
+                assert_eq!(path, path::button(&scanner_id(), 1));
                 assert!(
-                    !visible(&row.label_entry),
-                    "row {} offers a rename the device would refuse",
-                    row.index
+                    !options.contains_key("output_folder"),
+                    "Reset wrote the inherited folder back: {options:?}"
+                );
+                assert_eq!(
+                    options.get("format"),
+                    Some(&Value::Str("png".to_owned())),
+                    "resetting one key must not clear the key's other overrides"
                 );
             }
-            assert_eq!(rows[0].label_text.label(), "Scan to File");
-
-            // §5: the divergence is a caption on the key that has one, and silence
-            // everywhere else.
-            assert!(visible(&rows[2].caption));
-            assert_eq!(
-                rows[2].caption.label(),
-                "This key is labelled \"Scan to OCR\" but runs the document profile"
-            );
-            for index in [0, 1, 3] {
-                assert!(!visible(&rows[index].caption), "row {index} nags");
-            }
-
-            // The profile column: the assignment, or the way to make one.
-            assert_eq!(rows[0].profile_button.label().as_deref(), Some("Document"));
-            assert_eq!(rows[1].profile_button.label().as_deref(), Some("Image"));
-            assert_eq!(
-                rows[3].profile_button.label().as_deref(),
-                Some("Assign profile")
-            );
-
-            // Only what the key overrides: key 1 changes `format`, key 0 changes nothing.
-            assert_eq!(rows[1].summary.label(), "Format: png");
-            assert!(visible(&rows[1].summary));
-            assert!(!visible(&rows[0].summary));
-
-            // Unassigned keys have no profile options to open.
-            assert!(!rows[3].configure.is_sensitive());
-            assert!(rows[0].configure.is_sensitive());
-
-            // The default profile group writes `Scanner1.DefaultProfile` and shows what
-            // that profile is set to.
-            assert_eq!(page.default_button.label().as_deref(), Some("Document"));
-            assert_eq!(page.default_summary.label(), "Output folder: /srv/scans");
-
-            // Picking a profile is this action, resolved from the row the way a menu
-            // item resolves it — so this is the picker's own wiring, not a shortcut past
-            // it. What it produces is a property write and *nothing else*: the button
-            // still reads "Assign profile" until the daemon says otherwise.
-            rows[3]
-                .root
-                .activate_action(
-                    &format!("button.{PROFILE_ACTION}"),
-                    Some(&"image".to_variant()),
-                )
-                .expect("the row must carry the action its menu names");
-            assert_eq!(
-                rows[3].profile_button.label().as_deref(),
-                Some("Assign profile"),
-                "the row moved before the daemon confirmed"
-            );
-            match sent.try_recv() {
-                Ok(BusCommand::SetButtonProfile { path, kind }) => {
-                    assert!(path.ends_with("/button/3"), "wrote to {path}");
-                    assert_eq!(kind, Some(ProfileKind::Image));
-                }
-                other => panic!("expected a Button1.Profile write, got {other:?}"),
-            }
-
-            // Re-picking what is already assigned writes nothing.
-            rows[0]
-                .root
-                .activate_action(
-                    &format!("button.{PROFILE_ACTION}"),
-                    Some(&"document".to_variant()),
-                )
-                .unwrap();
-            assert!(sent.is_empty(), "a no-op pick still rewrote the config");
-
-            page.root
-                .activate_action(
-                    &format!("scanner.{DEFAULT_PROFILE_ACTION}"),
-                    Some(&"image".to_variant()),
-                )
-                .expect("the page must carry the default-profile action");
-            match sent.try_recv() {
-                Ok(BusCommand::SetDefaultProfile { path, kind }) => {
-                    assert_eq!(path, scanbus_core::path::scanner(&scanner_id()));
-                    assert_eq!(kind, Some(ProfileKind::Image));
-                }
-                other => panic!("expected a Scanner1.DefaultProfile write, got {other:?}"),
-            }
-            drop(rows);
-
-            // --- The same page, for a device that does allow renaming. ---
-            let mut hp = brother(1, true);
-            hp.buttons = BTreeMap::from([(
-                0,
-                button(0, "Shortcut 1", true, Some(ProfileKind::Image), &[]),
-            )]);
-            page.render(&hp, &profiles);
-
-            let rows = page.rows.borrow();
-            assert_eq!(rows.len(), 1);
-            assert!(visible(&rows[0].label_entry));
-            assert!(!visible(&rows[0].label_text));
-            assert_eq!(rows[0].label_entry.text(), "Shortcut 1");
-            assert!(!visible(&rows[0].caption), "no opinion is not a divergence");
-            drop(rows);
-
-            // --- A scanner with no keys at all: an explanation, not an empty group. ---
-            page.render(&brother(0, false), &profiles);
-            assert!(page.rows.borrow().is_empty());
-            assert!(!visible(&page.group));
-            assert!(visible(&page.empty));
-            assert_eq!(page.empty.label(), empty_state_text(0));
+            other => panic!("expected a Button1.ProfileOptions write, got {other:?}"),
         }
+
+        // A key that stops running the profile the dialog was opened for takes the
+        // dialog with it — its **Reset** would otherwise write into another map.
+        let mut reassigned = overriding_folder.clone();
+        reassigned.buttons.insert(
+            1,
+            button(1, "Scan to Image", false, Some(ProfileKind::Document), &[]),
+        );
+        page.render(&reassigned, &profiles);
+        assert!(
+            page.dialog.borrow().is_none(),
+            "the stale dialog stayed open"
+        );
+
+        // --- The same page, for a device that does allow renaming. ---
+        let mut hp = brother(1, true);
+        hp.buttons = BTreeMap::from([(
+            0,
+            button(0, "Shortcut 1", true, Some(ProfileKind::Image), &[]),
+        )]);
+        page.render(&hp, &profiles);
+
+        let rows = page.rows.borrow();
+        assert_eq!(rows.len(), 1);
+        assert!(visible(&rows[0].label_entry));
+        assert!(!visible(&rows[0].label_text));
+        assert_eq!(rows[0].label_entry.text(), "Shortcut 1");
+        assert!(!visible(&rows[0].caption), "no opinion is not a divergence");
+        drop(rows);
+
+        // --- A scanner with no keys at all: an explanation, not an empty group. ---
+        page.render(&brother(0, false), &profiles);
+        assert!(page.rows.borrow().is_empty());
+        assert!(!visible(&page.group));
+        assert!(visible(&page.empty));
+        assert_eq!(page.empty.label(), empty_state_text(0));
     }
 }

@@ -11,6 +11,7 @@ use libadwaita::prelude::*;
 use crate::autostart;
 use crate::bus::BusCommand;
 use crate::lifecycle::AppLifecycle;
+use crate::profiles::ProfilesPage;
 use crate::scanners::{ScannerListModel, ScannersPane, ToastAction};
 use crate::store::{DiscoveryState, ServiceState};
 
@@ -64,16 +65,23 @@ pub fn build_window(
     sidebar.append(&footer);
 
     let scanners_pane = ScannersPane::new(Rc::clone(&scanners), pane_commands);
-    let profiles_placeholder = adw::StatusPage::builder()
-        .title("Profiles are not editable yet")
-        .description("Issue 10.7 owns the profile editor and option widgets.")
-        .build();
+    let profiles_page = Rc::new(ProfilesPage::new(commands.clone()));
 
     let page_stack = gtk::Stack::new();
     page_stack.set_hexpand(true);
     page_stack.set_vexpand(true);
     page_stack.add_named(scanners_pane.widget(), Some("scanners"));
-    page_stack.add_named(&profiles_placeholder, Some("profiles"));
+    page_stack.add_named(profiles_page.widget(), Some("profiles"));
+
+    {
+        let model = Rc::clone(&scanners);
+        let profiles_page = Rc::clone(&profiles_page);
+        let render = move || {
+            profiles_page.render(&model.profiles(), &model.service_details().profile_types);
+        };
+        render();
+        scanners.connect_changed(render);
+    }
 
     let content = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     content.append(&sidebar);
