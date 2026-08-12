@@ -18,6 +18,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev
+
       - name: Install toolchain
         run: |
           rustup toolchain install "$RUST_VERSION" --profile minimal \
@@ -39,9 +44,9 @@ jobs:
       # shell out to hardware-specific tooling no runner has.
       # `scanbus-gui` is temporarily excluded from CI builds: it pulls in a large GUI
       # dependency stack that we do not want to provision on runners yet.
-      - run: cargo clippy --workspace --exclude scanbus-gui --all-targets --locked -- -D warnings
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      - run: cargo test --workspace --exclude scanbus-gui --locked
+      - run: cargo test --workspace --locked
 
   features:
     name: feature matrix
