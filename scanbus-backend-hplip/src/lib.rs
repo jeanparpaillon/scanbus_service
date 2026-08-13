@@ -1,11 +1,16 @@
 //! HP backend: discovery, install checks, and walk-up button listening through HPLIP.
 //!
-//! Discovery and package checks still come from the HPLIP command-line tools. Walk-up
-//! button delivery comes from HPLIP's status service: `hp-systray --force-startup`
-//! activates the canonical `com.hplip.StatusService` owner on the session bus, and the
-//! resulting `hpssd` process emits `com.hplip.Toolbox.Event` updates there while keeping
-//! the per-device history behind `GetHistory`. Scanbus may request that canonical D-Bus
-//! activation, but it must not become a second process manager for `hpssd.py`.
+//! Network scanners are found by browsing the scanning service types ourselves (`mdns`),
+//! because `hp-probe --bus=net` only ever looks for a printer; `hp-probe` covers the USB
+//! bus, and the network bus only as a fallback. Package checks still come from the HPLIP
+//! command-line tools.
+//!
+//! Walk-up button delivery comes from HPLIP's status service: `hp-systray
+//! --force-startup` activates the canonical `com.hplip.StatusService` owner on the
+//! session bus, and the resulting `hpssd` process emits `com.hplip.Toolbox.Event` updates
+//! there while keeping the per-device history behind `GetHistory`. Scanbus may request
+//! that canonical D-Bus activation, but it must not become a second process manager for
+//! `hpssd.py`.
 //!
 //! # Requesting the activation is not enough on its own
 //!
@@ -20,6 +25,8 @@
 //! immediately without one. The first is checked up front in [`dependency_states`]; the
 //! second can only be reported after the fact, which is what [`ActivationFailure`] is for.
 
+mod mdns;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -32,6 +39,8 @@ use std::time::{Duration, UNIX_EPOCH};
 use async_trait::async_trait;
 use futures_core::stream::BoxStream;
 use futures_util::StreamExt as _;
+// `mdns` unqualified is this crate's own HP-record filter, so the shared browse helper
+// keeps its crate path at the one place it is called.
 use scanbus_backend_common::{
     DEFAULT_SCANIMAGE_HELPER, ScanimageConfig, fetch_pages_via_scanimage,
 };
@@ -65,11 +74,25 @@ const HPLIP_STATUS_SERVICE: &str = "com.hplip.StatusService";
 const HPLIP_STATUS_PATH: &str = "/com/hplip/StatusService";
 const HPLIP_STATUS_INTERFACE: &str = "com.hplip.StatusService";
 const HPLIP_TOOLBOX_INTERFACE: &str = "com.hplip.Toolbox";
+/// eSCL, the service type a network MFP advertises its scanner on, and the one
+/// `libhpdiscovery` browses first.
+const USCAN_SERVICE_TYPE: &str = "_uscan._tcp.local.";
+/// The older scanning service type, still all some HP devices publish.
+const SCANNER_SERVICE_TYPE: &str = "_scanner._tcp.local.";
+/// How long a discovery browse waits. Matched to `hp-probe`'s own `--timeout=5`, so
+/// substituting the browse for the network probe does not lengthen a discovery.
+const MDNS_BROWSE_WINDOW: Duration = Duration::from_secs(5);
+/// `hp-probe` buses when the browse found the network side. USB probing is hpmud's own
+/// job and has no mDNS equivalent.
+const PROBE_BUSES_USB_ONLY: &str = "--bus=usb";
+/// `hp-probe` buses when the browse found nothing: its SLP and JetDirect queries are the
+/// fallback for devices that advertise no scanning service type.
+const PROBE_BUSES_WITH_NET: &str = "--bus=net,usb";
 const DBUS_SERVICE: &str = "org.freedesktop.DBus";
 const DBUS_PATH: &str = "/org/freedesktop/DBus";
 const DBUS_INTERFACE: &str = "org.freedesktop.DBus";
 
-/// Walk-up HP backend backed by `hp-probe` and HPLIP's model database.
+/// Walk-up HP backend, backed by an mDNS browse, `hp-probe` and HPLIP's model database.
 #[derive(Debug, Clone)]
 pub struct HplipBackend {
     hp_probe_path: PathBuf,
@@ -91,9 +114,16 @@ impl Default for HplipBackend {
     }
 }
 
+/// One discovered device, in both of the spellings HPLIP uses for it.
+///
+/// The two are not interchangeable and each has exactly one consumer: `hp:/…` is the
+/// hpmud URI that the `hp-*` tools and `com.hplip.Toolbox.Event` speak, `hpaio:/…` is the
+/// SANE device name that `scanimage --device-name` can open. Carrying only the first is
+/// what makes a found scanner fail to open.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProbeRecord {
     device_uri: String,
+    sane_name: String,
     model_name: String,
     display_name: String,
 }
@@ -116,7 +146,9 @@ struct DependencyState {
 struct FetchState {
     active: Vec<ScannerId>,
     fetched: Vec<(ScannerId, String)>,
-    device_uris: BTreeMap<ScannerId, String>,
+    /// The SANE device names, not the hpmud URIs: this map exists only to feed
+    /// `scanimage --device-name`, which is the `hpaio:/…` spelling. See [`ProbeRecord`].
+    sane_names: BTreeMap<ScannerId, String>,
 }
 
 type HplipHistoryEntry = (String, String, i32, String, i32, String, f64);
@@ -162,17 +194,82 @@ impl HplipBackend {
     }
 
     fn discover_once(&self) -> Result<Vec<ScannerInfo>, BackendError> {
+        let models = load_models(&self.models_dat_path).unwrap_or_else(|error| {
+            warn!(
+                path = %self.models_dat_path.display(),
+                %error,
+                "could not read HPLIP model metadata; discovery will continue without it"
+            );
+            BTreeMap::new()
+        });
+
+        let mut records = self.browse_network(&models);
+        // `hp-probe` is kept for the USB bus, where hpmud probing is what finds a device
+        // and has no mDNS equivalent, and for the network bus only when the browse came
+        // back empty — the SLP and JetDirect queries behind `--bus=net` are how devices
+        // that answer neither `_uscan._tcp` nor `_scanner._tcp` are still found.
+        let buses = if records.is_empty() {
+            PROBE_BUSES_WITH_NET
+        } else {
+            PROBE_BUSES_USB_ONLY
+        };
+
+        match self.probe(buses) {
+            Ok(probed) => records.extend(probed),
+            // A broken `hp-probe` must not bury what the browse already found: that
+            // would put the USB bus back on the critical path for a network scanner,
+            // which is the failure this whole path exists to undo.
+            Err(error) if !records.is_empty() => {
+                warn!(%error, "hp-probe failed; reporting the HP scanners found over mDNS");
+            }
+            Err(error) => return Err(error),
+        }
+
+        records
+            .into_iter()
+            .map(|record| scanner_from_probe(record, &models))
+            .collect()
+    }
+
+    /// The HP scanners on the LAN, browsed from the scanning service types.
+    ///
+    /// Never an error, and empty on every failure: mDNS being unavailable says nothing
+    /// about the USB bus, and the caller answers an empty browse with the `hp-probe`
+    /// network fallback rather than with a failed discovery.
+    fn browse_network(&self, models: &BTreeMap<String, ModelInfo>) -> Vec<ProbeRecord> {
+        let services = match scanbus_backend_common::mdns::browse(
+            &[USCAN_SERVICE_TYPE, SCANNER_SERVICE_TYPE],
+            MDNS_BROWSE_WINDOW,
+        ) {
+            Ok(services) => services,
+            Err(error) => {
+                warn!(%error, "mDNS browse unavailable; falling back to hp-probe for the network bus");
+                return Vec::new();
+            }
+        };
+
+        let records = mdns::hp_scan_records(&services, models);
+        debug!(
+            answered = services.len(),
+            hp_scanners = records.len(),
+            "mDNS browse for HP network scanners finished"
+        );
+        records
+    }
+
+    /// What `hp-probe` reports on `buses`, or an empty list when HPLIP's tools are absent.
+    fn probe(&self, buses: &str) -> Result<Vec<ProbeRecord>, BackendError> {
         if !self.hp_probe_path.exists() {
             warn!(
                 path = %self.hp_probe_path.display(),
-                "hp-probe is absent; treating HPLIP discovery as empty"
+                "hp-probe is absent; treating HPLIP probing as empty"
             );
             return Ok(Vec::new());
         }
 
         let output = Command::new(&self.hp_probe_path)
             .args([
-                "--bus=net,usb",
+                buses,
                 "--filter=scan",
                 "--timeout=5",
                 "--ttl=4",
@@ -188,7 +285,7 @@ impl HplipBackend {
             return Err(BackendError::NotReachable {
                 scanner: Self::discovery_scanner(),
                 detail: format!(
-                    "hp-probe failed with {}: {}",
+                    "hp-probe {buses} failed with {}: {}",
                     output
                         .status
                         .code()
@@ -198,19 +295,7 @@ impl HplipBackend {
             });
         }
 
-        let models = load_models(&self.models_dat_path).unwrap_or_else(|error| {
-            warn!(
-                path = %self.models_dat_path.display(),
-                %error,
-                "could not read HPLIP model metadata; discovery will continue without it"
-            );
-            BTreeMap::new()
-        });
-
-        parse_probe_output(&String::from_utf8_lossy(&output.stdout))
-            .into_iter()
-            .map(|record| scanner_from_probe(record, &models))
-            .collect()
+        Ok(parse_probe_output(&String::from_utf8_lossy(&output.stdout)))
     }
 
     fn ensure_installed_once(&self, scanner: &ScannerInfo) -> Result<(), BackendError> {
@@ -237,34 +322,50 @@ impl HplipBackend {
         Ok(())
     }
 
-    fn device_uri(scanner: &ScannerInfo) -> Result<&str, BackendError> {
+    /// One of the strings discovery published under `capabilities.extra["hplip"]`.
+    fn published_name<'a>(scanner: &'a ScannerInfo, key: &str) -> Result<&'a str, BackendError> {
         scanner
             .capabilities
             .extra
             .get("hplip")
             .and_then(as_dict)
-            .and_then(|dict| dict.get("device_uri"))
+            .and_then(|dict| dict.get(key))
             .and_then(|value| match value {
-                Value::Str(uri) => Some(uri.as_str()),
+                Value::Str(name) => Some(name.as_str()),
                 _ => None,
             })
             .ok_or_else(|| {
                 BackendError::Other(format!(
-                    "scanner {} is missing the HPLIP device URI from discovery",
+                    "scanner {} is missing `{key}` from HPLIP discovery",
                     scanner.id
                 ))
             })
     }
 
-    fn remember_device_uris(&self, scanners: &[ScannerInfo]) {
+    /// The hpmud URI, for talking to HPLIP itself — `hpssd`'s history, the `hp-*` tools.
+    fn device_uri(scanner: &ScannerInfo) -> Result<&str, BackendError> {
+        Self::published_name(scanner, "device_uri")
+    }
+
+    /// The SANE device name, for opening the scanner with `scanimage`.
+    fn sane_name(scanner: &ScannerInfo) -> Result<&str, BackendError> {
+        Self::published_name(scanner, "sane_name")
+    }
+
+    fn remember_sane_names(&self, scanners: &[ScannerInfo]) {
         let mut state = self
             .fetch_state
             .lock()
             .expect("hplip fetch state lock is not poisoned");
-        state.device_uris.clear();
+        state.sane_names.clear();
         for scanner in scanners {
-            if let Ok(uri) = Self::device_uri(scanner) {
-                state.device_uris.insert(scanner.id.clone(), uri.to_owned());
+            match Self::sane_name(scanner) {
+                Ok(name) => {
+                    state.sane_names.insert(scanner.id.clone(), name.to_owned());
+                }
+                Err(error) => {
+                    warn!(scanner = %scanner.id, %error, "no SANE name for this HP; it will not be fetchable")
+                }
             }
         }
     }
@@ -328,7 +429,7 @@ impl ScannerBackend for HplipBackend {
             .await
             .map_err(|error| BackendError::Other(format!("hplip discover task failed: {error}")))?;
         let scanners = scanners?;
-        self.remember_device_uris(&scanners);
+        self.remember_sane_names(&scanners);
         Ok(scanners)
     }
 
@@ -531,14 +632,16 @@ impl ScannerBackend for HplipBackend {
             state.active.push(scanner_id.clone());
         }
 
-        let device_name = {
+        // `scanimage --device-name` wants the SANE name; handing it the `hp:/…` URI is
+        // what turns a scanner we did find into one we cannot open.
+        let sane_name = {
             let state = self
                 .fetch_state
                 .lock()
                 .expect("hplip fetch state lock is not poisoned");
-            state.device_uris.get(scanner_id).cloned()
+            state.sane_names.get(scanner_id).cloned()
         };
-        let Some(device_name) = device_name else {
+        let Some(sane_name) = sane_name else {
             let mut state = self
                 .fetch_state
                 .lock()
@@ -547,7 +650,7 @@ impl ScannerBackend for HplipBackend {
             return Err(BackendError::UnknownScanner(scanner_id.clone()));
         };
 
-        let mut config = ScanimageConfig::new(scanner_id.clone(), device_name);
+        let mut config = ScanimageConfig::new(scanner_id.clone(), sane_name);
         config.program = self.scanimage_helper_path.clone();
         let pages = match fetch_pages_via_scanimage(config).await {
             Ok(pages) => pages,
@@ -631,6 +734,7 @@ fn parse_probe_output(output: &str) -> Vec<ProbeRecord> {
         };
 
         records.push(ProbeRecord {
+            sane_name: sane_name_from_device_uri(device_uri),
             device_uri: device_uri.to_owned(),
             model_name,
             display_name,
@@ -676,6 +780,7 @@ fn capabilities_from_model(
         "device_uri".to_owned(),
         Value::Str(record.device_uri.clone()),
     );
+    extra.insert("sane_name".to_owned(), Value::Str(record.sane_name.clone()));
     extra.insert(
         "model_name".to_owned(),
         Value::Str(record.model_name.clone()),
@@ -745,6 +850,23 @@ fn as_dict(value: &Value) -> Option<&BTreeMap<String, Value>> {
         Value::Dict(dict) => Some(dict),
         _ => None,
     }
+}
+
+/// The SANE device name for an hpmud URI: `hp:/usb/…` becomes `hpaio:/usb/…`.
+///
+/// A prefix substitution and nothing more, because that is precisely what HPLIP itself
+/// does — `base/device.py:1091` builds `scan-uri` as `device_uri.replace('hp:/',
+/// 'hpaio:/')`, and `SCAN_URI`/`SANE_URI` at 1116 the same way.
+///
+/// In particular no `&queue=false` is appended here. That flag belongs to the mDNS path,
+/// where [`mdns::hp_scan_record`] builds it in exactly as `libhpdiscovery` does; for a
+/// URI that came out of `hp-probe`, `libsane-hpaio.so.1` composes the hpmud URI itself
+/// (it carries both `hp:/net/` and `&queue=false` as literals), and second-guessing it
+/// would only produce a name HPLIP never emits.
+fn sane_name_from_device_uri(device_uri: &str) -> String {
+    device_uri
+        .strip_prefix("hp:/")
+        .map_or_else(|| device_uri.to_owned(), |rest| format!("hpaio:/{rest}"))
 }
 
 fn model_key_from_uri(device_uri: &str) -> Option<String> {
@@ -1060,6 +1182,7 @@ Found 1 printer(s) on the 'net' bus.
             parse_probe_output(output),
             vec![ProbeRecord {
                 device_uri: "hp:/net/officejet_pro_9010?ip=192.168.1.9".to_owned(),
+                sane_name: "hpaio:/net/officejet_pro_9010?ip=192.168.1.9".to_owned(),
                 model_name: "HP OfficeJet Pro 9010".to_owned(),
                 display_name: "OfficeJet Pro 9010".to_owned(),
             }]
@@ -1078,9 +1201,56 @@ hp:/usb/officejet_8710_series?serial=CN1234ABCDE        HP OfficeJet 8710 series
             parse_probe_output(output),
             vec![ProbeRecord {
                 device_uri: "hp:/usb/officejet_8710_series?serial=CN1234ABCDE".to_owned(),
+                sane_name: "hpaio:/usb/officejet_8710_series?serial=CN1234ABCDE".to_owned(),
                 model_name: "HP OfficeJet 8710 series".to_owned(),
                 display_name: "HP OfficeJet 8710 series".to_owned(),
             }]
+        );
+    }
+
+    /// `scanimage` cannot open an `hp:/…` URI — that spelling is hpmud's. Discovery
+    /// therefore publishes both names, or fixing discovery only moves the failure from
+    /// "not found" to "cannot open".
+    #[test]
+    fn both_spellings_are_published_for_a_discovered_device() {
+        let record = ProbeRecord {
+            device_uri: "hp:/net/HP_OfficeJet_Pro_8610?ip=192.168.1.3&queue=false".to_owned(),
+            sane_name: "hpaio:/net/HP_OfficeJet_Pro_8610?ip=192.168.1.3&queue=false".to_owned(),
+            model_name: "HP OfficeJet Pro 8610".to_owned(),
+            display_name: "HP OfficeJet Pro 8610".to_owned(),
+        };
+        let capabilities = capabilities_from_model(
+            &record,
+            &Some("hp_officejet_pro_8610".to_owned()),
+            &ModelInfo::default(),
+        );
+        let hplip = capabilities
+            .extra
+            .get("hplip")
+            .and_then(as_dict)
+            .expect("discovery publishes an hplip section");
+
+        assert_eq!(
+            hplip.get("device_uri"),
+            Some(&Value::Str(record.device_uri.clone()))
+        );
+        assert_eq!(
+            hplip.get("sane_name"),
+            Some(&Value::Str(record.sane_name.clone()))
+        );
+    }
+
+    /// HPLIP's own rule, `base/device.py:1091`: substitute the scheme, change nothing
+    /// else — the query string, `queue=false` included, is carried across untouched.
+    #[test]
+    fn the_sane_name_is_the_hpmud_uri_with_its_scheme_substituted() {
+        assert_eq!(
+            sane_name_from_device_uri("hp:/net/HP_OfficeJet_Pro_8610?ip=192.168.1.3&queue=false"),
+            "hpaio:/net/HP_OfficeJet_Pro_8610?ip=192.168.1.3&queue=false"
+        );
+        assert_eq!(
+            sane_name_from_device_uri("hp:/usb/officejet_8710_series?serial=CN1234ABCDE"),
+            "hpaio:/usb/officejet_8710_series?serial=CN1234ABCDE"
         );
     }
 
@@ -1096,10 +1266,30 @@ hp:/usb/officejet_8710_series?serial=CN1234ABCDE        HP OfficeJet 8710 series
         );
     }
 
+    /// The URI shape the mDNS path builds. `queue=false` is a field this function does
+    /// not know and must ignore rather than refuse, and `ip=` stays ahead of `hostname=`:
+    /// an mDNS resolution yields a `.local.` name *as well as* addresses, and publishing
+    /// the name would leave the daemon unable to match this sighting with the same
+    /// device seen over `escl`.
+    #[test]
+    fn an_mdns_uri_is_addressed_by_its_ipv4() {
+        assert_eq!(
+            physical_address_from_uri("hp:/net/HP_OfficeJet_Pro_8610?ip=192.168.1.3&queue=false"),
+            Some("192.168.1.3".to_owned())
+        );
+        assert_eq!(
+            physical_address_from_uri(
+                "hp:/net/HP_OfficeJet_Pro_8610?ip=192.168.1.3&hostname=HP8610.local.&queue=false"
+            ),
+            Some("192.168.1.3".to_owned())
+        );
+    }
+
     #[test]
     fn capabilities_follow_scan_src_and_plugin_flags() {
         let record = ProbeRecord {
             device_uri: "hp:/net/officejet_pro_9010?ip=192.168.1.9".to_owned(),
+            sane_name: "hpaio:/net/officejet_pro_9010?ip=192.168.1.9".to_owned(),
             model_name: "HP OfficeJet Pro 9010".to_owned(),
             display_name: "OfficeJet Pro 9010".to_owned(),
         };
@@ -1307,6 +1497,7 @@ printf 'installed\\n'\n",
         };
         let record = ProbeRecord {
             device_uri: "hp:/net/officejet_pro_9010?ip=192.168.1.9".to_owned(),
+            sane_name: "hpaio:/net/officejet_pro_9010?ip=192.168.1.9".to_owned(),
             model_name: "HP OfficeJet Pro 9010".to_owned(),
             display_name: "OfficeJet Pro 9010".to_owned(),
         };
@@ -1381,9 +1572,9 @@ printf 'P5\\n1 1\\n255\\n\\003' > \"$(printf \"$batch\" 1)\"\n",
             ..HplipBackend::default()
         };
         let scanner_id = ScannerId::from_backend(ID, "192.168.1.9").unwrap();
-        backend.fetch_state.lock().unwrap().device_uris.insert(
+        backend.fetch_state.lock().unwrap().sane_names.insert(
             scanner_id.clone(),
-            "hp:/net/officejet_pro_9010?ip=192.168.1.9".to_owned(),
+            "hpaio:/net/officejet_pro_9010?ip=192.168.1.9".to_owned(),
         );
 
         let mut stream = backend.fetch_pages(&scanner_id, "job-1").await.unwrap();
@@ -1407,6 +1598,89 @@ printf 'P5\\n1 1\\n255\\n\\003' > \"$(printf \"$batch\" 1)\"\n",
                 scanner: scanner_id,
                 job: "job-1".to_owned(),
             }
+        );
+    }
+
+    /// The two spellings are not interchangeable at the point of use: `scanimage` only
+    /// knows `hpaio:/…`, so the map `fetch_pages` reads has to hold that one, while
+    /// `start_listening` keeps matching `hpssd` history entries against `hp:/…`.
+    #[test]
+    fn discovery_remembers_the_sane_name_and_leaves_the_hpmud_uri_to_listening() {
+        let backend = HplipBackend::default();
+        let record = ProbeRecord {
+            device_uri: "hp:/net/officejet_pro_9010?ip=192.168.1.9".to_owned(),
+            sane_name: "hpaio:/net/officejet_pro_9010?ip=192.168.1.9".to_owned(),
+            model_name: "HP OfficeJet Pro 9010".to_owned(),
+            display_name: "OfficeJet Pro 9010".to_owned(),
+        };
+        let scanner = scanner_from_probe(record.clone(), &BTreeMap::new()).unwrap();
+
+        assert_eq!(
+            HplipBackend::device_uri(&scanner).unwrap(),
+            record.device_uri
+        );
+        assert_eq!(HplipBackend::sane_name(&scanner).unwrap(), record.sane_name);
+
+        backend.remember_sane_names(std::slice::from_ref(&scanner));
+        assert_eq!(
+            backend
+                .fetch_state
+                .lock()
+                .unwrap()
+                .sane_names
+                .get(&scanner.id),
+            Some(&record.sane_name)
+        );
+    }
+
+    /// The whole point of carrying two names: what reaches `scanimage` is the openable one.
+    #[tokio::test]
+    async fn a_fetch_opens_the_scanner_by_its_sane_name() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let argv = tempdir.path().join("argv");
+        let script = tempdir.path().join("scanimage.sh");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+batch=\n\
+for arg in \"$@\"; do\n\
+  printf '%s\\n' \"$arg\" >> {argv}\n\
+  case \"$arg\" in\n\
+    --batch=*) batch=${{arg#--batch=}} ;;\n\
+  esac\n\
+done\n\
+printf 'P5\\n1 1\\n255\\n\\003' > \"$(printf \"$batch\" 1)\"\n",
+                argv = argv.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script, perms).unwrap();
+
+        let backend = HplipBackend {
+            scanimage_helper_path: script,
+            ..HplipBackend::default()
+        };
+        let record = ProbeRecord {
+            device_uri: "hp:/net/HP_OfficeJet_Pro_8610?ip=192.168.1.3&queue=false".to_owned(),
+            sane_name: "hpaio:/net/HP_OfficeJet_Pro_8610?ip=192.168.1.3&queue=false".to_owned(),
+            model_name: "HP OfficeJet Pro 8610".to_owned(),
+            display_name: "HP OfficeJet Pro 8610".to_owned(),
+        };
+        let scanner = scanner_from_probe(record.clone(), &BTreeMap::new()).unwrap();
+        backend.remember_sane_names(std::slice::from_ref(&scanner));
+
+        let mut stream = backend.fetch_pages(&scanner.id, "job-1").await.unwrap();
+        while stream.next().await.is_some() {}
+
+        let arguments = fs::read_to_string(&argv).unwrap();
+        assert!(
+            arguments
+                .lines()
+                .any(|argument| argument == format!("--device-name={}", record.sane_name)),
+            "scanimage was called with {arguments:?}"
         );
     }
 }

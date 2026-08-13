@@ -1606,10 +1606,13 @@ dependencies = [
 name = "scanbus-backend-common"
 version = "0.1.0"
 dependencies = [
+ "flume",
  "futures-core",
  "futures-util",
+ "mdns-sd",
  "scanbus-core",
  "tempfile",
+ "thiserror",
  "tokio",
  "tracing",
 ]
@@ -1621,6 +1624,7 @@ dependencies = [
  "async-trait",
  "futures-core",
  "futures-util",
+ "mdns-sd",
  "scanbus-backend-common",
  "scanbus-core",
  "tempfile",
@@ -1634,12 +1638,12 @@ name = "scanbus-backend-mobile"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "flume",
  "futures-core",
  "futures-util",
  "if-addrs",
  "mdns-sd",
  "rand",
+ "scanbus-backend-common",
  "scanbus-core",
  "serde",
  "serde_json",

@@ -7,9 +7,9 @@ rust-version.workspace = true
 repository.workspace = true
 
 [dependencies]
+scanbus-backend-common = { workspace = true, features = ["mdns"] }
 scanbus-core.workspace = true
 async-trait.workspace = true
-flume.workspace = true
 futures-core.workspace = true
 futures-util.workspace = true
 if-addrs.workspace = true

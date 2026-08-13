@@ -1,5 +1,8 @@
 //! Shared helpers for subprocess-driven scanner backends.
 
+#[cfg(feature = "mdns")]
+pub mod mdns;
+
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;

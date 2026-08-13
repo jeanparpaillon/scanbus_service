@@ -6,12 +6,23 @@ edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 
+[features]
+# The DNS-SD browse helper. Off by default so the backends that only shell out to a
+# vendor tool — and the daemon that links them — do not pull mdns-sd into their tree.
+mdns = ["dep:mdns-sd", "dep:flume", "dep:thiserror"]
+
 [dependencies]
 scanbus-core.workspace = true
 futures-core.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "process", "rt", "sync", "time"] }
 tracing.workspace = true
+
+# `mdns` only. flume is mdns-sd's own channel type: browsing several service types in
+# one window means selecting over the receivers it hands back.
+flume = { workspace = true, optional = true }
+mdns-sd = { workspace = true, optional = true }
+thiserror = { workspace = true, optional = true }
 
 [dev-dependencies]
 futures-util.workspace = true

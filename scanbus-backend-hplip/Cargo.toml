@@ -7,11 +7,14 @@ rust-version.workspace = true
 repository.workspace = true
 
 [dependencies]
-scanbus-backend-common.workspace = true
+scanbus-backend-common = { workspace = true, features = ["mdns"] }
 scanbus-core.workspace = true
 async-trait.workspace = true
 futures-core.workspace = true
 futures-util.workspace = true
+# For `ServiceInfo`: the records the mDNS filter reads come from the browse helper in
+# scanbus-backend-common, which hands them over in mdns-sd's own type.
+mdns-sd.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "sync"] }
 tracing.workspace = true
 zbus.workspace = true
