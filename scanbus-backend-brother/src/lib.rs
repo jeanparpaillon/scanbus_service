@@ -4,10 +4,35 @@
 //! machine it already enumerates Brother devices through the proprietary SANE backend
 //! as well as any eSCL-capable ones through airscan, which gives us one probe to parse
 //! instead of a fresh SNMP/mDNS implementation before the basics are tested.
+//!
+//! # This backend never installs anything
+//!
+//! `brscan4`/`brscan5` and `brscan-skey` are `.deb` files from Brother's website,
+//! outside any apt repository ([`scanbus-rust-implementation.md`] §4). The obvious
+//! reading of that — download the `.deb` and hand it to `dpkg -i` through `pkexec` —
+//! is deliberately not implemented: it would make every scanbus install a supply-chain
+//! decision the user was never shown, and would turn a session daemon into a
+//! privilege-escalation surface reachable from the session bus by any process.
+//!
+//! [`ensure_installed`](BrotherBackend::ensure_installed) therefore *verifies, or
+//! refuses*: it reports what is missing, by name and by where it comes from, and stops.
+//! Assisted installation is a later, separate step, and needs pieces this backend does
+//! not have — pinned URLs and checksums shipped in the package rather than fetched, an
+//! explicit confirmation through a UI, and a policy file the distribution can audit.
+//!
+//! Two things enforce that in code rather than in prose: every subprocess goes through
+//! [`CommandRunner`], so a test can assert the exact set of programs this crate is able
+//! to run, and `tests::the_backend_has_no_way_to_install_anything` greps the non-test
+//! source for the mechanisms that would be needed to install something.
+//!
+//! [`scanbus-rust-implementation.md`]: https://github.com/jeanparpaillon/scanbus_service/blob/master/docs/scanbus-rust-implementation.md
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures_core::stream::BoxStream;
@@ -24,13 +49,76 @@ pub const ID: &str = "brother-skey";
 
 const SCANNER_ID_BACKEND: &str = "brother";
 const SCANNER_BACKEND_NAME: &str = "proprietary:brother";
-const BRSCAN_SKEY_PACKAGE: &str = "brscan-skey";
+
+/// Where the packages come from, since no apt repository carries them.
+///
+/// Named in every "not installed" message: a user told only "brscan4 is missing" has
+/// nowhere to go, because `apt install brscan4` cannot work on any distribution.
+const BROTHER_SUPPORT_SITE: &str = "https://support.brother.com/";
+
+/// Everything the backend needs to decide whether one package is usable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PackageProbe {
+    package: &'static str,
+    /// Absolute paths that only exist when the package's files are on disk.
+    ///
+    /// Checked before any subprocess: on a machine where the driver is present this is
+    /// the whole check, and it costs no fork.
+    files: &'static [&'static str],
+}
+
+const BRSCAN4_PROBE: PackageProbe = PackageProbe {
+    package: "brscan4",
+    files: &[
+        "/opt/brother/scanner/brscan4",
+        "/usr/lib64/sane/libsane-brother4.so",
+        "/usr/lib/x86_64-linux-gnu/sane/libsane-brother4.so",
+    ],
+};
+
+const BRSCAN5_PROBE: PackageProbe = PackageProbe {
+    package: "brscan5",
+    files: &[
+        "/opt/brother/scanner/brscan5",
+        "/usr/lib64/sane/libsane-brother5.so",
+        "/usr/lib/x86_64-linux-gnu/sane/libsane-brother5.so",
+    ],
+};
+
+const BRSCAN_SKEY_PROBE: PackageProbe = PackageProbe {
+    package: "brscan-skey",
+    files: &["/usr/bin/brscan-skey", "/opt/brother/scanner/brscan-skey"],
+};
+
+/// The seam every subprocess in this crate goes through.
+///
+/// It exists so that "this backend cannot install anything" is a property a test can
+/// check rather than a claim in a comment: a stub runner records every invocation, and
+/// the allowlist test asserts the programs are exactly `scanimage` and `dpkg-query`,
+/// both read-only.
+trait CommandRunner: fmt::Debug + Send + Sync {
+    fn run(&self, program: &Path, args: &[&str]) -> io::Result<Output>;
+}
+
+/// The real one: spawns the program, and is the only `Command::new` in the crate.
+#[derive(Debug, Clone, Copy)]
+struct SystemCommandRunner;
+
+impl CommandRunner for SystemCommandRunner {
+    fn run(&self, program: &Path, args: &[&str]) -> io::Result<Output> {
+        Command::new(program).args(args).output()
+    }
+}
 
 /// Walk-up Brother backend backed by `scanimage -L` plus local package checks.
 #[derive(Debug, Clone)]
 pub struct BrotherBackend {
     scanimage_path: PathBuf,
     dpkg_query_path: PathBuf,
+    /// Prefix every probed path is resolved against. `/` outside tests; a tempdir in
+    /// them, which is what lets a test mask `brscan4` without touching the machine.
+    sysroot: PathBuf,
+    runner: Arc<dyn CommandRunner>,
 }
 
 impl Default for BrotherBackend {
@@ -38,6 +126,8 @@ impl Default for BrotherBackend {
         Self {
             scanimage_path: PathBuf::from("/usr/bin/scanimage"),
             dpkg_query_path: PathBuf::from("/usr/bin/dpkg-query"),
+            sysroot: PathBuf::from("/"),
+            runner: Arc::new(SystemCommandRunner),
         }
     }
 }
@@ -49,11 +139,15 @@ enum Driver {
 }
 
 impl Driver {
-    const fn package(self) -> &'static str {
+    const fn probe(self) -> PackageProbe {
         match self {
-            Self::Brscan4 => "brscan4",
-            Self::Brscan5 => "brscan5",
+            Self::Brscan4 => BRSCAN4_PROBE,
+            Self::Brscan5 => BRSCAN5_PROBE,
         }
+    }
+
+    const fn package(self) -> &'static str {
+        self.probe().package
     }
 }
 
@@ -99,18 +193,44 @@ struct Enrichment {
     stable_hint: Option<String>,
 }
 
+/// What the two checks together say about one package.
+///
+/// The middle variant is the reason there are two checks. `dpkg-query` answering
+/// `installed` is not proof that anything is on disk — a `.deb` unpacked by hand, a
+/// `/opt` wiped by a cleanup script and an aborted upgrade all leave the status
+/// database saying yes over an empty directory. Pairing on that answer fails later, in
+/// `start_listening`, with an error about SANE rather than about the driver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Presence {
+    /// Files are on disk. The driver can be used, whatever the packaging system thinks
+    /// — including on a machine with no `dpkg` at all.
+    Present,
+    /// The packaging system has the package registered as installed, and none of its
+    /// files are there. Reinstalling is the fix, so the message has to say so.
+    RegisteredButMissing,
+    /// Neither check found anything.
+    #[default]
+    Absent,
+}
+
+impl Presence {
+    const fn is_usable(self) -> bool {
+        matches!(self, Self::Present)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct InstalledState {
-    brscan4: bool,
-    brscan5: bool,
-    brscan_skey: bool,
+    brscan4: Presence,
+    brscan5: Presence,
+    brscan_skey: Presence,
 }
 
 impl InstalledState {
     const fn driver_installed(self, driver: Driver) -> bool {
         match driver {
-            Driver::Brscan4 => self.brscan4,
-            Driver::Brscan5 => self.brscan5,
+            Driver::Brscan4 => self.brscan4.is_usable(),
+            Driver::Brscan5 => self.brscan5.is_usable(),
         }
     }
 }
@@ -130,9 +250,9 @@ impl BrotherBackend {
             return Ok(Vec::new());
         }
 
-        let output = Command::new(&self.scanimage_path)
-            .arg("-L")
-            .output()
+        let output = self
+            .runner
+            .run(&self.scanimage_path, &["-L"])
             .map_err(|error| BackendError::NotReachable {
                 scanner: Self::discovery_scanner(),
                 detail: format!("failed to run scanimage -L: {error}"),
@@ -152,14 +272,15 @@ impl BrotherBackend {
             });
         }
 
-        let installed = installed_state(&self.dpkg_query_path)?;
+        let installed = self.installed_state()?;
         scanners_from_sightings(
             parse_scanimage_output(&String::from_utf8_lossy(&output.stdout)),
             installed,
         )
     }
 
-    fn ensure_installed_once(&self, scanner: &ScannerInfo) -> Result<(), BackendError> {
+    /// Which driver this scanner needs, from what discovery recorded about it.
+    fn required_driver_for(scanner: &ScannerInfo) -> Result<Driver, BackendError> {
         let metadata = brother_metadata(scanner).ok_or_else(|| BackendError::InstallFailed {
             package: "brother-driver".to_owned(),
             detail: format!(
@@ -167,36 +288,177 @@ impl BrotherBackend {
                 scanner.id
             ),
         })?;
-        let driver = metadata.driver.ok_or_else(|| BackendError::InstallFailed {
+        metadata.driver.ok_or_else(|| BackendError::InstallFailed {
             package: "brother-driver".to_owned(),
             detail: format!(
                 "scanbus does not know whether model {} requires brscan4 or brscan5 yet",
                 scanner.name
             ),
-        })?;
+        })
+    }
 
-        let installed = installed_state(&self.dpkg_query_path)?;
-        if !installed.driver_installed(driver) {
-            return Err(BackendError::InstallFailed {
-                package: driver.package().to_owned(),
-                detail: format!(
-                    "{} is not installed; install it before pairing {}",
-                    driver.package(),
-                    scanner.name
-                ),
-            });
-        }
-        if !installed.brscan_skey {
-            return Err(BackendError::InstallFailed {
-                package: BRSCAN_SKEY_PACKAGE.to_owned(),
-                detail: format!(
-                    "{BRSCAN_SKEY_PACKAGE} is not installed; install it before pairing {}",
-                    scanner.name
-                ),
-            });
+    /// One dependency step: announce it, check it, and refuse if it is not usable.
+    ///
+    /// The [`PairingProgress::Installing`] goes out *before* the check, not after it.
+    /// Nothing is being installed — but `installing_backend` is the state this phase of
+    /// pairing is in ([`scanbus-rust-implementation.md`] §5), and a client whose
+    /// progress UI only ever saw `pairing` → `done` here would have to be rewritten the
+    /// day assisted installation lands. The observable sequence is the contract; what
+    /// happens inside the step is not.
+    ///
+    /// [`scanbus-rust-implementation.md`]: https://github.com/jeanparpaillon/scanbus_service/blob/master/docs/scanbus-rust-implementation.md
+    async fn check_dependency(
+        &self,
+        probe: PackageProbe,
+        progress: &mpsc::Sender<PairingProgress>,
+    ) -> Result<(), BackendError> {
+        let _ = progress
+            .send(PairingProgress::Installing {
+                package: probe.package.to_owned(),
+                percent: None,
+            })
+            .await;
+
+        let backend = self.clone();
+        let presence = tokio::task::spawn_blocking(move || backend.package_presence(probe))
+            .await
+            .map_err(|error| {
+                BackendError::Other(format!("brother dependency check failed: {error}"))
+            })??;
+
+        if presence.is_usable() {
+            return Ok(());
         }
 
-        Ok(())
+        Err(BackendError::InstallFailed {
+            package: probe.package.to_owned(),
+            detail: missing_package_detail(probe, presence),
+        })
+    }
+
+    /// The driver this model needs, then `brscan-skey`, each its own progress step.
+    ///
+    /// Two steps rather than one because they fail for different reasons and are fixed
+    /// by installing different packages: a machine can have `brscan4` from an earlier
+    /// SANE-only setup and no `brscan-skey` at all, which is exactly the case where
+    /// scanning works and walk-up keys do not.
+    async fn check_dependencies(
+        &self,
+        scanner: &ScannerInfo,
+        progress: &mpsc::Sender<PairingProgress>,
+    ) -> Result<(), BackendError> {
+        let driver = Self::required_driver_for(scanner)?;
+        self.check_dependency(driver.probe(), progress).await?;
+        self.check_dependency(BRSCAN_SKEY_PROBE, progress).await
+    }
+
+    fn installed_state(&self) -> Result<InstalledState, BackendError> {
+        Ok(InstalledState {
+            brscan4: self.package_presence(BRSCAN4_PROBE)?,
+            brscan5: self.package_presence(BRSCAN5_PROBE)?,
+            brscan_skey: self.package_presence(BRSCAN_SKEY_PROBE)?,
+        })
+    }
+
+    /// Files first, packaging system second — and the second only when the first found
+    /// nothing.
+    ///
+    /// The order is what keeps the check honest on a machine the packaging system does
+    /// not describe: a driver whose files are there is usable even where `dpkg-query`
+    /// is absent or knows nothing, and the query is only needed to tell "never
+    /// installed" apart from "installed, then gutted". `dpkg-query -L` is asked for the
+    /// package's own file list rather than trusting [`PackageProbe::files`], because
+    /// the SANE library path is architecture-dependent and a hard-coded
+    /// `x86_64-linux-gnu` would report a working aarch64 install as broken.
+    fn package_presence(&self, probe: PackageProbe) -> Result<Presence, BackendError> {
+        if probe.files.iter().any(|file| self.resolve(file).exists()) {
+            return Ok(Presence::Present);
+        }
+
+        if !self.dpkg_query_path.exists() {
+            return Ok(Presence::Absent);
+        }
+
+        if !self.package_registered(probe.package)? {
+            return Ok(Presence::Absent);
+        }
+
+        if self
+            .package_files(probe.package)?
+            .iter()
+            .any(|file| self.resolve(file).is_file())
+        {
+            return Ok(Presence::Present);
+        }
+
+        Ok(Presence::RegisteredButMissing)
+    }
+
+    /// `dpkg-query -W`: does the packaging system consider this package installed?
+    fn package_registered(&self, package: &str) -> Result<bool, BackendError> {
+        let output = self
+            .runner
+            .run(
+                &self.dpkg_query_path,
+                &["-W", "-f=${db:Status-Status}\\n", package],
+            )
+            .map_err(|error| {
+                BackendError::Other(format!("failed to run dpkg-query for {package}: {error}"))
+            })?;
+
+        // A package the database has never heard of is an error exit, not an answer.
+        Ok(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).trim() == "installed",
+        )
+    }
+
+    /// `dpkg-query -L`: the paths the package claims to own.
+    fn package_files(&self, package: &str) -> Result<Vec<String>, BackendError> {
+        let output = self
+            .runner
+            .run(&self.dpkg_query_path, &["-L", package])
+            .map_err(|error| {
+                BackendError::Other(format!(
+                    "failed to list the files of {package} with dpkg-query: {error}"
+                ))
+            })?;
+
+        if !output.status.success() {
+            return Ok(Vec::new());
+        }
+
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with('/'))
+            .map(str::to_owned)
+            .collect())
+    }
+
+    fn resolve(&self, absolute: &str) -> PathBuf {
+        self.sysroot.join(absolute.trim_start_matches('/'))
+    }
+}
+
+/// What a client is told about a package it has to install itself.
+///
+/// Names the package and where it comes from, because neither is guessable: `apt
+/// install brscan4` works on no distribution, and the two failures need different
+/// actions from the user.
+fn missing_package_detail(probe: PackageProbe, presence: Presence) -> String {
+    let package = probe.package;
+    match presence {
+        Presence::Present => format!("{package} is installed"),
+        Presence::RegisteredButMissing => format!(
+            "{package} is registered as installed but none of its files are on disk; \
+             reinstall the package from {BROTHER_SUPPORT_SITE} — scanbus does not install it"
+        ),
+        Presence::Absent => format!(
+            "{package} is not installed and is in no distribution repository; \
+             download it from {BROTHER_SUPPORT_SITE} and install it, then pair again — \
+             scanbus does not install it"
+        ),
     }
 }
 
@@ -215,6 +477,16 @@ impl ScannerBackend for BrotherBackend {
             })?
     }
 
+    /// Verifies the Brother dependencies, or refuses. Never installs anything — see the
+    /// crate documentation for why that is the whole design and not an omission.
+    ///
+    /// # Cancellation
+    ///
+    /// Safe at every point, and trivially so: the call only reads. Dropping it mid-check
+    /// leaves a `dpkg-query` that may still be running and will exit on its own, and
+    /// nothing else — no unpacked archive, no half-written config, no partial state to
+    /// unwind. A fresh call afterwards produces the same progress sequence as a first
+    /// one.
     async fn ensure_installed(
         &self,
         scanner: &ScannerInfo,
@@ -226,7 +498,7 @@ impl ScannerBackend for BrotherBackend {
             })
             .await;
 
-        match self.ensure_installed_once(scanner) {
+        match self.check_dependencies(scanner, &progress).await {
             Ok(()) => {
                 let _ = progress.send(PairingProgress::Ready).await;
                 Ok(())
@@ -687,58 +959,6 @@ fn numeric_prefix(token: &str) -> Option<&str> {
     (end > 0).then(|| &token[..end])
 }
 
-fn installed_state(dpkg_query_path: &Path) -> Result<InstalledState, BackendError> {
-    Ok(InstalledState {
-        brscan4: package_installed(
-            dpkg_query_path,
-            "brscan4",
-            &[
-                Path::new("/opt/brother/scanner/brscan4"),
-                Path::new("/usr/lib64/sane/libsane-brother4.so"),
-                Path::new("/usr/lib/x86_64-linux-gnu/sane/libsane-brother4.so"),
-            ],
-        )?,
-        brscan5: package_installed(
-            dpkg_query_path,
-            "brscan5",
-            &[
-                Path::new("/opt/brother/scanner/brscan5"),
-                Path::new("/usr/lib64/sane/libsane-brother5.so"),
-                Path::new("/usr/lib/x86_64-linux-gnu/sane/libsane-brother5.so"),
-            ],
-        )?,
-        brscan_skey: package_installed(
-            dpkg_query_path,
-            BRSCAN_SKEY_PACKAGE,
-            &[
-                Path::new("/usr/bin/brscan-skey"),
-                Path::new("/opt/brother/scanner/brscan-skey"),
-            ],
-        )?,
-    })
-}
-
-fn package_installed(
-    dpkg_query_path: &Path,
-    package: &'static str,
-    fallback_paths: &[&Path],
-) -> Result<bool, BackendError> {
-    if dpkg_query_path.exists() {
-        let output = Command::new(dpkg_query_path)
-            .args(["-W", "-f=${db:Status-Status}\\n", package])
-            .output()
-            .map_err(|error| {
-                BackendError::Other(format!("failed to run dpkg-query for {package}: {error}"))
-            })?;
-        if output.status.success() {
-            return Ok(String::from_utf8_lossy(&output.stdout).trim() == "installed");
-        }
-        return Ok(false);
-    }
-
-    Ok(fallback_paths.iter().any(|path| path.exists()))
-}
-
 fn command_output(stdout: &[u8], stderr: &[u8]) -> String {
     let stdout = String::from_utf8_lossy(stdout).trim().to_owned();
     let stderr = String::from_utf8_lossy(stderr).trim().to_owned();
@@ -753,6 +973,15 @@ fn command_output(stdout: &[u8], stderr: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::os::unix::process::ExitStatusExt as _;
+    use std::process::ExitStatus;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    use scanbus_core::PairingState;
+    use tempfile::TempDir;
+
     use super::*;
 
     #[test]
@@ -783,9 +1012,9 @@ device 'airscan:escl:Brother MFC-L2710DW http://BRW001122334455.local:80/eSCL/' 
                     .unwrap(),
             ],
             InstalledState {
-                brscan4: true,
-                brscan5: false,
-                brscan_skey: true,
+                brscan4: Presence::Present,
+                brscan5: Presence::Absent,
+                brscan_skey: Presence::Present,
             },
         )
         .unwrap();
@@ -843,6 +1072,388 @@ device 'airscan:escl:Brother MFC-L2710DW http://BRW001122334455.local:80/eSCL/' 
         assert_eq!(
             physical_address_from_uri("brother5:usb:001:002"),
             Some("usb:001:002".to_owned())
+        );
+    }
+
+    // ---------------------------------------------------------------- install checks
+
+    /// A `dpkg-query` that answers from a table instead of from this machine's status
+    /// database, and records every argv it was handed.
+    ///
+    /// The recording is the point: it is what lets a test state "these are the only
+    /// programs the backend can run, and both are read-only" as an assertion rather
+    /// than as a comment.
+    #[derive(Debug, Default)]
+    struct RecordingRunner {
+        invocations: Mutex<Vec<Vec<String>>>,
+        /// Packages `dpkg-query -W` reports as `installed`.
+        registered: BTreeSet<&'static str>,
+        /// What `dpkg-query -L` lists for a package.
+        files: BTreeMap<&'static str, Vec<String>>,
+        /// Slept before answering, so a test can drop the call while it is in flight.
+        delay: Duration,
+    }
+
+    impl RecordingRunner {
+        fn programs(&self) -> Vec<String> {
+            self.invocations
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|argv| argv[0].clone())
+                .collect()
+        }
+
+        fn argv(&self) -> Vec<Vec<String>> {
+            self.invocations.lock().unwrap().clone()
+        }
+    }
+
+    impl CommandRunner for RecordingRunner {
+        fn run(&self, program: &Path, args: &[&str]) -> io::Result<Output> {
+            let mut argv = vec![program.display().to_string()];
+            argv.extend(args.iter().map(|arg| (*arg).to_owned()));
+            self.invocations.lock().unwrap().push(argv);
+
+            if !self.delay.is_zero() {
+                std::thread::sleep(self.delay);
+            }
+
+            let package = args.last().copied().unwrap_or_default();
+            let (code, stdout) = match args.first().copied() {
+                Some("-W") if self.registered.contains(package) => (0, "installed\n".to_owned()),
+                Some("-L") => match self.files.get(package) {
+                    Some(files) => (0, format!("{}\n", files.join("\n"))),
+                    None => (1, String::new()),
+                },
+                _ => (1, String::new()),
+            };
+
+            Ok(Output {
+                status: ExitStatus::from_raw(code << 8),
+                stdout: stdout.into_bytes(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    /// A sysroot with `dpkg-query` present but nothing else, plus the files asked for.
+    fn sysroot(files: &[&str]) -> TempDir {
+        let root = tempfile::tempdir().unwrap();
+        for file in files {
+            let path = root.path().join(file.trim_start_matches('/'));
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, b"stub").unwrap();
+        }
+        root
+    }
+
+    fn backend(root: &TempDir, runner: Arc<RecordingRunner>) -> BrotherBackend {
+        // `dpkg_query_path` has to exist as a file for the packaging query to be tried
+        // at all; the runner is what decides what it answers.
+        let dpkg_query = root.path().join("dpkg-query");
+        fs::write(&dpkg_query, b"stub").unwrap();
+
+        BrotherBackend {
+            dpkg_query_path: dpkg_query,
+            sysroot: root.path().to_path_buf(),
+            runner,
+            ..BrotherBackend::default()
+        }
+    }
+
+    /// The MFC-L2710DW of this machine, as discovery hands it to `ensure_installed`.
+    fn brother_mfc() -> ScannerInfo {
+        scanners_from_sightings(
+            vec![
+                parse_scanimage_line("device 'brother4:net1;dev0' is 'Brother MFC-L2710DW'")
+                    .unwrap(),
+            ],
+            InstalledState::default(),
+        )
+        .unwrap()
+        .remove(0)
+    }
+
+    async fn ensure_installed_progress(
+        backend: &BrotherBackend,
+        scanner: &ScannerInfo,
+    ) -> (Result<(), BackendError>, Vec<PairingProgress>) {
+        let (sender, mut receiver) = mpsc::channel(8);
+        let outcome = backend.ensure_installed(scanner, sender).await;
+
+        let mut progress = Vec::new();
+        while let Ok(step) = receiver.try_recv() {
+            progress.push(step);
+        }
+        (outcome, progress)
+    }
+
+    /// The boring case this machine is in: both packages present, so pairing walks
+    /// straight through — but still through `installing_backend`, because that is the
+    /// state a client's progress UI is written against.
+    #[tokio::test]
+    async fn present_dependencies_still_pass_through_installing_backend() {
+        let root = sysroot(&["/opt/brother/scanner/brscan4", "/usr/bin/brscan-skey"]);
+        let runner = Arc::new(RecordingRunner::default());
+        let backend = backend(&root, Arc::clone(&runner));
+
+        let (outcome, progress) = ensure_installed_progress(&backend, &brother_mfc()).await;
+
+        outcome.unwrap();
+        assert_eq!(
+            progress,
+            vec![
+                PairingProgress::Checking {
+                    message: "checking Brother dependencies for MFC-L2710DW".to_owned(),
+                },
+                PairingProgress::Installing {
+                    package: "brscan4".to_owned(),
+                    percent: None,
+                },
+                PairingProgress::Installing {
+                    package: "brscan-skey".to_owned(),
+                    percent: None,
+                },
+                PairingProgress::Ready,
+            ]
+        );
+        assert!(
+            progress
+                .iter()
+                .any(|step| step.pairing_state() == Some(PairingState::InstallingBackend))
+        );
+        // Files on disk answer the question on their own: no subprocess at all.
+        assert!(runner.programs().is_empty());
+    }
+
+    /// `brscan4` masked from detection: named, sourced, and refused — nothing installed.
+    #[tokio::test]
+    async fn a_missing_driver_is_refused_by_name_and_by_where_it_comes_from() {
+        let root = sysroot(&["/usr/bin/brscan-skey"]);
+        let runner = Arc::new(RecordingRunner::default());
+        let backend = backend(&root, Arc::clone(&runner));
+
+        let (outcome, progress) = ensure_installed_progress(&backend, &brother_mfc()).await;
+
+        let error = outcome.unwrap_err();
+        let BackendError::InstallFailed { package, detail } = &error else {
+            panic!("expected an install failure, got {error:?}");
+        };
+        assert_eq!(package, "brscan4");
+        assert!(detail.contains("brscan4"), "{detail}");
+        assert!(detail.contains(BROTHER_SUPPORT_SITE), "{detail}");
+        assert!(detail.contains("scanbus does not install it"), "{detail}");
+
+        // The client sees the same story on the property as the caller does on the Err.
+        assert_eq!(
+            progress.last(),
+            Some(&PairingProgress::Failed {
+                message: error.to_string(),
+            })
+        );
+        assert_eq!(
+            progress.last().unwrap().pairing_state(),
+            Some(PairingState::Failed(error.to_string()))
+        );
+        // It gave up at the driver: `brscan-skey` was never announced as a step.
+        assert_eq!(
+            progress
+                .iter()
+                .filter(|step| matches!(step, PairingProgress::Installing { .. }))
+                .count(),
+            1
+        );
+    }
+
+    /// A package can be installed and its files removed, and the status database keeps
+    /// saying `installed`. Believing it defers the failure to `start_listening`, where
+    /// it looks like a SANE problem.
+    #[tokio::test]
+    async fn a_registered_package_with_no_files_is_not_installed() {
+        let root = sysroot(&["/usr/bin/brscan-skey"]);
+        let runner = Arc::new(RecordingRunner {
+            registered: BTreeSet::from(["brscan4"]),
+            files: BTreeMap::from([(
+                "brscan4",
+                vec!["/opt/brother/scanner/brscan4/Brsane4.ini".to_owned()],
+            )]),
+            ..RecordingRunner::default()
+        });
+        let backend = backend(&root, Arc::clone(&runner));
+
+        let (outcome, _) = ensure_installed_progress(&backend, &brother_mfc()).await;
+
+        let BackendError::InstallFailed { package, detail } = outcome.unwrap_err() else {
+            panic!("expected an install failure");
+        };
+        assert_eq!(package, "brscan4");
+        assert!(detail.contains("none of its files are on disk"), "{detail}");
+        assert!(detail.contains("reinstall"), "{detail}");
+    }
+
+    /// The SANE library path is architecture-dependent, so the hard-coded list is a
+    /// fast path, not the answer. The package's own file list is what settles it.
+    #[tokio::test]
+    async fn a_driver_installed_outside_the_known_paths_is_found_through_the_package() {
+        let root = sysroot(&[
+            "/usr/lib/aarch64-linux-gnu/sane/libsane-brother4.so",
+            "/usr/bin/brscan-skey",
+        ]);
+        let runner = Arc::new(RecordingRunner {
+            registered: BTreeSet::from(["brscan4"]),
+            files: BTreeMap::from([(
+                "brscan4",
+                vec![
+                    "/usr/share/doc/brscan4".to_owned(),
+                    "/usr/lib/aarch64-linux-gnu/sane/libsane-brother4.so".to_owned(),
+                ],
+            )]),
+            ..RecordingRunner::default()
+        });
+        let backend = backend(&root, Arc::clone(&runner));
+
+        let (outcome, _) = ensure_installed_progress(&backend, &brother_mfc()).await;
+
+        outcome.unwrap();
+        assert_eq!(
+            runner.argv().first().map(|argv| argv[1].clone()),
+            Some("-W".to_owned())
+        );
+    }
+
+    /// `CancelPairing()` drops the future, possibly while a probe is running. The check
+    /// only reads, so there is nothing to unwind — and the proof is that a fresh call
+    /// reports exactly the sequence a first one would.
+    #[tokio::test]
+    async fn cancelling_the_check_leaves_nothing_behind() {
+        let root = sysroot(&["/usr/lib/aarch64-linux-gnu/sane/libsane-brother4.so"]);
+        let runner = Arc::new(RecordingRunner {
+            registered: BTreeSet::from(["brscan4", "brscan-skey"]),
+            files: BTreeMap::from([
+                (
+                    "brscan4",
+                    vec!["/usr/lib/aarch64-linux-gnu/sane/libsane-brother4.so".to_owned()],
+                ),
+                ("brscan-skey", vec!["/usr/bin/brscan-skey".to_owned()]),
+            ]),
+            delay: Duration::from_millis(200),
+            ..RecordingRunner::default()
+        });
+        let backend = backend(&root, Arc::clone(&runner));
+        let scanner = brother_mfc();
+
+        let (sender, _receiver) = mpsc::channel(8);
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(20),
+            backend.ensure_installed(&scanner, sender),
+        )
+        .await;
+        assert!(
+            cancelled.is_err(),
+            "the check should still have been running"
+        );
+
+        // `brscan-skey`'s files were never there; the cancelled run cannot have created
+        // them, and the second run has to reach the same verdict from the same evidence.
+        assert!(!root.path().join("usr/bin/brscan-skey").exists());
+        fs::create_dir_all(root.path().join("usr/bin")).unwrap();
+        fs::write(root.path().join("usr/bin/brscan-skey"), b"stub").unwrap();
+
+        let (outcome, progress) = ensure_installed_progress(&backend, &scanner).await;
+
+        outcome.unwrap();
+        assert_eq!(
+            progress,
+            vec![
+                PairingProgress::Checking {
+                    message: "checking Brother dependencies for MFC-L2710DW".to_owned(),
+                },
+                PairingProgress::Installing {
+                    package: "brscan4".to_owned(),
+                    percent: None,
+                },
+                PairingProgress::Installing {
+                    package: "brscan-skey".to_owned(),
+                    percent: None,
+                },
+                PairingProgress::Ready,
+            ]
+        );
+    }
+
+    /// The allowlist, as an assertion: two programs, both read-only queries.
+    ///
+    /// This is what [`ensure_installed`](ScannerBackend::ensure_installed) not being
+    /// able to install anything means concretely. `dpkg-query` is not `dpkg`: `-W` and
+    /// `-L` read the status database, and neither has a mode that unpacks a `.deb`.
+    #[tokio::test]
+    async fn the_install_path_only_ever_runs_read_only_queries() {
+        let root = sysroot(&[]);
+        let runner = Arc::new(RecordingRunner {
+            registered: BTreeSet::from(["brscan4"]),
+            ..RecordingRunner::default()
+        });
+        let backend = backend(&root, Arc::clone(&runner));
+
+        let (outcome, _) = ensure_installed_progress(&backend, &brother_mfc()).await;
+        assert!(outcome.is_err());
+
+        let dpkg_query = backend.dpkg_query_path.display().to_string();
+        for argv in runner.argv() {
+            assert_eq!(argv[0], dpkg_query, "unexpected program: {argv:?}");
+            assert!(
+                matches!(argv[1].as_str(), "-W" | "-L"),
+                "unexpected dpkg-query mode: {argv:?}"
+            );
+        }
+        assert!(!runner.argv().is_empty(), "the probe never ran");
+    }
+
+    /// The same claim, checked against the source rather than against one run: the
+    /// mechanisms an install would need are absent from the crate.
+    ///
+    /// Comment lines are excluded on purpose — the crate documentation has to be able
+    /// to name what it refuses to do — and so is this test module, which names them in
+    /// order to forbid them.
+    #[test]
+    fn the_backend_has_no_way_to_install_anything() {
+        let source = include_str!("lib.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the test module marker splits the file")
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        for forbidden in [
+            "pkexec",
+            "sudo",
+            "apt-get",
+            "apt install",
+            "dpkg -i",
+            "--install",
+            "--unpack",
+            "reqwest",
+            "ureq",
+            "hyper",
+            "TcpStream",
+            "curl",
+            "wget",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "the brother backend must not reach for {forbidden}"
+            );
+        }
+
+        // One process spawn in the crate, inside the runner every probe goes through.
+        assert_eq!(
+            production.matches("Command::new").count(),
+            1,
+            "every subprocess must go through CommandRunner"
         );
     }
 }

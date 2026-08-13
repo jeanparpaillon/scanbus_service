@@ -88,7 +88,14 @@ pub enum PairingProgress {
         message: String,
     },
 
-    /// A package is being downloaded or installed — the system is being modified.
+    /// The backend is working on one named dependency. Maps to
+    /// [`PairingState::InstallingBackend`].
+    ///
+    /// "Installing" names the *phase*, not necessarily an action: a backend that only
+    /// verifies its dependencies and refuses when they are missing — which is what the
+    /// Brother one does, deliberately — still emits this per package it depends on. The
+    /// sequence a client sees is the contract, and it must not change the day a backend
+    /// gains the ability to install what it currently only checks.
     Installing {
         /// Package, `.deb` or step, e.g. `"brscan5"`.
         package: String,
