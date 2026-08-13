@@ -1,11 +1,16 @@
 //! HP backend: discovery, install checks, and walk-up button listening through HPLIP.
 //!
-//! Discovery and package checks still come from the HPLIP command-line tools. Walk-up
-//! button delivery comes from HPLIP's status service: `hp-systray --force-startup`
-//! activates the canonical `com.hplip.StatusService` owner on the session bus, and the
-//! resulting `hpssd` process emits `com.hplip.Toolbox.Event` updates there while keeping
-//! the per-device history behind `GetHistory`. Scanbus may request that canonical D-Bus
-//! activation, but it must not become a second process manager for `hpssd.py`.
+//! Network scanners are found by browsing the scanning service types ourselves (`mdns`),
+//! because `hp-probe --bus=net` only ever looks for a printer; `hp-probe` covers the USB
+//! bus, and the network bus only as a fallback. Package checks still come from the HPLIP
+//! command-line tools.
+//!
+//! Walk-up button delivery comes from HPLIP's status service: `hp-systray
+//! --force-startup` activates the canonical `com.hplip.StatusService` owner on the
+//! session bus, and the resulting `hpssd` process emits `com.hplip.Toolbox.Event` updates
+//! there while keeping the per-device history behind `GetHistory`. Scanbus may request
+//! that canonical D-Bus activation, but it must not become a second process manager for
+//! `hpssd.py`.
 //!
 //! # Requesting the activation is not enough on its own
 //!
@@ -34,6 +39,8 @@ use std::time::{Duration, UNIX_EPOCH};
 use async_trait::async_trait;
 use futures_core::stream::BoxStream;
 use futures_util::StreamExt as _;
+// `mdns` unqualified is this crate's own HP-record filter, so the shared browse helper
+// keeps its crate path at the one place it is called.
 use scanbus_backend_common::{
     DEFAULT_SCANIMAGE_HELPER, ScanimageConfig, fetch_pages_via_scanimage,
 };
@@ -67,11 +74,25 @@ const HPLIP_STATUS_SERVICE: &str = "com.hplip.StatusService";
 const HPLIP_STATUS_PATH: &str = "/com/hplip/StatusService";
 const HPLIP_STATUS_INTERFACE: &str = "com.hplip.StatusService";
 const HPLIP_TOOLBOX_INTERFACE: &str = "com.hplip.Toolbox";
+/// eSCL, the service type a network MFP advertises its scanner on, and the one
+/// `libhpdiscovery` browses first.
+const USCAN_SERVICE_TYPE: &str = "_uscan._tcp.local.";
+/// The older scanning service type, still all some HP devices publish.
+const SCANNER_SERVICE_TYPE: &str = "_scanner._tcp.local.";
+/// How long a discovery browse waits. Matched to `hp-probe`'s own `--timeout=5`, so
+/// substituting the browse for the network probe does not lengthen a discovery.
+const MDNS_BROWSE_WINDOW: Duration = Duration::from_secs(5);
+/// `hp-probe` buses when the browse found the network side. USB probing is hpmud's own
+/// job and has no mDNS equivalent.
+const PROBE_BUSES_USB_ONLY: &str = "--bus=usb";
+/// `hp-probe` buses when the browse found nothing: its SLP and JetDirect queries are the
+/// fallback for devices that advertise no scanning service type.
+const PROBE_BUSES_WITH_NET: &str = "--bus=net,usb";
 const DBUS_SERVICE: &str = "org.freedesktop.DBus";
 const DBUS_PATH: &str = "/org/freedesktop/DBus";
 const DBUS_INTERFACE: &str = "org.freedesktop.DBus";
 
-/// Walk-up HP backend backed by `hp-probe` and HPLIP's model database.
+/// Walk-up HP backend, backed by an mDNS browse, `hp-probe` and HPLIP's model database.
 #[derive(Debug, Clone)]
 pub struct HplipBackend {
     hp_probe_path: PathBuf,
@@ -173,17 +194,82 @@ impl HplipBackend {
     }
 
     fn discover_once(&self) -> Result<Vec<ScannerInfo>, BackendError> {
+        let models = load_models(&self.models_dat_path).unwrap_or_else(|error| {
+            warn!(
+                path = %self.models_dat_path.display(),
+                %error,
+                "could not read HPLIP model metadata; discovery will continue without it"
+            );
+            BTreeMap::new()
+        });
+
+        let mut records = self.browse_network(&models);
+        // `hp-probe` is kept for the USB bus, where hpmud probing is what finds a device
+        // and has no mDNS equivalent, and for the network bus only when the browse came
+        // back empty — the SLP and JetDirect queries behind `--bus=net` are how devices
+        // that answer neither `_uscan._tcp` nor `_scanner._tcp` are still found.
+        let buses = if records.is_empty() {
+            PROBE_BUSES_WITH_NET
+        } else {
+            PROBE_BUSES_USB_ONLY
+        };
+
+        match self.probe(buses) {
+            Ok(probed) => records.extend(probed),
+            // A broken `hp-probe` must not bury what the browse already found: that
+            // would put the USB bus back on the critical path for a network scanner,
+            // which is the failure this whole path exists to undo.
+            Err(error) if !records.is_empty() => {
+                warn!(%error, "hp-probe failed; reporting the HP scanners found over mDNS");
+            }
+            Err(error) => return Err(error),
+        }
+
+        records
+            .into_iter()
+            .map(|record| scanner_from_probe(record, &models))
+            .collect()
+    }
+
+    /// The HP scanners on the LAN, browsed from the scanning service types.
+    ///
+    /// Never an error, and empty on every failure: mDNS being unavailable says nothing
+    /// about the USB bus, and the caller answers an empty browse with the `hp-probe`
+    /// network fallback rather than with a failed discovery.
+    fn browse_network(&self, models: &BTreeMap<String, ModelInfo>) -> Vec<ProbeRecord> {
+        let services = match scanbus_backend_common::mdns::browse(
+            &[USCAN_SERVICE_TYPE, SCANNER_SERVICE_TYPE],
+            MDNS_BROWSE_WINDOW,
+        ) {
+            Ok(services) => services,
+            Err(error) => {
+                warn!(%error, "mDNS browse unavailable; falling back to hp-probe for the network bus");
+                return Vec::new();
+            }
+        };
+
+        let records = mdns::hp_scan_records(&services, models);
+        debug!(
+            answered = services.len(),
+            hp_scanners = records.len(),
+            "mDNS browse for HP network scanners finished"
+        );
+        records
+    }
+
+    /// What `hp-probe` reports on `buses`, or an empty list when HPLIP's tools are absent.
+    fn probe(&self, buses: &str) -> Result<Vec<ProbeRecord>, BackendError> {
         if !self.hp_probe_path.exists() {
             warn!(
                 path = %self.hp_probe_path.display(),
-                "hp-probe is absent; treating HPLIP discovery as empty"
+                "hp-probe is absent; treating HPLIP probing as empty"
             );
             return Ok(Vec::new());
         }
 
         let output = Command::new(&self.hp_probe_path)
             .args([
-                "--bus=net,usb",
+                buses,
                 "--filter=scan",
                 "--timeout=5",
                 "--ttl=4",
@@ -199,7 +285,7 @@ impl HplipBackend {
             return Err(BackendError::NotReachable {
                 scanner: Self::discovery_scanner(),
                 detail: format!(
-                    "hp-probe failed with {}: {}",
+                    "hp-probe {buses} failed with {}: {}",
                     output
                         .status
                         .code()
@@ -209,19 +295,7 @@ impl HplipBackend {
             });
         }
 
-        let models = load_models(&self.models_dat_path).unwrap_or_else(|error| {
-            warn!(
-                path = %self.models_dat_path.display(),
-                %error,
-                "could not read HPLIP model metadata; discovery will continue without it"
-            );
-            BTreeMap::new()
-        });
-
-        parse_probe_output(&String::from_utf8_lossy(&output.stdout))
-            .into_iter()
-            .map(|record| scanner_from_probe(record, &models))
-            .collect()
+        Ok(parse_probe_output(&String::from_utf8_lossy(&output.stdout)))
     }
 
     fn ensure_installed_once(&self, scanner: &ScannerInfo) -> Result<(), BackendError> {
@@ -289,7 +363,9 @@ impl HplipBackend {
                 Ok(name) => {
                     state.sane_names.insert(scanner.id.clone(), name.to_owned());
                 }
-                Err(error) => warn!(scanner = %scanner.id, %error, "no SANE name for this HP; it will not be fetchable"),
+                Err(error) => {
+                    warn!(scanner = %scanner.id, %error, "no SANE name for this HP; it will not be fetchable")
+                }
             }
         }
     }

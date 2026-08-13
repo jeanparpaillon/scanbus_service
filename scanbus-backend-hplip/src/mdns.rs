@@ -19,17 +19,13 @@
 //! `hp:/net/…` URI and the SANE `hpaio:/net/…` name — so that a record found here is
 //! indistinguishable downstream from one `hp-probe` found on the USB bus.
 
-// The filter lands before the discovery path that calls it, so that it can be reviewed
-// against captured records on its own. Remove this with the browse wiring.
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
 
 use mdns_sd::ServiceInfo;
 use tracing::debug;
 
-use super::{ModelInfo, ProbeRecord, sane_name_from_device_uri};
+use super::{ModelInfo, ProbeRecord, physical_address_from_uri, sane_name_from_device_uri};
 
 /// TXT keys that state the manufacturer, most specific first. `mdns-sd` looks TXT keys
 /// up case insensitively, so `usb_MFG` also matches a device that spells it `usb_mfg`.
@@ -40,12 +36,45 @@ const MODEL_KEYS: [&str; 2] = ["usb_MDL", "mdl"];
 /// The human-readable device name, present on both service types.
 const TYPE_KEY: &str = "ty";
 
+/// The HP scanners among `services`, one record per physical device.
+///
+/// A device that advertises both browsed service types resolves twice, and the two
+/// records need not agree on the model spelling (`_scanner._tcp` splits `mfg`/`mdl`,
+/// `_uscan._tcp` has only `ty`), so the address is what identifies a device here — the
+/// same key [`super::scanner_from_probe`] derives its `ScannerId` from. `services` is in
+/// the browse helper's priority order, so the record kept for a device seen twice is its
+/// `_uscan._tcp` one.
+pub(crate) fn hp_scan_records(
+    services: &[ServiceInfo],
+    models: &BTreeMap<String, ModelInfo>,
+) -> Vec<ProbeRecord> {
+    let mut records: Vec<ProbeRecord> = Vec::new();
+    for service in services {
+        let Some(record) = hp_scan_record(service, models) else {
+            continue;
+        };
+        let address = physical_address_from_uri(&record.device_uri);
+        if records
+            .iter()
+            .any(|kept| physical_address_from_uri(&kept.device_uri) == address)
+        {
+            debug!(
+                instance = %service.get_fullname(),
+                "this HP already answered on another service type; keeping the first record"
+            );
+            continue;
+        }
+        records.push(record);
+    }
+    records
+}
+
 /// The device this record describes, or `None` if it is not an HP scanner reachable over
 /// IPv4.
 ///
 /// Both URIs are built here rather than derived later, because only this side knows the
 /// address the browse resolved: the record is what the rest of the backend consumes.
-pub(crate) fn hp_scan_record(
+fn hp_scan_record(
     service: &ServiceInfo,
     models: &BTreeMap<String, ModelInfo>,
 ) -> Option<ProbeRecord> {
@@ -111,10 +140,7 @@ fn scan_address(service: &ServiceInfo) -> Option<Ipv4Addr> {
 /// The spelling that comes back is the advertised one (`HP OfficeJet Pro 8610`), matching
 /// what `hp-probe` puts in its `Model` column; [`normalize_model_name`] turns it into the
 /// URI spelling.
-fn hp_scan_model(
-    service: &ServiceInfo,
-    models: &BTreeMap<String, ModelInfo>,
-) -> Option<String> {
+fn hp_scan_model(service: &ServiceInfo, models: &BTreeMap<String, ModelInfo>) -> Option<String> {
     let instance = instance_name(service);
 
     if !names_hp(service, instance) {
@@ -356,6 +382,56 @@ mod tests {
                 ("txtvers", "1"),
             ],
         )
+    }
+
+    /// A browse hands over every answer on both service types; what comes back out is
+    /// one record per HP device, non-HP answers dropped.
+    #[test]
+    fn a_browse_yields_one_record_per_hp_device() {
+        let uscan = record(
+            "_uscan._tcp.local.",
+            "HP OfficeJet Pro 8610 [1A2B3C]",
+            &[("rs", "eSCL"), ("ty", "HP OfficeJet Pro 8610 [1A2B3C]")],
+        );
+        // The same device on the older service type, spelling its model differently.
+        let scanner = record(
+            "_scanner._tcp.local.",
+            "Officejet Pro 8610 [1A2B3C]",
+            &[
+                ("mfg", "Hewlett-Packard"),
+                ("mdl", "Officejet Pro 8610"),
+                ("ty", "Officejet Pro 8610"),
+            ],
+        );
+        let second_hp = record_at(
+            "_uscan._tcp.local.",
+            "HP LaserJet 3055",
+            &[("ty", "HP LaserJet 3055")],
+            &[IpAddr::from(Ipv4Addr::new(192, 168, 1, 9))],
+        );
+
+        let records = hp_scan_records(
+            &[
+                uscan,
+                brother_uscan(),
+                scanner,
+                brother_scanner(),
+                second_hp,
+            ],
+            &models(&[("hp_officejet_pro_8610", 7), ("hp_laserjet_3055", 4)]),
+        );
+
+        // The `_uscan._tcp` record is the one kept, because the browse offered it first.
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.device_uri.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "hp:/net/HP_OfficeJet_Pro_8610?ip=192.168.1.3&queue=false",
+                "hp:/net/HP_LaserJet_3055?ip=192.168.1.9&queue=false",
+            ],
+        );
     }
 
     #[test]
