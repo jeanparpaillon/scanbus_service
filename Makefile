@@ -120,6 +120,9 @@ reload:
 test:
 	cargo test --workspace --features $(BACKENDS)
 
+fmt:
+	cargo fmt --all
+
 lint:
 	cargo clippy --workspace --all-targets --all-features -- -D warnings
 
