@@ -14,11 +14,10 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use flume::RecvTimeoutError;
 use futures_core::{Stream, stream::BoxStream};
 use if_addrs::{IfAddr, get_if_addrs};
-use mdns_sd::{ServiceDaemon, ServiceEvent};
 use rand::Rng;
+use scanbus_backend_common::mdns;
 use scanbus_core::{
     BackendError, ButtonsCapability, Capabilities as ScannerCapabilities, ProfileKind, RawPage,
     RestoreDisposition, ScannerBackend, ScannerId, ScannerInfo, Status, Value,
@@ -1442,55 +1441,31 @@ fn generate_nonce() -> String {
 }
 
 fn discover_once(timeout: Duration) -> Result<Vec<(ScannerInfo, DiscoveryRecord)>, BackendError> {
-    let daemon = ServiceDaemon::new().map_err(|error| BackendError::NotReachable {
-        scanner: ScannerId::from_backend(ID, "discovery").expect("static discovery id is valid"),
-        detail: format!("failed to start mDNS browser: {error}"),
-    })?;
-    let receiver = daemon.browse(SERVICE_TYPE).map_err(|error| {
-        BackendError::Other(format!("failed to browse {SERVICE_TYPE}: {error}"))
+    let services = mdns::browse(&[SERVICE_TYPE], timeout).map_err(|error| match error {
+        // A browser that cannot start is a host-side problem, not "no phone answered",
+        // so it keeps the shape the daemon can act on.
+        mdns::BrowseError::DaemonUnavailable(_) => BackendError::NotReachable {
+            scanner: ScannerId::from_backend(ID, "discovery")
+                .expect("static discovery id is valid"),
+            detail: error.to_string(),
+        },
+        mdns::BrowseError::BrowseRefused(_) => BackendError::Other(error.to_string()),
     })?;
 
     let mut seen = BTreeMap::<ScannerId, (ScannerInfo, DiscoveryRecord)>::new();
-    let started = Instant::now();
-    loop {
-        let elapsed = started.elapsed();
-        if elapsed >= timeout {
-            break;
+    for service in &services {
+        let Some((scanner, record)) = scanner_from_service(service) else {
+            continue;
+        };
+        if seen.contains_key(&scanner.id) {
+            warn!(
+                scanner_id = %scanner.id,
+                instance = %service.get_fullname(),
+                "duplicate mobile scanner id discovered; keeping first one"
+            );
+            continue;
         }
-        let remaining = timeout - elapsed;
-        match receiver.recv_timeout(remaining) {
-            Ok(ServiceEvent::ServiceResolved(service)) => {
-                if let Some((scanner, record)) = scanner_from_service(&service) {
-                    if seen.contains_key(&scanner.id) {
-                        warn!(
-                            scanner_id = %scanner.id,
-                            instance = %service.get_fullname(),
-                            "duplicate mobile scanner id discovered; keeping first one"
-                        );
-                        continue;
-                    }
-                    seen.insert(scanner.id.clone(), (scanner, record));
-                }
-            }
-            Ok(
-                ServiceEvent::SearchStarted(_)
-                | ServiceEvent::ServiceFound(_, _)
-                | ServiceEvent::ServiceRemoved(_, _)
-                | ServiceEvent::SearchStopped(_),
-            ) => {}
-            Err(RecvTimeoutError::Timeout) => break,
-            Err(RecvTimeoutError::Disconnected) => {
-                warn!("mDNS browser disconnected before timeout");
-                break;
-            }
-        }
-    }
-
-    if let Err(error) = daemon.stop_browse(SERVICE_TYPE) {
-        debug!(%error, "mobile discover stop_browse failed; continuing");
-    }
-    if let Err(error) = daemon.shutdown() {
-        debug!(%error, "mobile discover daemon shutdown failed; continuing");
+        seen.insert(scanner.id.clone(), (scanner, record));
     }
 
     Ok(seen.into_values().collect())
