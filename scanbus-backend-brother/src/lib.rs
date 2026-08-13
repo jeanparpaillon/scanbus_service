@@ -39,9 +39,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io;
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use futures_core::stream::BoxStream;
@@ -51,9 +52,13 @@ use scanbus_core::{
     Status, Value,
 };
 use tokio::sync::mpsc;
-use tracing::warn;
+use tracing::{debug, info, warn};
 
+pub mod registrar;
 pub mod skey;
+
+use registrar::{SnmpTransport, UdpSnmp, probe_scan_to_pc};
+use skey::snmp::DEFAULT_COMMUNITY;
 
 /// Backend identifier, as it will be reported by [`ScannerBackend::id`].
 pub const ID: &str = "brother-skey";
@@ -130,6 +135,16 @@ pub struct BrotherBackend {
     /// them, which is what lets a test mask `brscan4` without touching the machine.
     sysroot: PathBuf,
     runner: Arc<dyn CommandRunner>,
+    /// How the scan-key OID is asked about. A seam for the same reason
+    /// [`CommandRunner`] is one: it is what lets a test stand in a device that refuses.
+    transport: Arc<dyn SnmpTransport>,
+    /// What each device answered when it was asked whether it does scan-to-PC at all.
+    ///
+    /// Shared with every clone of the backend, because [`discover`](ScannerBackend::discover)
+    /// runs on a clone and is where the answer has to surface. Written at pairing time
+    /// and read at discovery time — see [`BrotherBackend::note_scan_to_pc`] for why the
+    /// question is not asked on every discovery instead.
+    scan_to_pc: Arc<Mutex<BTreeMap<ScannerId, ScanToPc>>>,
 }
 
 impl Default for BrotherBackend {
@@ -139,8 +154,24 @@ impl Default for BrotherBackend {
             dpkg_query_path: PathBuf::from("/usr/bin/dpkg-query"),
             sysroot: PathBuf::from("/"),
             runner: Arc::new(SystemCommandRunner),
+            transport: Arc::new(UdpSnmp::default()),
+            scan_to_pc: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
+}
+
+/// What a device has said about scan-to-PC, when it was asked.
+///
+/// Only ever holds an answer the *device* gave. A printer that was switched off when
+/// pairing ran is absent from the map rather than present as unavailable: silence is a
+/// statement about that minute, and turning it into a permanent "this model has no
+/// buttons" would need a power cycle and a re-pair to undo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ScanToPc {
+    /// The device knows the scan-key OID. Its panel keys are worth offering.
+    Available,
+    /// It cannot be registered, and the reason is worth carrying to the user.
+    Unavailable { reason: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -284,10 +315,83 @@ impl BrotherBackend {
         }
 
         let installed = self.installed_state()?;
+        let scan_to_pc = self.scan_to_pc.lock().expect("scan-to-PC notes").clone();
         scanners_from_sightings(
             parse_scanimage_output(&String::from_utf8_lossy(&output.stdout)),
             installed,
+            &scan_to_pc,
         )
+    }
+
+    /// Ask the device whether it does scan-to-PC at all, and remember what it said.
+    ///
+    /// **This never fails pairing.** A device that refuses the registration OID is an
+    /// older or newer generation ([`brother-skeyless-backend.md`] §4 — the arch notes
+    /// record models documenting TCP 5566 and 54921 instead), and it stays a perfectly
+    /// good pull scanner. The consequence of a refusal is `buttons.count = 0` and a
+    /// reason in the capability dict, not an error out of `Pair()`.
+    ///
+    /// A **read**, not a registration: pairing must not put an entry on the panel that
+    /// nothing is listening behind — the listener is 5.9 and the mapping of keys to
+    /// profiles is 5.11. `GetRequest` on the same OID answers the same question and
+    /// changes nothing on the device.
+    ///
+    /// Asked here rather than during discovery because discovery must stay cheap and
+    /// must not block: one unreachable printer would otherwise add
+    /// [`registrar::RESPONSE_TIMEOUT`] to every `discover()` on the machine. Pairing
+    /// already talks about one device, at a moment the user is waiting for it.
+    ///
+    /// [`brother-skeyless-backend.md`]: https://github.com/jeanparpaillon/scanbus_service/blob/master/docs/brother-skeyless-backend.md
+    async fn note_scan_to_pc(&self, scanner: &ScannerInfo) {
+        let note = match device_ipv4(scanner) {
+            Some(device) => {
+                match probe_scan_to_pc(&*self.transport, device, DEFAULT_COMMUNITY).await {
+                    Ok(()) => ScanToPc::Available,
+                    Err(error) if error.is_refusal() => ScanToPc::Unavailable {
+                        reason: error.to_string(),
+                    },
+                    // Silence says nothing about the model. Leave the scanner as
+                    // discovery described it and ask again at the next pairing.
+                    Err(error) => {
+                        debug!(
+                            scanner = %scanner.id,
+                            %error,
+                            "could not ask this device about scan-to-PC; leaving its buttons as \
+                             discovery reported them",
+                        );
+                        return;
+                    }
+                }
+            }
+            // Nothing to send SNMP to. A USB scanner is the honest case — the vendor
+            // daemon has a separate USB path for panel keys and scanbus does not
+            // implement it — and it is recorded as such rather than left implying that
+            // the four keys work.
+            None => match usb_endpoint(&scanner.address) {
+                Some(endpoint) => ScanToPc::Unavailable {
+                    reason: format!(
+                        "scanbus registers scan-to-PC over the network, and {endpoint} is a USB \
+                         connection; connect this scanner to the network to use its panel keys"
+                    ),
+                },
+                None => {
+                    debug!(
+                        scanner = %scanner.id,
+                        address = %scanner.address,
+                        "no IPv4 address to ask about scan-to-PC",
+                    );
+                    return;
+                }
+            },
+        };
+
+        if let ScanToPc::Unavailable { reason } = &note {
+            info!(scanner = %scanner.id, %reason, "this scanner reports no panel keys");
+        }
+        self.scan_to_pc
+            .lock()
+            .expect("scan-to-PC notes")
+            .insert(scanner.id.clone(), note);
     }
 
     /// Which driver this scanner needs, from what discovery recorded about it.
@@ -496,8 +600,10 @@ impl ScannerBackend for BrotherBackend {
     /// Safe at every point, and trivially so: the call only reads. Dropping it mid-check
     /// leaves a `dpkg-query` that may still be running and will exit on its own, and
     /// nothing else — no unpacked archive, no half-written config, no partial state to
-    /// unwind. A fresh call afterwards produces the same progress sequence as a first
-    /// one.
+    /// unwind. The scan-to-PC probe is a read too, of one OID, and a drop during it
+    /// leaves the device exactly as it was and this backend with one fewer note than it
+    /// would have had. A fresh call afterwards produces the same progress sequence as a
+    /// first one.
     async fn ensure_installed(
         &self,
         scanner: &ScannerInfo,
@@ -511,6 +617,11 @@ impl ScannerBackend for BrotherBackend {
 
         match self.check_dependencies(scanner, &progress).await {
             Ok(()) => {
+                // After the dependencies and before `Ready`, because what it learns
+                // changes what the scanner is reported to be able to do — and it emits
+                // no progress step of its own, so the observable sequence a client is
+                // written against is unchanged whether the device answers or not.
+                self.note_scan_to_pc(scanner).await;
                 let _ = progress.send(PairingProgress::Ready).await;
                 Ok(())
             }
@@ -587,6 +698,7 @@ impl UnsupportedWithScanner for BackendError {
 fn scanners_from_sightings(
     sightings: Vec<Sighting>,
     installed: InstalledState,
+    scan_to_pc: &BTreeMap<ScannerId, ScanToPc>,
 ) -> Result<Vec<ScannerInfo>, BackendError> {
     let enrichments = enrichments_by_model(&sightings);
     let mut scanners = BTreeMap::<ScannerId, (u8, ScannerInfo)>::new();
@@ -626,7 +738,12 @@ fn scanners_from_sightings(
                 .unwrap_or_else(|| display_name(&sighting.description)),
             backend: SCANNER_BACKEND_NAME.to_owned(),
             address: address.clone(),
-            capabilities: capabilities_for_sighting(&sighting, driver, installed),
+            capabilities: capabilities_for_sighting(
+                &sighting,
+                driver,
+                installed,
+                scan_to_pc.get(&id),
+            ),
             status: Status::Online,
         };
         let precedence = if sighting.transport.is_vendor() { 0 } else { 1 };
@@ -768,10 +885,17 @@ fn required_driver(sighting: &Sighting) -> Option<Driver> {
     }
 }
 
+/// What one sighting can do, including what the device itself said about its panel keys.
+///
+/// `scan_to_pc` is `None` for a scanner that has never been asked — every scanner, until
+/// it is paired. The model table's optimism stands until the device contradicts it, which
+/// is the right way round: a scanner nobody has paired yet is not evidence of anything,
+/// and a `count` that dropped to zero on its own would be indistinguishable from a bug.
 fn capabilities_for_sighting(
     sighting: &Sighting,
     driver: Option<Driver>,
     installed: InstalledState,
+    scan_to_pc: Option<&ScanToPc>,
 ) -> Capabilities {
     let mut capabilities = model_capabilities(sighting.model_key.as_deref()).unwrap_or_default();
     let mut extra = BTreeMap::from([(
@@ -802,10 +926,53 @@ fn capabilities_for_sighting(
         extra.insert("model".to_owned(), Value::Str(model.clone()));
     }
 
+    match scan_to_pc {
+        Some(ScanToPc::Available) => {
+            extra.insert("scan_to_pc".to_owned(), Value::Bool(true));
+        }
+        Some(ScanToPc::Unavailable { reason }) => {
+            // Zero buttons whatever the model table says: the table is a guess from a
+            // model name, and this is the device's own answer. Nothing else about the
+            // scanner changes — it stays discovered, pairable, and scannable.
+            capabilities.buttons = ButtonsCapability {
+                count: 0,
+                label_configurable: false,
+                labels: Vec::new(),
+            };
+            extra.insert("scan_to_pc".to_owned(), Value::Bool(false));
+            extra.insert("scan_to_pc_reason".to_owned(), Value::Str(reason.clone()));
+        }
+        None => {}
+    }
+
     capabilities
         .extra
         .insert("brother".to_owned(), Value::Dict(extra));
     capabilities
+}
+
+/// The device's IPv4 address, if discovery found one.
+///
+/// `physical_address` first because it is the field discovery put the device's own
+/// address in; `address` is a fallback that may still be the raw `device_uri`. A device
+/// only known by an mDNS name yields `None` — resolving one is the listener's problem
+/// (5.9), not something to guess at here.
+fn device_ipv4(scanner: &ScannerInfo) -> Option<Ipv4Addr> {
+    let physical = scanner
+        .capabilities
+        .extra
+        .get("brother")
+        .and_then(as_dict)
+        .and_then(|dict| dict.get("physical_address"))
+        .and_then(|value| match value {
+            Value::Str(address) => Some(address.as_str()),
+            _ => None,
+        });
+
+    physical
+        .and_then(ipv4)
+        .or_else(|| ipv4(&scanner.address))
+        .and_then(|address| address.parse().ok())
 }
 
 fn model_capabilities(model_key: Option<&str>) -> Option<Capabilities> {
@@ -985,6 +1152,7 @@ fn command_output(stdout: &[u8], stderr: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::net::SocketAddrV4;
     use std::os::unix::process::ExitStatusExt as _;
     use std::process::ExitStatus;
     use std::sync::Mutex;
@@ -1027,6 +1195,7 @@ device 'airscan:escl:Brother MFC-L2710DW http://BRW001122334455.local:80/eSCL/' 
                 brscan5: Presence::Absent,
                 brscan_skey: Presence::Present,
             },
+            &never_asked(),
         )
         .unwrap();
 
@@ -1060,6 +1229,7 @@ device 'airscan:escl:Brother MFC-L2710DW http://BRW001122334455.local:80/eSCL/' 
             )
             .unwrap()],
                 InstalledState::default(),
+                &never_asked(),
             )
             .unwrap();
 
@@ -1101,6 +1271,8 @@ device 'airscan:escl:Brother MFC-L2710DW http://BRW001122334455.local:80/eSCL/' 
         registered: BTreeSet<&'static str>,
         /// What `dpkg-query -L` lists for a package.
         files: BTreeMap<&'static str, Vec<String>>,
+        /// What `scanimage -L` prints. Empty means "no devices", not "no scanimage".
+        scanimage: &'static str,
         /// Slept before answering, so a test can drop the call while it is in flight.
         delay: Duration,
     }
@@ -1128,6 +1300,14 @@ device 'airscan:escl:Brother MFC-L2710DW http://BRW001122334455.local:80/eSCL/' 
 
             if !self.delay.is_zero() {
                 std::thread::sleep(self.delay);
+            }
+
+            if program.ends_with("scanimage") {
+                return Ok(Output {
+                    status: ExitStatus::from_raw(0),
+                    stdout: self.scanimage.as_bytes().to_vec(),
+                    stderr: Vec::new(),
+                });
             }
 
             let package = args.last().copied().unwrap_or_default();
@@ -1181,9 +1361,269 @@ device 'airscan:escl:Brother MFC-L2710DW http://BRW001122334455.local:80/eSCL/' 
                     .unwrap(),
             ],
             InstalledState::default(),
+            &never_asked(),
         )
         .unwrap()
         .remove(0)
+    }
+
+    /// The state every scanner is in before anybody pairs it: nothing has been asked, so
+    /// nothing the device said is on record.
+    fn never_asked() -> BTreeMap<ScannerId, ScanToPc> {
+        BTreeMap::new()
+    }
+
+    // ------------------------------------------------------ the scan-to-PC degraded path
+
+    /// A device on the network that answers the scan-key OID however it is told to.
+    ///
+    /// The fake SNMP responder the acceptance criterion asks for: it is what lets "a
+    /// model that refuses is still a scanner" be a test rather than a hardware ritual.
+    #[derive(Debug)]
+    struct FakeSnmp {
+        /// `None` is a printer that is switched off.
+        answer: Option<skey::snmp::ErrorStatus>,
+        asked: Mutex<Vec<SocketAddrV4>>,
+    }
+
+    impl FakeSnmp {
+        fn answering(answer: Option<skey::snmp::ErrorStatus>) -> Arc<Self> {
+            Arc::new(Self {
+                answer,
+                asked: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn asked(&self) -> Vec<SocketAddrV4> {
+            self.asked.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl SnmpTransport for FakeSnmp {
+        async fn exchange(
+            &self,
+            device: SocketAddrV4,
+            request: &skey::snmp::Message,
+        ) -> Result<skey::snmp::Message, registrar::TransportError> {
+            use skey::snmp::{Message, Pdu, PduKind, Value as SnmpValue, VarBind, Version};
+
+            self.asked.lock().unwrap().push(device);
+            let Some(error_status) = self.answer else {
+                return Err(registrar::TransportError::Timeout(
+                    registrar::RESPONSE_TIMEOUT,
+                ));
+            };
+
+            Ok(Message {
+                version: Version::V1,
+                community: request.community.clone(),
+                pdu: Pdu {
+                    kind: PduKind::Response,
+                    request_id: request.pdu.request_id,
+                    error_status,
+                    error_index: 0,
+                    varbinds: vec![VarBind::new(
+                        request.pdu.varbinds[0].oid.clone(),
+                        SnmpValue::OctetString(b"TRUE".to_vec()),
+                    )],
+                },
+            })
+        }
+    }
+
+    /// One eSCL sighting of a four-button model, at an address SNMP can be sent to.
+    const NETWORK_MFC: &str =
+        "device 'escl:http://192.168.1.23:80' is a Brother MFC-L2710DW flatbed scanner\n";
+
+    fn networked_backend(
+        root: &TempDir,
+        transport: Arc<dyn SnmpTransport>,
+    ) -> (BrotherBackend, Arc<RecordingRunner>) {
+        let runner = Arc::new(RecordingRunner {
+            scanimage: NETWORK_MFC,
+            ..RecordingRunner::default()
+        });
+        let scanimage = root.path().join("scanimage");
+        fs::write(&scanimage, b"stub").unwrap();
+
+        let backend = BrotherBackend {
+            scanimage_path: scanimage,
+            transport,
+            ..backend(root, Arc::clone(&runner))
+        };
+        (backend, runner)
+    }
+
+    fn brother_dict(scanner: &ScannerInfo) -> BTreeMap<String, Value> {
+        scanner
+            .capabilities
+            .extra
+            .get("brother")
+            .and_then(as_dict)
+            .cloned()
+            .expect("every Brother scanner carries its dict")
+    }
+
+    /// The degraded path of the design's §4, end to end: the device says it does not
+    /// know the OID, `Pair()` still succeeds, and the scanner keeps everything except
+    /// its buttons.
+    #[tokio::test]
+    async fn a_device_that_refuses_the_oid_keeps_a_scanner_and_loses_its_buttons() {
+        let root = sysroot(&["/opt/brother/scanner/brscan4", "/usr/bin/brscan-skey"]);
+        let device = FakeSnmp::answering(Some(skey::snmp::ErrorStatus::NoSuchName));
+        let (backend, _) = networked_backend(&root, device.clone());
+
+        // Before anybody asks, the model table's guess stands.
+        let before = backend.discover().await.unwrap();
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].capabilities.buttons.count, 4);
+
+        // Pairing asks — and does not fail because the answer was no.
+        let (outcome, progress) = ensure_installed_progress(&backend, &before[0]).await;
+        outcome.expect("a model without scan-to-PC is still pairable");
+        assert_eq!(progress.last(), Some(&PairingProgress::Ready));
+
+        let asked = device.asked();
+        assert_eq!(
+            asked,
+            vec![SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 23), 161)],
+            "asked exactly the device, exactly once",
+        );
+
+        // And discovery now reports what the device said about itself.
+        let after = backend.discover().await.unwrap();
+        assert_eq!(after.len(), 1, "the scanner is still discovered");
+        assert_eq!(after[0].id, before[0].id);
+        assert_eq!(after[0].status, Status::Online);
+        assert_eq!(
+            after[0].capabilities.buttons.count, 0,
+            "the device's own answer beats the model table",
+        );
+
+        let dict = brother_dict(&after[0]);
+        assert_eq!(dict.get("scan_to_pc"), Some(&Value::Bool(false)));
+        let Some(Value::Str(reason)) = dict.get("scan_to_pc_reason") else {
+            panic!("the reason must travel with the scanner: {dict:?}");
+        };
+        assert!(
+            reason.contains("does not appear to support scan-to-PC"),
+            "{reason}",
+        );
+        // Everything the pull-scanning path needs is untouched.
+        assert_eq!(
+            dict.get("device_uri"),
+            Some(&Value::Str("escl:http://192.168.1.23:80".to_owned()))
+        );
+        assert_eq!(
+            after[0].capabilities.sources,
+            before[0].capabilities.sources
+        );
+        assert_eq!(
+            after[0].capabilities.resolutions,
+            before[0].capabilities.resolutions
+        );
+    }
+
+    #[tokio::test]
+    async fn a_device_that_knows_the_oid_keeps_its_buttons() {
+        let root = sysroot(&["/opt/brother/scanner/brscan4", "/usr/bin/brscan-skey"]);
+        let device = FakeSnmp::answering(Some(skey::snmp::ErrorStatus::NoError));
+        let (backend, _) = networked_backend(&root, device);
+
+        let scanner = backend.discover().await.unwrap().remove(0);
+        ensure_installed_progress(&backend, &scanner)
+            .await
+            .0
+            .unwrap();
+
+        let after = backend.discover().await.unwrap().remove(0);
+        assert_eq!(after.capabilities.buttons.count, 4);
+        assert_eq!(
+            brother_dict(&after).get("scan_to_pc"),
+            Some(&Value::Bool(true))
+        );
+    }
+
+    /// A printer that was switched off during pairing has said nothing about itself, and
+    /// must not be recorded as a model without buttons — that would need another pairing
+    /// to undo.
+    #[tokio::test]
+    async fn a_printer_that_does_not_answer_is_not_recorded_as_button_less() {
+        let root = sysroot(&["/opt/brother/scanner/brscan4", "/usr/bin/brscan-skey"]);
+        let device = FakeSnmp::answering(None);
+        let (backend, _) = networked_backend(&root, device);
+
+        let scanner = backend.discover().await.unwrap().remove(0);
+        ensure_installed_progress(&backend, &scanner)
+            .await
+            .0
+            .unwrap();
+
+        let after = backend.discover().await.unwrap().remove(0);
+        assert_eq!(after.capabilities.buttons.count, 4);
+        let dict = brother_dict(&after);
+        assert!(
+            !dict.contains_key("scan_to_pc"),
+            "silence is not an answer to record: {dict:?}",
+        );
+    }
+
+    /// A USB scanner cannot be registered by this backend at all. Saying so is more
+    /// useful than leaving four keys advertised that nothing will ever deliver.
+    #[tokio::test]
+    async fn a_usb_scanner_reports_no_panel_keys_and_says_why() {
+        let root = sysroot(&["/opt/brother/scanner/brscan4", "/usr/bin/brscan-skey"]);
+        let device = FakeSnmp::answering(Some(skey::snmp::ErrorStatus::NoError));
+        let runner = Arc::new(RecordingRunner {
+            scanimage: "device 'brother4:bus4;dev1:usb:001:002' is a Brother MFC-L2710DW\n",
+            ..RecordingRunner::default()
+        });
+        let scanimage = root.path().join("scanimage");
+        fs::write(&scanimage, b"stub").unwrap();
+        let backend = BrotherBackend {
+            scanimage_path: scanimage,
+            transport: device.clone(),
+            ..backend(&root, runner)
+        };
+
+        let scanner = backend.discover().await.unwrap().remove(0);
+        ensure_installed_progress(&backend, &scanner)
+            .await
+            .0
+            .unwrap();
+
+        assert!(
+            device.asked().is_empty(),
+            "there is nothing to send an SNMP datagram to",
+        );
+
+        let after = backend.discover().await.unwrap().remove(0);
+        assert_eq!(after.capabilities.buttons.count, 0);
+        let Some(Value::Str(reason)) = brother_dict(&after).get("scan_to_pc_reason").cloned()
+        else {
+            panic!("a USB scanner must say why it has no keys");
+        };
+        assert!(reason.contains("USB"), "{reason}");
+    }
+
+    #[test]
+    fn a_device_address_is_read_from_discovery_metadata_or_not_at_all() {
+        let networked = scanners_from_sightings(
+            vec![parse_scanimage_line(NETWORK_MFC).unwrap()],
+            InstalledState::default(),
+            &never_asked(),
+        )
+        .unwrap()
+        .remove(0);
+        assert_eq!(
+            device_ipv4(&networked),
+            Some(Ipv4Addr::new(192, 168, 1, 23))
+        );
+
+        // A vendor URI names a SANE device, not an address, and an mDNS name is not one
+        // this backend resolves. Neither may be guessed at.
+        assert_eq!(device_ipv4(&brother_mfc()), None);
     }
 
     async fn ensure_installed_progress(
@@ -1449,6 +1889,7 @@ device 'airscan:escl:Brother MFC-L2710DW http://BRW001122334455.local:80/eSCL/' 
         // lib.rs would have stopped meaning anything the moment it was added.
         let sources = [
             ("lib.rs", include_str!("lib.rs")),
+            ("registrar.rs", include_str!("registrar.rs")),
             ("skey/mod.rs", include_str!("skey/mod.rs")),
             ("skey/snmp.rs", include_str!("skey/snmp.rs")),
             ("skey/register.rs", include_str!("skey/register.rs")),
@@ -1504,6 +1945,11 @@ device 'airscan:escl:Brother MFC-L2710DW http://BRW001122334455.local:80/eSCL/' 
     /// This is what makes `cargo test -p scanbus-backend-brother` runnable with no
     /// hardware and no network — the property the whole "parse it before you socket it"
     /// order exists to buy, so it is asserted rather than left as an intention.
+    ///
+    /// [`crate::registrar`] is deliberately **not** on this list: it is the module that
+    /// owns the socket and the clock, which is why the list is spelled out rather than
+    /// being "every file under `src/`". Its own tests still need neither, because what it
+    /// sends goes through a [`crate::registrar::SnmpTransport`] a test can supply.
     #[test]
     fn the_skey_protocol_modules_open_nothing() {
         let sources = [

@@ -10,9 +10,19 @@ repository.workspace = true
 scanbus-core.workspace = true
 async-trait.workspace = true
 futures-core.workspace = true
-tokio = { workspace = true, features = ["rt", "sync"] }
+# `net` and `time` are the registration lease's: a UDP socket to the device's port 161 —
+# also what asks the routing table which of this machine's addresses reaches it — and the
+# sleep between two refreshes. Nothing here starts a runtime; the daemon does.
+tokio = { workspace = true, features = ["net", "rt", "sync", "time"] }
 tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+# `test-util` pauses the clock, which is how a 360 s lease is refreshed a dozen times in
+# a test that finishes instantly and touches no hardware.
+tokio = { workspace = true, features = [
+    "macros",
+    "rt-multi-thread",
+    "test-util",
+    "time",
+] }
