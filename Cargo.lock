@@ -1624,6 +1624,7 @@ dependencies = [
  "async-trait",
  "futures-core",
  "futures-util",
+ "mdns-sd",
  "scanbus-backend-common",
  "scanbus-core",
  "tempfile",

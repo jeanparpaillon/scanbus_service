@@ -20,6 +20,8 @@
 //! immediately without one. The first is checked up front in [`dependency_states`]; the
 //! second can only be reported after the fact, which is what [`ActivationFailure`] is for.
 
+mod mdns;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
