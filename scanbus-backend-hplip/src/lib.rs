@@ -93,9 +93,16 @@ impl Default for HplipBackend {
     }
 }
 
+/// One discovered device, in both of the spellings HPLIP uses for it.
+///
+/// The two are not interchangeable and each has exactly one consumer: `hp:/…` is the
+/// hpmud URI that the `hp-*` tools and `com.hplip.Toolbox.Event` speak, `hpaio:/…` is the
+/// SANE device name that `scanimage --device-name` can open. Carrying only the first is
+/// what makes a found scanner fail to open.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProbeRecord {
     device_uri: String,
+    sane_name: String,
     model_name: String,
     display_name: String,
 }
@@ -633,6 +640,7 @@ fn parse_probe_output(output: &str) -> Vec<ProbeRecord> {
         };
 
         records.push(ProbeRecord {
+            sane_name: sane_name_from_device_uri(device_uri),
             device_uri: device_uri.to_owned(),
             model_name,
             display_name,
@@ -678,6 +686,7 @@ fn capabilities_from_model(
         "device_uri".to_owned(),
         Value::Str(record.device_uri.clone()),
     );
+    extra.insert("sane_name".to_owned(), Value::Str(record.sane_name.clone()));
     extra.insert(
         "model_name".to_owned(),
         Value::Str(record.model_name.clone()),
@@ -747,6 +756,23 @@ fn as_dict(value: &Value) -> Option<&BTreeMap<String, Value>> {
         Value::Dict(dict) => Some(dict),
         _ => None,
     }
+}
+
+/// The SANE device name for an hpmud URI: `hp:/usb/…` becomes `hpaio:/usb/…`.
+///
+/// A prefix substitution and nothing more, because that is precisely what HPLIP itself
+/// does — `base/device.py:1091` builds `scan-uri` as `device_uri.replace('hp:/',
+/// 'hpaio:/')`, and `SCAN_URI`/`SANE_URI` at 1116 the same way.
+///
+/// In particular no `&queue=false` is appended here. That flag belongs to the mDNS path,
+/// where [`mdns::hp_scan_record`] builds it in exactly as `libhpdiscovery` does; for a
+/// URI that came out of `hp-probe`, `libsane-hpaio.so.1` composes the hpmud URI itself
+/// (it carries both `hp:/net/` and `&queue=false` as literals), and second-guessing it
+/// would only produce a name HPLIP never emits.
+fn sane_name_from_device_uri(device_uri: &str) -> String {
+    device_uri
+        .strip_prefix("hp:/")
+        .map_or_else(|| device_uri.to_owned(), |rest| format!("hpaio:/{rest}"))
 }
 
 fn model_key_from_uri(device_uri: &str) -> Option<String> {
@@ -1062,6 +1088,7 @@ Found 1 printer(s) on the 'net' bus.
             parse_probe_output(output),
             vec![ProbeRecord {
                 device_uri: "hp:/net/officejet_pro_9010?ip=192.168.1.9".to_owned(),
+                sane_name: "hpaio:/net/officejet_pro_9010?ip=192.168.1.9".to_owned(),
                 model_name: "HP OfficeJet Pro 9010".to_owned(),
                 display_name: "OfficeJet Pro 9010".to_owned(),
             }]
@@ -1080,9 +1107,56 @@ hp:/usb/officejet_8710_series?serial=CN1234ABCDE        HP OfficeJet 8710 series
             parse_probe_output(output),
             vec![ProbeRecord {
                 device_uri: "hp:/usb/officejet_8710_series?serial=CN1234ABCDE".to_owned(),
+                sane_name: "hpaio:/usb/officejet_8710_series?serial=CN1234ABCDE".to_owned(),
                 model_name: "HP OfficeJet 8710 series".to_owned(),
                 display_name: "HP OfficeJet 8710 series".to_owned(),
             }]
+        );
+    }
+
+    /// `scanimage` cannot open an `hp:/…` URI — that spelling is hpmud's. Discovery
+    /// therefore publishes both names, or fixing discovery only moves the failure from
+    /// "not found" to "cannot open".
+    #[test]
+    fn both_spellings_are_published_for_a_discovered_device() {
+        let record = ProbeRecord {
+            device_uri: "hp:/net/HP_OfficeJet_Pro_8610?ip=192.168.1.3&queue=false".to_owned(),
+            sane_name: "hpaio:/net/HP_OfficeJet_Pro_8610?ip=192.168.1.3&queue=false".to_owned(),
+            model_name: "HP OfficeJet Pro 8610".to_owned(),
+            display_name: "HP OfficeJet Pro 8610".to_owned(),
+        };
+        let capabilities = capabilities_from_model(
+            &record,
+            &Some("hp_officejet_pro_8610".to_owned()),
+            &ModelInfo::default(),
+        );
+        let hplip = capabilities
+            .extra
+            .get("hplip")
+            .and_then(as_dict)
+            .expect("discovery publishes an hplip section");
+
+        assert_eq!(
+            hplip.get("device_uri"),
+            Some(&Value::Str(record.device_uri.clone()))
+        );
+        assert_eq!(
+            hplip.get("sane_name"),
+            Some(&Value::Str(record.sane_name.clone()))
+        );
+    }
+
+    /// HPLIP's own rule, `base/device.py:1091`: substitute the scheme, change nothing
+    /// else — the query string, `queue=false` included, is carried across untouched.
+    #[test]
+    fn the_sane_name_is_the_hpmud_uri_with_its_scheme_substituted() {
+        assert_eq!(
+            sane_name_from_device_uri("hp:/net/HP_OfficeJet_Pro_8610?ip=192.168.1.3&queue=false"),
+            "hpaio:/net/HP_OfficeJet_Pro_8610?ip=192.168.1.3&queue=false"
+        );
+        assert_eq!(
+            sane_name_from_device_uri("hp:/usb/officejet_8710_series?serial=CN1234ABCDE"),
+            "hpaio:/usb/officejet_8710_series?serial=CN1234ABCDE"
         );
     }
 
@@ -1102,6 +1176,7 @@ hp:/usb/officejet_8710_series?serial=CN1234ABCDE        HP OfficeJet 8710 series
     fn capabilities_follow_scan_src_and_plugin_flags() {
         let record = ProbeRecord {
             device_uri: "hp:/net/officejet_pro_9010?ip=192.168.1.9".to_owned(),
+            sane_name: "hpaio:/net/officejet_pro_9010?ip=192.168.1.9".to_owned(),
             model_name: "HP OfficeJet Pro 9010".to_owned(),
             display_name: "OfficeJet Pro 9010".to_owned(),
         };
@@ -1309,6 +1384,7 @@ printf 'installed\\n'\n",
         };
         let record = ProbeRecord {
             device_uri: "hp:/net/officejet_pro_9010?ip=192.168.1.9".to_owned(),
+            sane_name: "hpaio:/net/officejet_pro_9010?ip=192.168.1.9".to_owned(),
             model_name: "HP OfficeJet Pro 9010".to_owned(),
             display_name: "OfficeJet Pro 9010".to_owned(),
         };
