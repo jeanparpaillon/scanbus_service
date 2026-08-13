@@ -25,7 +25,16 @@
 //! to run, and `tests::the_backend_has_no_way_to_install_anything` greps the non-test
 //! source for the mechanisms that would be needed to install something.
 //!
+//! **The invariant is "installs nothing", not "no network".** Speaking the Brother
+//! push-button protocol ourselves ([`skey`]) means an SNMP exchange on UDP/161 and a
+//! listener on UDP/54925 — and that is the whole point of
+//! [`brother-skeyless-backend.md`]: a datagram sent to a printer on the local network is
+//! not a package fetched from a vendor's website, and doing it ourselves is what removes
+//! the two `.deb` files from the story rather than adding to it. What the guard test
+//! forbids is a package manager, an HTTP client, a downloader, and privilege escalation.
+//!
 //! [`scanbus-rust-implementation.md`]: https://github.com/jeanparpaillon/scanbus_service/blob/master/docs/scanbus-rust-implementation.md
+//! [`brother-skeyless-backend.md`]: https://github.com/jeanparpaillon/scanbus_service/blob/master/docs/brother-skeyless-backend.md
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -43,6 +52,8 @@ use scanbus_core::{
 };
 use tokio::sync::mpsc;
 use tracing::warn;
+
+pub mod skey;
 
 /// Backend identifier, as it will be reported by [`ScannerBackend::id`].
 pub const ID: &str = "brother-skey";
@@ -1413,47 +1424,118 @@ device 'airscan:escl:Brother MFC-L2710DW http://BRW001122334455.local:80/eSCL/' 
     /// The same claim, checked against the source rather than against one run: the
     /// mechanisms an install would need are absent from the crate.
     ///
+    /// **The invariant is "this backend cannot install anything", not "this backend does
+    /// not use the network."** It used to read as the latter, because at the time the
+    /// only thing the crate did was run `scanimage` and stat some files. That is no
+    /// longer true and must not be tightened back: [`crate::skey`] exists precisely so
+    /// that scanbus can speak SNMP to a printer on the local network *instead of*
+    /// requiring two `.deb` files from a vendor download form. A UDP socket to
+    /// `192.168.x.y:161` is not a download.
+    ///
+    /// So what is forbidden is the machinery of *acquiring and installing software*: a
+    /// package manager, an HTTP client, a downloader, privilege escalation. `TcpStream`
+    /// stays on the list not because TCP is forbidden in principle but because nothing
+    /// in this protocol uses it — the day a Phoenix-firmware model needs
+    /// `POST /phoenix/mib`, that is a decision to argue for in a review, and this
+    /// assertion is what forces the argument to happen.
+    ///
     /// Comment lines are excluded on purpose — the crate documentation has to be able
-    /// to name what it refuses to do — and so is this test module, which names them in
-    /// order to forbid them.
+    /// to name what it refuses to do — and so is each file's test module, which names
+    /// them in order to forbid them.
     #[test]
     fn the_backend_has_no_way_to_install_anything() {
-        let source = include_str!("lib.rs");
-        let production = source
-            .split("#[cfg(test)]")
-            .next()
-            .expect("the test module marker splits the file")
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n");
+        // Every non-test source file in the crate, not just this one: `skey` is where
+        // the code that talks to a device now lives, and a guard that only covered
+        // lib.rs would have stopped meaning anything the moment it was added.
+        let sources = [
+            ("lib.rs", include_str!("lib.rs")),
+            ("skey/mod.rs", include_str!("skey/mod.rs")),
+            ("skey/snmp.rs", include_str!("skey/snmp.rs")),
+            ("skey/register.rs", include_str!("skey/register.rs")),
+            ("skey/event.rs", include_str!("skey/event.rs")),
+            ("skey/fields.rs", include_str!("skey/fields.rs")),
+        ];
 
-        for forbidden in [
-            "pkexec",
-            "sudo",
-            "apt-get",
-            "apt install",
-            "dpkg -i",
-            "--install",
-            "--unpack",
-            "reqwest",
-            "ureq",
-            "hyper",
-            "TcpStream",
-            "curl",
-            "wget",
-        ] {
-            assert!(
-                !production.contains(forbidden),
-                "the brother backend must not reach for {forbidden}"
-            );
+        let production = |source: &str| {
+            source
+                .split("#[cfg(test)]")
+                .next()
+                .expect("the test module marker splits the file")
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        for (name, source) in sources {
+            let production = production(source);
+            for forbidden in [
+                "pkexec",
+                "sudo",
+                "apt-get",
+                "apt install",
+                "dpkg -i",
+                "--install",
+                "--unpack",
+                "reqwest",
+                "ureq",
+                "hyper",
+                "TcpStream",
+                "curl",
+                "wget",
+            ] {
+                assert!(
+                    !production.contains(forbidden),
+                    "{name} must not reach for {forbidden}"
+                );
+            }
         }
 
         // One process spawn in the crate, inside the runner every probe goes through.
-        assert_eq!(
-            production.matches("Command::new").count(),
-            1,
-            "every subprocess must go through CommandRunner"
-        );
+        let spawns: usize = sources
+            .iter()
+            .map(|(_, source)| production(source).matches("Command::new").count())
+            .sum();
+        assert_eq!(spawns, 1, "every subprocess must go through CommandRunner");
+    }
+
+    /// The protocol modules are pure: no socket, no filesystem, no clock.
+    ///
+    /// This is what makes `cargo test -p scanbus-backend-brother` runnable with no
+    /// hardware and no network — the property the whole "parse it before you socket it"
+    /// order exists to buy, so it is asserted rather than left as an intention.
+    #[test]
+    fn the_skey_protocol_modules_open_nothing() {
+        let sources = [
+            ("skey/mod.rs", include_str!("skey/mod.rs")),
+            ("skey/snmp.rs", include_str!("skey/snmp.rs")),
+            ("skey/register.rs", include_str!("skey/register.rs")),
+            ("skey/event.rs", include_str!("skey/event.rs")),
+            ("skey/fields.rs", include_str!("skey/fields.rs")),
+        ];
+        for (name, source) in sources {
+            let production = source
+                .split("#[cfg(test)]")
+                .next()
+                .expect("the test module marker splits the file")
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            for forbidden in [
+                "UdpSocket",
+                "std::fs",
+                "File::",
+                "Command::new",
+                "Instant::now",
+                "SystemTime::now",
+            ] {
+                assert!(
+                    !production.contains(forbidden),
+                    "{name} is a protocol module and must stay free of {forbidden}"
+                );
+            }
+        }
     }
 }

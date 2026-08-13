@@ -106,20 +106,109 @@ The second row is the one that matters: the OID the `brscan-skey` reverse-engine
 **exists on this device and returns a value** rather than `noSuchName`. That is the single
 riskiest assumption in this design, and it survives first contact.
 
-**What is not verified**, and must be before any of this is written:
+### 2.2.1 What the vendor binary settled
 
-- the exact varbind type and payload accepted by a `SetRequest` on that OID, and whether the
-  community must be `internal` for writes even though `public` answers reads;
-- the **UDP/54925 datagram format** the device sends when a panel entry is selected, and
-  whether it expects a reply on that socket before it will consider the request handled;
-- whether the device holds any state between the notification and the scan that eSCL
+The three open questions above were expected to need a packet capture. Most of them did not:
+`/opt/brother/scanner/brscan-skey/brscan-skey-exe` (0.3.4-0) **ships unstripped**, symbol table
+and all, down to the names of its translation units — `snmp_encode.c`, `snmp_decode.c`,
+`udp_agent.c`, `registerpc.c`, `scramble.c`. Reading the encoder is strictly better evidence
+than reading a capture, because it covers every input rather than the one that happened to be
+recorded. Everything below is cited to the function it came from, and implemented in
+[`skey/`](../scanbus-backend-brother/src/skey/).
+
+**The message.** `BerEncode1` (`0x406536`) writes ordinary SNMPv1 —
+
+```text
+SEQUENCE { INTEGER version, OCTET STRING community, [0xA0|op] {
+    INTEGER request-id, INTEGER error-status, INTEGER error-index,
+    SEQUENCE { SEQUENCE { OID, value } … } } }
+```
+
+— with three departures worth knowing, all reproduced:
+
+- **The varbind value is always an OCTET STRING**, tag `0x04`, *including in a
+  `GetRequest`*, where the RFC uses `05 00`. `BerEncNull` is present at `0x405da6` and is
+  never called. That answers "the exact varbind type": there is no type negotiation, the
+  registration string goes in as an octet string.
+- **Lengths cap at `u16`** — `BerEncLen` (`0x405de9`) takes a `short`, so `81 xx` and
+  `82 hi lo` are the only long forms it can emit.
+- **The version field's width is assumed to be three bytes** when the outer length is
+  computed.
+
+**The community is `internal`, not `public`.** `InitSnmpMess` (`0x407255`) reads
+`CommunityName=` from `/etc/opt/brother/scanner/brscan-skey/brscan-snmp.cfg` and falls back to
+an immediate `"internal"` — and the file as shipped has that line commented out, so `internal`
+is what every registration on this machine has ever used. Reads answer on both; nothing says
+writes do, so scanbus registers with `internal`.
+
+**`BRID` is the panel password, obfuscated.** The sixth field is not a device id. It is the
+four-digit password from `brscan-skey.config` run through Brother's own scrambler (`enc_main`
+at `0x406aaa`, tables `shuffletbl`/`hextbl`, key blob at `0x414a70`). scanbus does not
+implement that obfuscation and does not offer the feature: it always writes `BRID=`, which is
+what the vendor writes too when no password is set, and `password=` empty is how the config
+ships. A device with a panel password set is a degraded case (§4), not a reason to
+reimplement an obfuscation.
+
+**Newer firmware does not use SNMP at all.** `register_pc` (`0x40cd24`) branches on
+`ISPhoenixFirmware` between `register_pc_legacy` — the SNMP path above — and
+`register_pc_phoenix`, which `POST`s *the same registration string* as JSON to
+`https://<ip>/phoenix/mib` with digest auth `Public:0000`
+(`{"request":[{"key":"1.3.6.1.4.1.2435.2.3.9.2.11.1.1.0","string_value":"TYPE=BR;…"}]}`,
+template at `0x415a90`). Only the SNMP path is implemented. Which branch the MFC-J5335DW
+takes is **not known**, and it is now the most likely reason for registration to fail on this
+machine — worth checking before blaming the BER.
+
+**The datagram.** `udp_sent` (`0x40884f`) frames every message on 54925 as four binary bytes
+then a NUL-terminated ASCII payload, and sends `4 + strlen(payload)` — the terminator is not
+on the wire:
+
+```text
+byte 0   id            byte 1   length >> 8
+byte 2   length        byte 3   code           byte 4…  payload
+```
+
+`check_udp_data` (`0x408134`) validates `(b[1] << 8) | b[2] == strlen(b + 4)` and dispatches on
+`(b[0], b[3])`. A **panel key press is `0x01`/`0x01`**; every other pair is an internal command
+the vendor CLI posts to its own daemon over the same socket (`0x80`/`0x80…0x84` for add,
+delete, terminate, list, refresh). scanbus recognises those and declines them, because binding
+the port means receiving them whenever someone runs `brscan-skey --refresh`.
+
+The payload is the same `KEY=VALUE;` grammar as the registration. `decode_key_data`
+(`0x40bad1`) reads `USER=`, `TYPE=` (must be `BR`), `HOST=`, `CLIENT=` — the device's own
+address, and the only field that says *which* scanner this is — and `FUNC=`. The sample
+datagram Brother compiled into `.data` at `0x61b480` shows the fuller set:
+
+```text
+TYPE=BR;BUTTON=SCAN;USER="idevd101";FUNC=IMAGE;HOST=10.136.150.6:54925;APPNUM=1;
+P1=0;P2=0;P3=0;P4=0;REGID=756;SEQ=1;;CLIENT=10.136.41.234
+```
+
+It is committed as a fixture. Note the stray empty field before `CLIENT`: field order and the
+field set are not something to depend on, and the parser is order-independent and ignores what
+it has no use for.
+
+**No reply is expected on that socket.** After `check_udp_data`, `udp_agent` (`0x407b15`) calls
+only `set_sync_event`, `get_last_recv_ip_address`, `sprintf` and `strcpy` — there is no path
+from a received datagram to `udp_sent`. The only thing the daemon writes is a `Refresh Device
+List` command to itself when the receive loop times out.
+
+### 2.2.2 What is still unverified
+
+Two of the original three questions are answered. What is left needs hardware, and
+[`scripts/capture-skey.sh`](../scripts/capture-skey.sh) is the one command that gets it:
+
+- **Whether the device accepts a `SetRequest` on that OID.** The OID exists and reads back
+  `TRUE`; that a write takes is a different claim, and no amount of reading the vendor's
+  encoder can make it. This is now the riskiest remaining assumption.
+- **Whether the MFC-J5335DW is a Phoenix-firmware model**, in which case registration is an
+  HTTPS `POST` and the SNMP path will silently register nothing.
+- **The `(id, code)` a real device puts in front of a key press.** `check_udp_data` requires
+  `0x01`/`0x01` and the parser enforces exactly that, so a device using another pair fails
+  loudly with the bytes in the message rather than silently.
+- **Whether the device holds state between the notification and the scan** that eSCL
   acquisition would bypass or upset — the failure mode to watch for is a panel that reports an
-  error after a scan that nonetheless succeeded.
-
-All three are answerable on the development machine without guessing, because `brscan-skey` and
-`brscan4` *are* installed there: run the vendor daemon under `tcpdump -i any -s0 -w skey.pcap
-'udp port 161 or udp port 54925'`, press each of the four panel entries, and keep the capture as
-a test fixture. Issue 5.7 owns that capture and the parsers built from it.
+  error after a scan that nonetheless succeeded. Unchanged from the original list; this one was
+  never going to be answerable from a disassembly.
 
 ## 3. Shape in code
 
@@ -133,8 +222,13 @@ scanbus-backend-brother/src/
 └── skey/
     ├── snmp.rs      BER encode/decode for GetRequest/SetRequest/Response
     ├── register.rs  the registration string, the lease, the refresh task
-    └── event.rs     the UDP/54925 datagram → button index
+    ├── event.rs     the UDP/54925 datagram → button index
+    └── fields.rs    the KEY=VALUE; grammar both of the above are written in
 ```
+
+As built, the three protocol modules open nothing — no socket, no file, no clock — and a test
+in `lib.rs` holds them to it. The lease refresh task named above is the first thing that will
+need one, and it belongs with the listener rather than here.
 
 **No SNMP crate.** Two PDU types, one transport, no MIB parsing, no v3 crypto — the BER encoder
 and decoder are roughly two hundred lines with exhaustive round-trip tests, which is a smaller
@@ -179,6 +273,12 @@ did nothing. `LabelConfigurable` stays `false`: the labels are the firmware's.
   pull-scannable. Do not try to coexist on the port.
 - **A vendor driver is installed** — it is used for acquisition only when the device offers no
   eSCL. Its presence is never a requirement.
+- **A panel password is set on the device** — the registration needs it in `BRID=`, scrambled
+  with an obfuscation scanbus does not implement (§2.2.1). Registration will not take. Report
+  it as such rather than as a timeout, and leave the scanner pull-scannable.
+- **The device runs Phoenix firmware** — registration is an HTTPS `POST` rather than an SNMP
+  `SetRequest` (§2.2.1). Not implemented; the same degraded path as a device that rejects the
+  OID.
 
 ## 5. What this supersedes
 
