@@ -100,3 +100,5 @@ for the work: `117-fix-wifi-scanning`, `104-network-step`. Do the whole task in
 that worktree — it keeps the main checkout free for parallel work
 and shares one object store, so no re-clone. Remove it with
 `git worktree remove` once the branch is merged.
+
+Let user run test, fmt and lint manually.
