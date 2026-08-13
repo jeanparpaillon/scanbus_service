@@ -125,7 +125,9 @@ struct DependencyState {
 struct FetchState {
     active: Vec<ScannerId>,
     fetched: Vec<(ScannerId, String)>,
-    device_uris: BTreeMap<ScannerId, String>,
+    /// The SANE device names, not the hpmud URIs: this map exists only to feed
+    /// `scanimage --device-name`, which is the `hpaio:/…` spelling. See [`ProbeRecord`].
+    sane_names: BTreeMap<ScannerId, String>,
 }
 
 type HplipHistoryEntry = (String, String, i32, String, i32, String, f64);
@@ -246,34 +248,48 @@ impl HplipBackend {
         Ok(())
     }
 
-    fn device_uri(scanner: &ScannerInfo) -> Result<&str, BackendError> {
+    /// One of the strings discovery published under `capabilities.extra["hplip"]`.
+    fn published_name<'a>(scanner: &'a ScannerInfo, key: &str) -> Result<&'a str, BackendError> {
         scanner
             .capabilities
             .extra
             .get("hplip")
             .and_then(as_dict)
-            .and_then(|dict| dict.get("device_uri"))
+            .and_then(|dict| dict.get(key))
             .and_then(|value| match value {
-                Value::Str(uri) => Some(uri.as_str()),
+                Value::Str(name) => Some(name.as_str()),
                 _ => None,
             })
             .ok_or_else(|| {
                 BackendError::Other(format!(
-                    "scanner {} is missing the HPLIP device URI from discovery",
+                    "scanner {} is missing `{key}` from HPLIP discovery",
                     scanner.id
                 ))
             })
     }
 
-    fn remember_device_uris(&self, scanners: &[ScannerInfo]) {
+    /// The hpmud URI, for talking to HPLIP itself — `hpssd`'s history, the `hp-*` tools.
+    fn device_uri(scanner: &ScannerInfo) -> Result<&str, BackendError> {
+        Self::published_name(scanner, "device_uri")
+    }
+
+    /// The SANE device name, for opening the scanner with `scanimage`.
+    fn sane_name(scanner: &ScannerInfo) -> Result<&str, BackendError> {
+        Self::published_name(scanner, "sane_name")
+    }
+
+    fn remember_sane_names(&self, scanners: &[ScannerInfo]) {
         let mut state = self
             .fetch_state
             .lock()
             .expect("hplip fetch state lock is not poisoned");
-        state.device_uris.clear();
+        state.sane_names.clear();
         for scanner in scanners {
-            if let Ok(uri) = Self::device_uri(scanner) {
-                state.device_uris.insert(scanner.id.clone(), uri.to_owned());
+            match Self::sane_name(scanner) {
+                Ok(name) => {
+                    state.sane_names.insert(scanner.id.clone(), name.to_owned());
+                }
+                Err(error) => warn!(scanner = %scanner.id, %error, "no SANE name for this HP; it will not be fetchable"),
             }
         }
     }
@@ -337,7 +353,7 @@ impl ScannerBackend for HplipBackend {
             .await
             .map_err(|error| BackendError::Other(format!("hplip discover task failed: {error}")))?;
         let scanners = scanners?;
-        self.remember_device_uris(&scanners);
+        self.remember_sane_names(&scanners);
         Ok(scanners)
     }
 
@@ -540,14 +556,16 @@ impl ScannerBackend for HplipBackend {
             state.active.push(scanner_id.clone());
         }
 
-        let device_name = {
+        // `scanimage --device-name` wants the SANE name; handing it the `hp:/…` URI is
+        // what turns a scanner we did find into one we cannot open.
+        let sane_name = {
             let state = self
                 .fetch_state
                 .lock()
                 .expect("hplip fetch state lock is not poisoned");
-            state.device_uris.get(scanner_id).cloned()
+            state.sane_names.get(scanner_id).cloned()
         };
-        let Some(device_name) = device_name else {
+        let Some(sane_name) = sane_name else {
             let mut state = self
                 .fetch_state
                 .lock()
@@ -556,7 +574,7 @@ impl ScannerBackend for HplipBackend {
             return Err(BackendError::UnknownScanner(scanner_id.clone()));
         };
 
-        let mut config = ScanimageConfig::new(scanner_id.clone(), device_name);
+        let mut config = ScanimageConfig::new(scanner_id.clone(), sane_name);
         config.program = self.scanimage_helper_path.clone();
         let pages = match fetch_pages_via_scanimage(config).await {
             Ok(pages) => pages,
@@ -1459,9 +1477,9 @@ printf 'P5\\n1 1\\n255\\n\\003' > \"$(printf \"$batch\" 1)\"\n",
             ..HplipBackend::default()
         };
         let scanner_id = ScannerId::from_backend(ID, "192.168.1.9").unwrap();
-        backend.fetch_state.lock().unwrap().device_uris.insert(
+        backend.fetch_state.lock().unwrap().sane_names.insert(
             scanner_id.clone(),
-            "hp:/net/officejet_pro_9010?ip=192.168.1.9".to_owned(),
+            "hpaio:/net/officejet_pro_9010?ip=192.168.1.9".to_owned(),
         );
 
         let mut stream = backend.fetch_pages(&scanner_id, "job-1").await.unwrap();
@@ -1485,6 +1503,89 @@ printf 'P5\\n1 1\\n255\\n\\003' > \"$(printf \"$batch\" 1)\"\n",
                 scanner: scanner_id,
                 job: "job-1".to_owned(),
             }
+        );
+    }
+
+    /// The two spellings are not interchangeable at the point of use: `scanimage` only
+    /// knows `hpaio:/…`, so the map `fetch_pages` reads has to hold that one, while
+    /// `start_listening` keeps matching `hpssd` history entries against `hp:/…`.
+    #[test]
+    fn discovery_remembers_the_sane_name_and_leaves_the_hpmud_uri_to_listening() {
+        let backend = HplipBackend::default();
+        let record = ProbeRecord {
+            device_uri: "hp:/net/officejet_pro_9010?ip=192.168.1.9".to_owned(),
+            sane_name: "hpaio:/net/officejet_pro_9010?ip=192.168.1.9".to_owned(),
+            model_name: "HP OfficeJet Pro 9010".to_owned(),
+            display_name: "OfficeJet Pro 9010".to_owned(),
+        };
+        let scanner = scanner_from_probe(record.clone(), &BTreeMap::new()).unwrap();
+
+        assert_eq!(
+            HplipBackend::device_uri(&scanner).unwrap(),
+            record.device_uri
+        );
+        assert_eq!(HplipBackend::sane_name(&scanner).unwrap(), record.sane_name);
+
+        backend.remember_sane_names(std::slice::from_ref(&scanner));
+        assert_eq!(
+            backend
+                .fetch_state
+                .lock()
+                .unwrap()
+                .sane_names
+                .get(&scanner.id),
+            Some(&record.sane_name)
+        );
+    }
+
+    /// The whole point of carrying two names: what reaches `scanimage` is the openable one.
+    #[tokio::test]
+    async fn a_fetch_opens_the_scanner_by_its_sane_name() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let argv = tempdir.path().join("argv");
+        let script = tempdir.path().join("scanimage.sh");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+batch=\n\
+for arg in \"$@\"; do\n\
+  printf '%s\\n' \"$arg\" >> {argv}\n\
+  case \"$arg\" in\n\
+    --batch=*) batch=${{arg#--batch=}} ;;\n\
+  esac\n\
+done\n\
+printf 'P5\\n1 1\\n255\\n\\003' > \"$(printf \"$batch\" 1)\"\n",
+                argv = argv.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script, perms).unwrap();
+
+        let backend = HplipBackend {
+            scanimage_helper_path: script,
+            ..HplipBackend::default()
+        };
+        let record = ProbeRecord {
+            device_uri: "hp:/net/HP_OfficeJet_Pro_8610?ip=192.168.1.3&queue=false".to_owned(),
+            sane_name: "hpaio:/net/HP_OfficeJet_Pro_8610?ip=192.168.1.3&queue=false".to_owned(),
+            model_name: "HP OfficeJet Pro 8610".to_owned(),
+            display_name: "HP OfficeJet Pro 8610".to_owned(),
+        };
+        let scanner = scanner_from_probe(record.clone(), &BTreeMap::new()).unwrap();
+        backend.remember_sane_names(std::slice::from_ref(&scanner));
+
+        let mut stream = backend.fetch_pages(&scanner.id, "job-1").await.unwrap();
+        while stream.next().await.is_some() {}
+
+        let arguments = fs::read_to_string(&argv).unwrap();
+        assert!(
+            arguments
+                .lines()
+                .any(|argument| argument == format!("--device-name={}", record.sane_name)),
+            "scanimage was called with {arguments:?}"
         );
     }
 }
