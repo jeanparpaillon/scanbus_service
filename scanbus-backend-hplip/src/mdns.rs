@@ -292,6 +292,8 @@ fn without_bracketed_tail(name: &str) -> &str {
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+    use scanbus_core::{ScannerId, Source, Value};
+
     use super::*;
 
     fn models(entries: &[(&str, i32)]) -> BTreeMap<String, ModelInfo> {
@@ -343,6 +345,12 @@ mod tests {
     }
 
     /// Captured from the development LAN with `avahi-browse -rpt _uscan._tcp`.
+    ///
+    /// The Brother records below are real; the HP ones in this module are constructed,
+    /// because there is no HP on this LAN to browse. They carry the eSCL key set the
+    /// Brother capture shows (`txtvers`, `vers`, `rs`, `ty`, `pdl`, `is`, `duplex`) with
+    /// HP's own `ty` spelling, bracketed serial tail included — the form HP's AirPrint
+    /// firmware publishes and the one `hp-probe`'s `Model` column agrees with.
     fn brother_uscan() -> ServiceInfo {
         record(
             "_uscan._tcp.local.",
@@ -480,6 +488,61 @@ mod tests {
                 model_name: "HP OfficeJet Pro 8610".to_owned(),
                 display_name: "HP OfficeJet Pro 8610 [1A2B3C]".to_owned(),
             }),
+        );
+    }
+
+    /// The whole path, from what the browse resolved to what the daemon publishes.
+    ///
+    /// The address a browsed device is published under is the bare IPv4, never the
+    /// `.local.` hostname mDNS also hands over: the daemon deduplicates one physical
+    /// device across backends by address, and `hplip` has to be the sighting that wins
+    /// over `escl` for the same MFP or the walk-up button is lost. The `ScannerId` is
+    /// derived from that same address, so it is stable across browses regardless of
+    /// which service type answered.
+    #[test]
+    fn a_browsed_device_is_published_under_its_ipv4_address() {
+        // scan_src 3 is flatbed|ADF, scan_type 6 is the duplex-capable scanner class.
+        let models = models(&[("hp_officejet_pro_8610", 6)]);
+        let records = hp_scan_records(
+            &[record(
+                "_uscan._tcp.local.",
+                "HP OfficeJet Pro 8610 [1A2B3C]",
+                &[
+                    ("txtvers", "1"),
+                    ("vers", "2.63"),
+                    ("rs", "eSCL"),
+                    ("ty", "HP OfficeJet Pro 8610 [1A2B3C]"),
+                    ("is", "platen,adf"),
+                    ("duplex", "T"),
+                ],
+            )],
+            &models,
+        );
+        let record = records.into_iter().next().expect("the HP is a scanner");
+
+        let scanner =
+            crate::scanner_from_probe(record, &models).expect("the record is publishable");
+
+        assert_eq!(scanner.address, "192.168.1.3");
+        assert_eq!(
+            scanner.id,
+            ScannerId::from_backend(crate::ID, "192.168.1.3").expect("the address is a valid id")
+        );
+        // The URI spelling of the model resolves back to its `models.dat` section, which
+        // is what a browsed device gets its sources and duplex from — the same
+        // enrichment an `hp-probe` record gets.
+        assert_eq!(scanner.capabilities.sources, [Source::Flatbed, Source::Adf]);
+        assert!(scanner.capabilities.duplex);
+        assert_eq!(
+            scanner
+                .capabilities
+                .extra
+                .get("hplip")
+                .and_then(crate::as_dict)
+                .and_then(|hplip| hplip.get("sane_name")),
+            Some(&Value::Str(
+                "hpaio:/net/HP_OfficeJet_Pro_8610?ip=192.168.1.3&queue=false".to_owned()
+            )),
         );
     }
 

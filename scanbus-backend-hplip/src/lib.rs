@@ -1266,6 +1266,25 @@ hp:/usb/officejet_8710_series?serial=CN1234ABCDE        HP OfficeJet 8710 series
         );
     }
 
+    /// The URI shape the mDNS path builds. `queue=false` is a field this function does
+    /// not know and must ignore rather than refuse, and `ip=` stays ahead of `hostname=`:
+    /// an mDNS resolution yields a `.local.` name *as well as* addresses, and publishing
+    /// the name would leave the daemon unable to match this sighting with the same
+    /// device seen over `escl`.
+    #[test]
+    fn an_mdns_uri_is_addressed_by_its_ipv4() {
+        assert_eq!(
+            physical_address_from_uri("hp:/net/HP_OfficeJet_Pro_8610?ip=192.168.1.3&queue=false"),
+            Some("192.168.1.3".to_owned())
+        );
+        assert_eq!(
+            physical_address_from_uri(
+                "hp:/net/HP_OfficeJet_Pro_8610?ip=192.168.1.3&hostname=HP8610.local.&queue=false"
+            ),
+            Some("192.168.1.3".to_owned())
+        );
+    }
+
     #[test]
     fn capabilities_follow_scan_src_and_plugin_flags() {
         let record = ProbeRecord {
