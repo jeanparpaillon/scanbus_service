@@ -6,7 +6,7 @@ Brother's website** — no `brscan4`/`brscan5`, no `brscan-skey` — for either 
 scanning.
 
 It supersedes the Brother half of
-[scanbus-rust-implementation.md](scanbus-rust-implementation.md) §4, which describes
+[scanbus-daemon-design.md](scanbus-daemon-design.md) §2, which describes
 `start_listening()` as spawning `brscan-skey` and `set_button_mapping()` as rewriting
 `brscan-skey.config`.
 

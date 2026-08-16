@@ -13,7 +13,7 @@ that its own spec does not say.
 ## 1. Why it looks nothing like Brother or HP
 
 Every assumption baked into `ScannerBackend`
-([scanbus-rust-implementation.md](scanbus-rust-implementation.md) §3) is inverted here,
+([scanbus-daemon-design.md](scanbus-daemon-design.md) §1) is inverted here,
 and each inversion is load-bearing rather than cosmetic:
 
 | | Brother / HP | Mobile |

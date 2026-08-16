@@ -2,7 +2,7 @@
 
 Companion to [scanbus-dbus-api.md](scanbus-dbus-api.md) (the contract),
 [scanbus-cli.md](scanbus-cli.md) (the other client) and
-[scanbus-rust-implementation.md](scanbus-rust-implementation.md) (the daemon). This document
+[scanbus-daemon-design.md](scanbus-daemon-design.md) (the daemon). This document
 describes a **client**: a GTK4/libadwaita application that speaks the API of §1–§9 and nothing
 else. It never opens a scanner, never touches `brscan-skey.config`, never installs a package.
 Where it needs a capability the daemon does not expose over D-Bus, that is a daemon issue —

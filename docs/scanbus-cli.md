@@ -1,7 +1,7 @@
 # `scanbus` — command-line client for the scanbus D-Bus API
 
 Companion to [scanbus-dbus-api.md](scanbus-dbus-api.md) (the contract) and
-[scanbus-rust-implementation.md](scanbus-rust-implementation.md) (the daemon). This document
+[scanbus-daemon-design.md](scanbus-daemon-design.md) (the daemon). This document
 describes a **client**: a binary named `scanbus` that speaks the API of §1–§8 and nothing else.
 It never opens a scanner, never touches `brscan-skey.config`, never installs a package. If the
 CLI needs a capability the daemon does not expose over D-Bus, that is a daemon issue, not a CLI

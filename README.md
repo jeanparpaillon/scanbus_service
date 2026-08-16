@@ -124,6 +124,18 @@ systemctl --user enable --now scanbus.service
 
 ## Documentation
 
+Split in two, because the two are read at different times — see `CLAUDE.md`.
+
+*Design*, read when scoping a change:
+
 - `docs/scanbus-dbus-api.md` — the D-Bus API this service implements
-- `docs/scanbus-rust-implementation.md` — implementation plan
+- `docs/scanbus-daemon-design.md` — the `ScannerBackend` trait, pairing, profile pipeline
+- `docs/scanbus-cli.md`, `docs/scanbus-gnome-gui.md` — the two clients
+- `docs/scanbus-mobile-backend.md`, `docs/brother-skeyless-backend.md`,
+  `docs/brother-brscan-arch.md` — per-backend design and vendor background
+
+*Development*, read when writing the code:
+
+- `docs/scanbus-rust-implementation.md` — workspace layout, dependencies, packaging, testing
+- `CONTRIBUTING.md` — the manual release checklist
 - `docs/todo/` — the issue backlog, one file per GitHub issue

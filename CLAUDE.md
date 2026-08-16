@@ -1,9 +1,48 @@
-# Documentation layout
+# Two documentation contexts
 
-- `README.md` — what the extension is for.
-- `docs/*scanbus-cli*.md` - specifications
-- `docs/todo/<n>_<n>.md` — one file per issue, submitted to GitHub with
-  `./scripts/submit_issue.sh docs/todo/3_1.md`.
+The docs are split by *when they are read*, not by subject. A task is either turning a
+user story into an issue (**arch context**) or turning an issue into code (**dev
+context**). Load one set, not both — that is the point of the split.
+
+## Arch context — story → issue
+
+What the system is and why. Read these when drafting or revising `docs/todo/<n>_<n>.md`.
+
+| Doc | What it settles |
+|---|---|
+| `docs/scanbus-dbus-api.md` | The contract: object tree, the four interfaces, profiles, errors. The other arch docs are written against it. |
+| `docs/scanbus-daemon-design.md` | Daemon side: the `ScannerBackend` trait, per-backend specifics, `PairingState`, the profile pipeline. |
+| `docs/scanbus-cli.md` | The `scanbus` CLI — a client, and its §11 deltas the daemon owes it. |
+| `docs/scanbus-gnome-gui.md` | The GTK4/libadwaita client, plus `docs/design/*.png`, the mockups it implements. |
+| `docs/scanbus-mobile-backend.md` | The mobile backend, where the phone dials us. §10 is the list of things the Android app owes its own spec. |
+| `docs/brother-skeyless-backend.md` | Brother with no vendor package. Supersedes the Brother half of the daemon design. |
+| `docs/brother-brscan-arch.md` | Vendor background only — how Brother's stack works. Read it to justify a design, not to implement one. |
+| `TODO.md` | Backlog of hardware and frontends not yet designed. Where a story comes from. |
+
+## Dev context — issue → code
+
+How the code is built. Read these when implementing an issue.
+
+| Doc | What it settles |
+|---|---|
+| `README.md` | The authoritative crate table, the one-way dependency rule, MSRV, the `cargo`/`make` invocations. Start here. |
+| `docs/scanbus-rust-implementation.md` | Workspace layout as planned, dependencies, development order, `.deb`/systemd/D-Bus packaging, testing strategy. |
+| `CONTRIBUTING.md` | The manual GUI release checklist, run on real hardware. |
+
+## Reading rules
+
+- **The issue is the brief.** When implementing, the GitHub issue plus dev context is
+  normally the whole of it.
+- **Follow `Context:`, do not sweep.** An issue's `Context:` header names one arch doc
+  and one section. Read that section when the code has to match a contract — not the
+  whole doc, and not its siblings.
+- `docs/scanbus-dbus-api.md` is the one arch doc regularly needed while coding, because
+  it is the wire contract. Read the interface being touched, not all nine sections.
+- **Do not read a doc "for background".** Every one of them is 200–600 lines of prose
+  arguing a decision; they cost more context than they return unless the task turns on
+  that decision.
+- **When code and doc disagree, the code is what ships** — say so in the issue or fix
+  the doc, do not silently follow either.
 
 # Issue format
 
@@ -15,7 +54,7 @@ lines, and uses **everything from the first `##` heading onward** as the issue b
 # 3.1 — Repoint brscan-skey at our scripts, reversibly
 
 **Workstream:** 3 — Scan actions
-**Context:** [design.md](../design.md) §2.1 — repoint, don't replace
+**Context:** [brother-skeyless-backend.md](../brother-skeyless-backend.md) §2 — repoint, don't replace
 **Requires:** [1.2]
 **State:** draft
 
@@ -57,19 +96,21 @@ Three sections, in this order:
   obvious way*. Where the plan departs from `README.md` or from what the Brother
   package does, say so and give the reason; that argument is the reason the issue
   exists and is what stops the decision being silently reverted later. Name the
-  concrete evidence — a config file's contents, a line from a stock script, a fact
-  from `docs/design.md` §1.
+  concrete evidence — a config file's contents, a line from a stock script, a section
+  of the arch doc named in `Context:`.
 - **Checklist** — `- [ ]` items, the work itself. Specific enough to disagree with.
 - **Acceptance** — `- [ ]` items, observable outcomes. What is run and what is seen,
   not "works correctly". Include the degraded and failure cases, not only the happy
   path.
 
-Cross-reference other issues as `[3.4](3_4.md)` and design sections as
-`[design.md](../design.md) §2.1`.
+**`Context:` must point at an arch doc and a section**, e.g.
+`[scanbus-dbus-api.md](../scanbus-dbus-api.md) §3`. It is what lets the implementer
+read one section instead of the set, so a link to a whole document is a defect in the
+issue. Cross-reference other issues as `[3.4](3_4.md)`.
 
 # Planning a task, then filing it
 
-Two steps, deliberately separate:
+Arch context. Two steps, deliberately separate:
 
 1. **Draft.** Write `docs/todo/<number with underscores>.md`. The format is what
    [scripts/submit_issue.sh](scripts/submit_issue.sh) parses, so it is not free
@@ -86,10 +127,13 @@ Two steps, deliberately separate:
 
 Needs `gh` (authenticated) and `gum`.
 
+If drafting reveals the arch doc is wrong or silent, fix the doc in the same change —
+an issue that carries design nobody can find later is how the split stops working.
+
 # Working an issue
 
-When working an issue, ask user whether to work on main checkout or a dedicated
-branch *and* a git worktree for it. If dedicated branch :
+Dev context. Ask the user whether to work on the main checkout or a dedicated branch
+*and* a git worktree for it. If dedicated branch:
 
 ```sh
 git worktree add .worktrees/<issue>-<topic> -b <issue>-<topic> origin/master
