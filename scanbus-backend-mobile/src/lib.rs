@@ -1,5 +1,7 @@
 //! Wire protocol primitives and backend plumbing for `scanbus-backend-mobile`.
 
+pub mod tls;
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -256,6 +258,13 @@ pub struct MobileBackend {
     /// What pairing issued, keyed by the scanner it belongs to.
     paired: Arc<Mutex<BTreeMap<ScannerId, PairedDevice>>>,
     store_path: Arc<PathBuf>,
+    /// The one certificate of §11.2, loaded once here and handed to both TLS
+    /// configurations. `None` is the §11.5 failure: an identity that could not be read
+    /// is reported and left alone, never regenerated, and the host simply has no TLS.
+    identity: Option<Arc<tls::HostIdentity>>,
+    /// Why, kept for the same reason [`ListenerBinding::bind_error`] is — the daemon has
+    /// to be able to say what is wrong with a scanner that came up unusable.
+    identity_error: Option<Arc<str>>,
     listener: Arc<Mutex<ListenerBinding>>,
     listener_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     subscriptions: Arc<Mutex<BTreeMap<ScannerId, mpsc::Sender<scanbus_core::ScanTrigger>>>>,
@@ -291,6 +300,34 @@ impl MobileBackend {
         } else {
             store.upload_port
         };
+        // Next to the device table, because §11.5 puts it there: one directory holds
+        // everything a pairing survives a restart on.
+        let identity_dir = store_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        let (identity, identity_error) = match tls::HostIdentity::load_or_generate(&identity_dir) {
+            Ok(identity) => {
+                debug!(
+                    dir = %identity_dir.display(),
+                    fingerprint = identity.fingerprint_sha256(),
+                    "mobile TLS identity ready"
+                );
+                (Some(Arc::new(identity)), None)
+            }
+            // Loud, and nothing else: §11.5's one irreversible mistake is to treat this
+            // as a first start and mint a new key over it.
+            Err(error) => {
+                let error = error.to_string();
+                warn!(
+                    dir = %identity_dir.display(),
+                    %error,
+                    "mobile TLS identity is unusable; it will not be regenerated and phones paired over TLS stay offline"
+                );
+                (None, Some(Arc::from(error.as_str())))
+            }
+        };
+
         let listener = bind_listener(configured_port);
         let upload_port = listener.port;
         if let Some(error) = listener.bind_error.as_ref() {
@@ -317,6 +354,8 @@ impl MobileBackend {
             discovered: Arc::new(Mutex::new(BTreeMap::new())),
             paired: Arc::new(Mutex::new(paired)),
             store_path: Arc::new(store_path),
+            identity,
+            identity_error,
             listener: Arc::new(Mutex::new(listener)),
             listener_task: Arc::new(Mutex::new(None)),
             subscriptions: Arc::new(Mutex::new(BTreeMap::new())),
@@ -337,6 +376,26 @@ impl MobileBackend {
             .lock()
             .expect("mobile listener lock poisoned")
             .is_bound()
+    }
+
+    /// The certificate both TLS configurations are built from, or `None` when the host
+    /// has no usable identity and therefore speaks no TLS at all.
+    pub fn identity(&self) -> Option<&tls::HostIdentity> {
+        self.identity.as_deref()
+    }
+
+    /// What the app pinned during pairing (§11.1). `None` for the same reason as above.
+    pub fn certificate_fingerprint(&self) -> Option<&str> {
+        self.identity
+            .as_deref()
+            .map(tls::HostIdentity::fingerprint_sha256)
+    }
+
+    /// Why there is no identity, in the words §11.5 wants logged. Shaped like the
+    /// listener's own bind error deliberately: both are startup failures that leave
+    /// paired phones unreachable rather than aborting the daemon.
+    pub fn identity_error(&self) -> Option<&str> {
+        self.identity_error.as_deref()
     }
 
     fn listener_error(&self) -> Option<String> {
@@ -1179,9 +1238,12 @@ fn constant_time_eq(left: &str, right: &str) -> bool {
 }
 
 fn hash_token(token: &str) -> String {
-    let digest = Sha256::digest(token.as_bytes());
-    let mut out = String::with_capacity(digest.len() * 2);
-    for byte in digest {
+    hex_lower(&Sha256::digest(token.as_bytes()))
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
         use fmt::Write as _;
         let _ = write!(out, "{byte:02x}");
     }
