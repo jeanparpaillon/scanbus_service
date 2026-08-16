@@ -77,14 +77,14 @@ install-hplip-services:
 	install -D -m 0644 packaging/dbus-1/services/scanbus-hplip-status.service \
 		"$(DESTDIR)$(DBUS_SERVICE_DIR)/scanbus-hplip-status.service"
 
-install-frontend: $(TARGET_DIR)/scanbus-gui
+install-frontend:
 	install -D -m 0755 "$(TARGET_DIR)/scanbus-gui" "$(DESTDIR)$(BINDIR)/scanbus-gui"
 	install -D -m 0644 packaging/applications/org.scanbus.Gui.desktop \
 		"$(DESTDIR)$(APPLICATIONS_DIR)/org.scanbus.Gui.desktop"
 	install -D -m 0644 packaging/autostart/org.scanbus.Gui.desktop \
 		"$(DESTDIR)$(AUTOSTART_DIR)/org.scanbus.Gui.desktop"
 
-install-backend: $(TARGET_DIR)/scanbus $(TARGET_DIR)/scanbus-daemon
+install-backend:
 	install -D -m 0755 "$(TARGET_DIR)/scanbus" "$(DESTDIR)$(BINDIR)/scanbus"
 	install -D -m 0755 "$(TARGET_DIR)/scanbus-daemon" "$(DESTDIR)$(BINDIR)/scanbus-daemon"
 	install -D -m 0755 packaging/libexec/scanbus/scanbus-scanimage \
@@ -93,7 +93,7 @@ install-backend: $(TARGET_DIR)/scanbus $(TARGET_DIR)/scanbus-daemon
 # One page per command, not just scanbus.1: the SUBCOMMANDS section of scanbus(1) is a
 # list of scanbus-scan(1)-style references that `man` resolves against installed files,
 # so shipping the top page alone leaves every one of them a dead link.
-install-doc: $(TARGET_DIR)/scanbus
+install-doc:
 	install -d "$(DESTDIR)$(MANDIR)/man1"
 	"$(TARGET_DIR)/scanbus" manpage --output-dir "$(DESTDIR)$(MANDIR)/man1"
 
