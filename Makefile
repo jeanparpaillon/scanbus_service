@@ -45,13 +45,13 @@ release:
 debug:
 	$(MAKE) CARGO_ENV=debug all
 
-$(TARGET_DIR)/scanbus:
+$(TARGET_DIR)/scanbus: FORCE
 	cargo build --package scanbus-cli --bin $(notdir $@) $(profile_opt)
 
-$(TARGET_DIR)/scanbus-daemon:
+$(TARGET_DIR)/scanbus-daemon: FORCE
 	cargo build --package scanbus-daemon --bin $(notdir $@) $(profile_opt) --features $(BACKENDS)
 
-$(TARGET_DIR)/scanbus-gui:
+$(TARGET_DIR)/scanbus-gui: FORCE
 	cargo build --package scanbus-gui --bin $(notdir $@) $(profile_opt)
 
 install: install-backend install-frontend install-services install-doc install-license
@@ -127,10 +127,10 @@ lint:
 	cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 clean:
-	cargo clean
+	cargo clean ${profile_opt}
 
 .PHONY: all release debug 
 .PHONY: install install-backend install-frontend install-services install-doc
 .PHONY: install-license install-copyright install-hplip-services
 .PHONY: deb version version-check version-sync
-.PHONY: reload test clean lint
+.PHONY: reload test clean lint FORCE
