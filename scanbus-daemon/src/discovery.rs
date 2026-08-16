@@ -320,21 +320,43 @@ async fn run_session(
     let probed: Vec<&'static str> = backends.iter().map(|entry| entry.backend.id()).collect();
 
     loop {
-        let found = probe(&backends).await;
+        let mut tasks = probe(&backends);
+        let mut seen = Vec::new();
+        let mut stop_requested = false;
 
-        // Checked after the probe rather than before publishing each scanner: a
-        // `StopDiscovery` that arrived while the round was in flight must not be
-        // followed by an `InterfacesAdded` for a scanner it was supposed to take away.
-        if *stopped.borrow() {
-            break;
+        // Published as each backend answers rather than after the whole round — see
+        // `probe`. Leaving the loop drops `tasks`, which aborts whatever is still in
+        // flight.
+        while let Some(result) = tasks.join_next().await {
+            let (backend, found) = match result {
+                Ok(batch) => batch,
+                // A panicking backend takes down its own probe and nothing else.
+                Err(error) => {
+                    warn!(%error, "a backend probe panicked");
+                    continue;
+                }
+            };
+
+            // Checked before each backend's scanners rather than once per round: a
+            // `StopDiscovery` that arrived while the round was in flight must not be
+            // followed by an `InterfacesAdded` for a scanner it was supposed to take
+            // away. Anything published before it arrived is taken away by the release
+            // path, which ends the session's objects.
+            if *stopped.borrow() {
+                stop_requested = true;
+                break;
+            }
+
+            for info in found {
+                seen.push(info.id.clone());
+                if let Err(error) = scanners.observe(&backend, info).await {
+                    warn!(%error, "could not publish a discovered scanner");
+                }
+            }
         }
 
-        let mut seen = Vec::with_capacity(found.len());
-        for (backend, info) in found {
-            seen.push(info.id.clone());
-            if let Err(error) = scanners.observe(&backend, info).await {
-                warn!(%error, "could not publish a discovered scanner");
-            }
+        if stop_requested {
+            break;
         }
 
         // The other half of a round: what the backends stopped finding. A paired scanner
@@ -363,10 +385,22 @@ async fn run_session(
 
 /// One round: every backend at once, each with its own timeout.
 ///
-/// The results are ordered by rank so that the better-ranked sighting of a device is
-/// the one [`ScannerRegistry::observe`](crate::scanners::ScannerRegistry::observe)
-/// sees first, which is what makes the precedence order decide a tie.
-async fn probe(backends: &[RankedBackend]) -> Vec<(RankedBackend, scanbus_core::ScannerInfo)> {
+/// Returns the tasks rather than their results, so the caller can publish a backend's
+/// scanners the moment that backend answers. Joining them all here first is what
+/// [`BACKEND_TIMEOUT`]'s "only as slow as its slowest *answering* backend" is meant to
+/// rule out, and did not: a backend that only ever times out held back everything the
+/// others had already found, for the full 10 s, every round. `scanbus discover`'s default
+/// `--for` is that same 10 s, so the batching version could publish a scanner
+/// microseconds after the CLI had given up and printed an empty table.
+///
+/// The cost is that [`RankedBackend::rank`] no longer settles which of two backends'
+/// sightings of one device is the published one. The registry keeps whichever arrives
+/// first and never replaces it (see [`crate::scanners`]), and that is now finishing
+/// order — so a fast generic backend can claim a device a vendor backend would have
+/// claimed, along with the buttons only the vendor backend can deliver. Rank still
+/// orders the scanners within one backend's answer, and is still what a filtered subset
+/// preserves.
+fn probe(backends: &[RankedBackend]) -> JoinSet<(RankedBackend, Vec<scanbus_core::ScannerInfo>)> {
     let mut tasks = JoinSet::new();
 
     for entry in backends {
@@ -377,13 +411,10 @@ async fn probe(backends: &[RankedBackend]) -> Vec<(RankedBackend, scanbus_core::
             let id = backend.id();
             let outcome = tokio::time::timeout(BACKEND_TIMEOUT, backend.discover()).await;
 
-            match outcome {
+            let found = match outcome {
                 Ok(Ok(scanners)) => {
                     debug!(backend = id, found = scanners.len(), "backend probed");
                     scanners
-                        .into_iter()
-                        .map(|info| (entry.clone(), info))
-                        .collect()
                 }
                 Ok(Err(error)) => {
                     // Logged and skipped: a backend that cannot probe is an environment
@@ -399,19 +430,11 @@ async fn probe(backends: &[RankedBackend]) -> Vec<(RankedBackend, scanbus_core::
                     );
                     Vec::new()
                 }
-            }
+            };
+
+            (entry, found)
         });
     }
 
-    let mut found = Vec::new();
-    while let Some(result) = tasks.join_next().await {
-        match result {
-            Ok(scanners) => found.extend(scanners),
-            // A panicking backend takes down its own probe and nothing else.
-            Err(error) => warn!(%error, "a backend probe panicked"),
-        }
-    }
-
-    found.sort_by_key(|(entry, _)| entry.rank);
-    found
+    tasks
 }

@@ -242,10 +242,20 @@ fn names_hp_device(name: &str) -> bool {
 ///   into `MDL:`), but AirPrint-style records often suffix it with the last bytes of the
 ///   serial — `HP OfficeJet Pro 8610 [1A2B3C]` — so the bracketed tail is tried off as
 ///   well as on;
-/// - `mdl` on `_scanner._tcp` omits the manufacturer, and `models.dat` sections include
-///   it, so `HP ` goes back in front;
+/// - `mdl` on `_scanner._tcp` omits the manufacturer where `ty` carries it, so each name
+///   is tried in both spellings (below);
 /// - the instance name is the last resort, and is what `libhpdiscovery` builds its URI
 ///   from — it carries no TXT keys at all in the shipped binary.
+///
+/// Both spellings, because `models.dat` uses both. Its sections are keyed off the
+/// IEEE-1284 `MDL:` field, which usually omits the manufacturer — this OfficeJet
+/// publishes `usb_MFG=HP;usb_MDL=OfficeJet 250 Mobile Series`, hence the section
+/// `[officejet_250_mobile_series]` — and keeps it only on the models whose own `MDL:`
+/// prints it, `[hp_laserjet_4ml]`. 571 of the 1457 sections in HPLIP 3.24.4 are of the
+/// first kind, so trying only the advertised `ty=HP OfficeJet 250 Mobile Series` misses
+/// them all and the device is dropped as "not an HP scanner". The advertised spelling is
+/// still tried first: where both sections exist (15 pairs, all duplicates of each other)
+/// it is the one the device names.
 fn model_candidates(service: &ServiceInfo, instance: &str) -> Vec<String> {
     let mut candidates = Vec::new();
     let mut push = |candidate: String| {
@@ -265,18 +275,35 @@ fn model_candidates(service: &ServiceInfo, instance: &str) -> Vec<String> {
         .chain([instance])
     {
         let name = name.trim();
-        let name = if names_hp_device(name) {
-            name.to_owned()
+        let alternative = if names_hp_device(name) {
+            without_vendor_prefix(name).to_owned()
         } else {
-            // A bare `mdl=OfficeJet Pro 8610`: the section names in models.dat all carry
-            // the manufacturer, so put it back rather than fail the lookup.
+            // A bare `mdl=OfficeJet Pro 8610`, for the sections that do carry the
+            // manufacturer.
             format!("HP {name}")
         };
-        push(without_bracketed_tail(&name).to_owned());
-        push(name);
+
+        for spelling in [name.to_owned(), alternative] {
+            push(without_bracketed_tail(&spelling).to_owned());
+            push(spelling);
+        }
     }
 
     candidates
+}
+
+/// `HP OfficeJet 250 Mobile Series` as `OfficeJet 250 Mobile Series`.
+///
+/// Only the leading manufacturer word, and only when it is one: the caller has already
+/// established that the record is HP's, so anything else here is part of the model.
+fn without_vendor_prefix(name: &str) -> &str {
+    let name = name.trim();
+    let (first, rest) = match name.find([' ', '_']) {
+        Some(split) => (&name[..split], name[split + 1..].trim()),
+        None => return name,
+    };
+
+    if is_hp_vendor(first) { rest } else { name }
 }
 
 /// `HP OfficeJet Pro 8610 [1A2B3C]` without its `[…]` tail.
@@ -461,6 +488,66 @@ mod tests {
         assert_eq!(
             hp_scan_model(&service, &models(&[("hp_officejet_pro_8610", 7)])).as_deref(),
             Some("HP OfficeJet Pro 8610"),
+        );
+    }
+
+    /// Captured from the development LAN with `avahi-browse -rpt _uscan._tcp`, and the
+    /// case that made the backend report no HP at all: `ty` leads with the manufacturer,
+    /// the section this device's `MDL:` names does not carry it, and the advertised
+    /// spelling alone therefore resolves to nothing. The model that comes back is the
+    /// de-prefixed one because it is what the hpmud URI has to say — HPLIP builds
+    /// `hp:/net/%s` out of `normalizeModelName(MDL)`, and this device's IPP record
+    /// spells that `usb_MFG=HP`, `usb_MDL=OfficeJet 250 Mobile Series`.
+    #[test]
+    fn an_hp_whose_models_dat_section_omits_the_manufacturer_still_resolves() {
+        let service = record(
+            "_uscan._tcp.local.",
+            "HP OfficeJet 250 Mobile Series [FE04C4]",
+            &[
+                ("txtvers", "1"),
+                ("vers", "2.5"),
+                ("rs", "eSCL"),
+                ("ty", "HP OfficeJet 250 Mobile Series"),
+                ("pdl", "application/octet-stream,application/pdf,image/jpeg"),
+                ("is", "adf"),
+                ("duplex", "F"),
+                ("mopria-certified", "1.3"),
+            ],
+        );
+
+        assert_eq!(
+            hp_scan_record(&service, &models(&[("officejet_250_mobile_series", 7)])),
+            Some(ProbeRecord {
+                device_uri: "hp:/net/OfficeJet_250_Mobile_Series?ip=192.168.1.3&queue=false"
+                    .to_owned(),
+                sane_name: "hpaio:/net/OfficeJet_250_Mobile_Series?ip=192.168.1.3&queue=false"
+                    .to_owned(),
+                model_name: "OfficeJet 250 Mobile Series".to_owned(),
+                // `ty` has no bracketed tail on this device, so the display name is it.
+                display_name: "HP OfficeJet 250 Mobile Series".to_owned(),
+            }),
+        );
+    }
+
+    /// The advertised spelling wins where `models.dat` ships both — 15 pairs in HPLIP
+    /// 3.24.4, e.g. `[hp_officejet_pro_8020_series]` alongside
+    /// `[officejet_pro_8020_series]` — so adding the de-prefixed candidate cannot move a
+    /// device that already resolved onto a different section.
+    #[test]
+    fn the_advertised_spelling_is_preferred_over_the_de_prefixed_one() {
+        let service = record(
+            "_uscan._tcp.local.",
+            "HP LaserJet 4ML",
+            &[("rs", "eSCL"), ("ty", "HP LaserJet 4ML")],
+        );
+
+        assert_eq!(
+            hp_scan_model(
+                &service,
+                &models(&[("hp_laserjet_4ml", 4), ("laserjet_4ml", 4)])
+            )
+            .as_deref(),
+            Some("HP LaserJet 4ML"),
         );
     }
 
