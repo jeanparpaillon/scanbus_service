@@ -19,6 +19,7 @@ use async_trait::async_trait;
 use futures_core::{Stream, stream::BoxStream};
 use if_addrs::{IfAddr, get_if_addrs};
 use rand::Rng;
+use rustls::pki_types::ServerName;
 use scanbus_backend_common::mdns;
 use scanbus_core::{
     BackendError, ButtonsCapability, Capabilities as ScannerCapabilities, ProfileKind, RawPage,
@@ -30,6 +31,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
+use tokio_rustls::TlsConnector;
+use tokio_rustls::client::TlsStream;
 use tracing::{debug, warn};
 
 /// Backend identifier, as reported by `ScannerBackend::id`.
@@ -563,8 +566,132 @@ impl MobileBackend {
                     .to_owned(),
             })?;
 
-        let mut socket = self.connect_to_record(&scanner.id, &record.address).await?;
+        // §11.3's port choice, and the whole of it: the key the phone advertised means it
+        // has a keystore identity to serve, its absence means it has none, and there is
+        // no third state to negotiate. Neither arm falls back to the other — see
+        // `dial_pairing_tls` on why the obvious cleartext retry is not there.
+        //
+        // One deadline covers the dial and, in the TLS arm, the handshake after it, so
+        // §11.3 costs no new timeout: a phone that accepts a connection and then stalls
+        // in the handshake still ends the pairing at the same 5 s as a phone that never
+        // accepted one.
+        let deadline = Instant::now() + self.connect_timeout;
+        let (response, tls) = match record.tls_address.as_deref() {
+            Some(tls_address) => {
+                let socket = self
+                    .dial_pairing_tls(&scanner.id, tls_address, deadline)
+                    .await?;
+                let response = self
+                    .pair_over(scanner, &record, tls_address, socket, progress)
+                    .await?;
+                // `true` is written here, in the arm that actually completed a handshake,
+                // and not from `record.tls_address.is_some()` at the store: §11.6 makes
+                // this flag the reason a later cleartext upload is refused, so it has to
+                // record what the connection was, never what was hoped for.
+                (response, true)
+            }
+            None => {
+                let socket = self.connect_to_record(&scanner.id, &record.address).await?;
+                let response = self
+                    .pair_over(scanner, &record, &record.address, socket, progress)
+                    .await?;
+                (response, false)
+            }
+        };
 
+        let device = PairedDevice {
+            device_id: response.device_id,
+            token_sha256: hash_token(&response.token),
+            profiles: response.capabilities.profiles,
+            paired_at: unix_timestamp_now(),
+            tls,
+        };
+        self.store_paired_device(&scanner.id, device)?;
+
+        Ok(())
+    }
+
+    /// Dials `address` and completes the TLS handshake of §11.3, inside what is left of
+    /// `deadline`.
+    ///
+    /// **There is no cleartext retry here, and adding one would undo the section.** A
+    /// phone that advertised `tlsport` and then cannot finish a handshake is broken, and
+    /// a quiet retry on the SRV port would hide that behind a pairing that merely looks
+    /// successful. The stronger reason is that an automatic downgrade is a path an
+    /// attacker gets to trigger: refusing the handshake is cheaper for them than
+    /// stripping the TXT key, and it would land in the same place.
+    async fn dial_pairing_tls(
+        &self,
+        scanner_id: &ScannerId,
+        address: &str,
+        deadline: Instant,
+    ) -> Result<TlsStream<TcpStream>, BackendError> {
+        // Already refused at the top of `pair` — a host with no identity has no client
+        // certificate to present and must not pair at all — so this is the shape of that
+        // check rather than a second policy.
+        let identity = self
+            .identity
+            .as_ref()
+            .ok_or_else(|| BackendError::NotReachable {
+                scanner: scanner_id.clone(),
+                detail: "this host has no TLS identity to present as a client certificate"
+                    .to_owned(),
+            })?;
+
+        // The address is an IP literal, so this is an `IpAddress` name and `rustls` sends
+        // no SNI — correct for one, and irrelevant to the other: nothing in the name is
+        // checked at either end (§11.3). It is parsed rather than invented so that a
+        // certificate a future version *did* verify would be verified against the thing
+        // that was actually dialled.
+        let server_name = ServerName::from(
+            address
+                .parse::<SocketAddr>()
+                .map_err(|error| BackendError::NotReachable {
+                    scanner: scanner_id.clone(),
+                    detail: format!("could not parse discovered TLS address {address}: {error}"),
+                })?
+                .ip(),
+        );
+
+        let socket = self.connect_to_record(scanner_id, address).await?;
+        let connector = TlsConnector::from(identity.pairing_client_config());
+
+        timeout(
+            deadline.saturating_duration_since(Instant::now()),
+            connector.connect(server_name, socket),
+        )
+        .await
+        .map_err(|_| BackendError::NotReachable {
+            scanner: scanner_id.clone(),
+            detail: format!(
+                "{address} accepted a connection but did not complete a TLS handshake within \
+				 the {:?} pairing budget",
+                self.connect_timeout
+            ),
+        })?
+        .map_err(|error| BackendError::NotReachable {
+            scanner: scanner_id.clone(),
+            detail: format!(
+                "the TLS handshake with {address} failed: {error}; the phone advertised that \
+				 port as its TLS one, so this pairing is not retried in cleartext"
+            ),
+        })
+    }
+
+    /// The handshake itself, over whichever of the two connections §11.3 chose.
+    ///
+    /// Generic over the socket rather than taking an enum of the two, because nothing in
+    /// here may depend on which one it got: the frames on a TLS pairing are byte-identical
+    /// to the frames on a cleartext one, and that is what keeps `pair_request` and
+    /// `pair_response` unchanged by §11.
+    async fn pair_over<S: AsyncRead + AsyncWrite + Unpin + Send>(
+        &self,
+        scanner: &ScannerInfo,
+        record: &DiscoveryRecord,
+        dialled: &str,
+        mut socket: S,
+        progress: &mpsc::Sender<scanbus_core::PairingProgress>,
+    ) -> Result<PairResponse, BackendError> {
         // Nothing below ever logs `nonce`: it is the whole security value of the
         // comparison, and a code sitting in a log is a code an attacker can replay.
         let nonce = generate_nonce();
@@ -587,7 +714,7 @@ impl MobileBackend {
         .await
         .map_err(|error| BackendError::NotReachable {
             scanner: scanner.id.clone(),
-            detail: format!("could not send pair_request to {}: {error}", record.address),
+            detail: format!("could not send pair_request to {dialled}: {error}"),
         })?;
 
         // Announced only once the request is on the wire, so a client cannot be showing
@@ -649,20 +776,7 @@ impl MobileBackend {
             ));
         }
 
-        let device = PairedDevice {
-            device_id: response.device_id,
-            token_sha256: hash_token(&response.token),
-            profiles: response.capabilities.profiles,
-            paired_at: unix_timestamp_now(),
-            // Cleartext, and recorded as such. The `tlsport` TXT key and the TLS dial of
-            // §11.3 are not wired yet, so every pairing this build makes is one §11.6
-            // describes: unencrypted, marked, and never retroactively upgraded. The flag
-            // is set from how the dial actually went, never from what was intended.
-            tls: false,
-        };
-        self.store_paired_device(&scanner.id, device)?;
-
-        Ok(())
+        Ok(response)
     }
 
     /// The most recent sighting of `scanner`, if one is still live.
@@ -2120,14 +2234,39 @@ mod tests {
     /// [9.6]: https://github.com/jeanparpaillon/scanbus_service/issues/45
     struct FakePhone {
         address: String,
+        /// The second port of §11.3, when this phone has a keystore identity — what it
+        /// would advertise as `tlsport`.
+        tls_address: Option<String>,
         /// What the phone read out of `pair_request`, once it has.
         request: Arc<Mutex<Option<PairRequest>>>,
         /// Set when the connection reached end-of-file — what `CancelPairing()` looks
         /// like from the app's side.
         disconnected: Arc<Mutex<bool>>,
+        /// The client certificate the host presented, which is the thing the real app
+        /// pins (§11.2).
+        client_certificate: Arc<Mutex<Option<rustls::pki_types::CertificateDer<'static>>>>,
+        /// How many times the cleartext SRV port was dialled. Zero is the assertion in
+        /// every TLS test: §11.3 keeps that port cleartext forever, so a host that
+        /// touches it has either ignored `tlsport` or retried after a failed handshake.
+        cleartext_dials: Arc<AtomicU64>,
+    }
+
+    /// What the phone serves on its second port, if it has one (§11.3).
+    #[derive(Clone, Copy)]
+    enum PhoneTls {
+        /// No `tlsport` in TXT: a phone with no keystore identity, or one built before
+        /// §11.
+        None,
+        /// A TLS port with its own self-signed keystore certificate, offering these
+        /// protocol versions.
+        Serves(&'static [&'static rustls::SupportedProtocolVersion]),
+        /// A port advertised as TLS that answers with something else. A broken phone —
+        /// and the case a cleartext retry would paper over.
+        Broken,
     }
 
     /// How the phone answers, once it has read the request.
+    #[derive(Clone, Copy)]
     enum Answer {
         /// Accept, with this `device_id` — the same one it advertised, or another.
         Accept { device_id: &'static str },
@@ -2139,66 +2278,69 @@ mod tests {
 
     impl FakePhone {
         async fn listen(answer: Answer) -> Self {
+            Self::listen_with_tls(answer, PhoneTls::None).await
+        }
+
+        async fn listen_with_tls(answer: Answer, tls: PhoneTls) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap().to_string();
             let request = Arc::new(Mutex::new(None));
             let disconnected = Arc::new(Mutex::new(false));
+            let client_certificate = Arc::new(Mutex::new(None));
+            let cleartext_dials = Arc::new(AtomicU64::new(0));
 
             let seen = Arc::clone(&request);
             let closed = Arc::clone(&disconnected);
+            let dials = Arc::clone(&cleartext_dials);
             tokio::spawn(async move {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let frame = read_frame(&mut socket, FrameKind::Control, DEFAULT_CONTROL_MAX_BYTES)
-                    .await
-                    .unwrap();
-                let Message::PairRequest(pair_request) = parse_control_message(&frame).unwrap()
-                else {
-                    panic!("the host sent something that is not a pair_request");
-                };
-                *seen.lock().unwrap() = Some(pair_request);
-
-                let response = match answer {
-                    Answer::Accept { device_id } => PairResponse {
-                        accepted: true,
-                        device_id: device_id.to_owned(),
-                        capabilities: Capabilities {
-                            profiles: vec![ProfileKind::Image],
-                        },
-                        token: "phone-token".to_owned(),
-                    },
-                    Answer::Reject => PairResponse {
-                        accepted: false,
-                        device_id: DEVICE_ID.to_owned(),
-                        capabilities: Capabilities::default(),
-                        token: String::new(),
-                    },
-                    Answer::Silence => {
-                        // Nothing is sent, and the socket is held open: the host has to
-                        // be the one that gives up. Reading is how the app notices the
-                        // host closing it, which is what `CancelPairing()` does.
-                        let mut byte = [0_u8; 1];
-                        if socket.read(&mut byte).await.unwrap_or(0) == 0 {
-                            *closed.lock().unwrap() = true;
-                        }
-                        return;
-                    }
-                };
-
-                let payload = serialize_control_message(&Message::PairResponse(response)).unwrap();
-                write_frame(
-                    &mut socket,
-                    FrameKind::Control,
-                    &payload,
-                    DEFAULT_CONTROL_MAX_BYTES,
-                )
-                .await
-                .unwrap();
+                let (socket, _) = listener.accept().await.unwrap();
+                dials.fetch_add(1, Ordering::SeqCst);
+                answer_pairing(socket, answer, seen, closed).await;
             });
+
+            let tls_address = match tls {
+                PhoneTls::None => None,
+                PhoneTls::Serves(versions) => {
+                    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let tls_address = listener.local_addr().unwrap().to_string();
+                    let config = Arc::new(phone_server_config(
+                        versions,
+                        Arc::clone(&client_certificate),
+                    ));
+                    let seen = Arc::clone(&request);
+                    let closed = Arc::clone(&disconnected);
+                    tokio::spawn(async move {
+                        let (socket, _) = listener.accept().await.unwrap();
+                        let socket = tokio_rustls::TlsAcceptor::from(config)
+                            .accept(socket)
+                            .await
+                            .expect("the host completed the handshake");
+                        answer_pairing(socket, answer, seen, closed).await;
+                    });
+                    Some(tls_address)
+                }
+                PhoneTls::Broken => {
+                    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let tls_address = listener.local_addr().unwrap().to_string();
+                    tokio::spawn(async move {
+                        let (mut socket, _) = listener.accept().await.unwrap();
+                        // The pairing framing, on the port it said was TLS. Not noise: a
+                        // phone that got its two ports the wrong way round is the most
+                        // likely form of this bug, and it is the one a cleartext retry
+                        // would turn into a silent downgrade.
+                        let _ = socket.write_all(b"\0\0\0\x04null").await;
+                    });
+                    Some(tls_address)
+                }
+            };
 
             Self {
                 address,
+                tls_address,
                 request,
                 disconnected,
+                client_certificate,
+                cleartext_dials,
             }
         }
 
@@ -2209,10 +2351,161 @@ mod tests {
                 .as_ref()
                 .map(|request| request.nonce.clone())
         }
+
+        /// The certificate the host presented as a client certificate, i.e. what the app
+        /// would pin.
+        fn pinned_certificate(&self) -> Option<rustls::pki_types::CertificateDer<'static>> {
+            self.client_certificate.lock().unwrap().clone()
+        }
+
+        fn cleartext_dials(&self) -> u64 {
+            self.cleartext_dials.load(Ordering::SeqCst)
+        }
+    }
+
+    /// One pairing, over whichever of the phone's two ports the host chose.
+    async fn answer_pairing<S: AsyncRead + AsyncWrite + Unpin>(
+        mut socket: S,
+        answer: Answer,
+        seen: Arc<Mutex<Option<PairRequest>>>,
+        closed: Arc<Mutex<bool>>,
+    ) {
+        let frame = read_frame(&mut socket, FrameKind::Control, DEFAULT_CONTROL_MAX_BYTES)
+            .await
+            .unwrap();
+        let Message::PairRequest(pair_request) = parse_control_message(&frame).unwrap() else {
+            panic!("the host sent something that is not a pair_request");
+        };
+        *seen.lock().unwrap() = Some(pair_request);
+
+        let response = match answer {
+            Answer::Accept { device_id } => PairResponse {
+                accepted: true,
+                device_id: device_id.to_owned(),
+                capabilities: Capabilities {
+                    profiles: vec![ProfileKind::Image],
+                },
+                token: "phone-token".to_owned(),
+            },
+            Answer::Reject => PairResponse {
+                accepted: false,
+                device_id: DEVICE_ID.to_owned(),
+                capabilities: Capabilities::default(),
+                token: String::new(),
+            },
+            Answer::Silence => {
+                // Nothing is sent, and the socket is held open: the host has to be the
+                // one that gives up. Reading is how the app notices the host closing it,
+                // which is what `CancelPairing()` does.
+                let mut byte = [0_u8; 1];
+                if socket.read(&mut byte).await.unwrap_or(0) == 0 {
+                    *closed.lock().unwrap() = true;
+                }
+                return;
+            }
+        };
+
+        let payload = serialize_control_message(&Message::PairResponse(response)).unwrap();
+        write_frame(
+            &mut socket,
+            FrameKind::Control,
+            &payload,
+            DEFAULT_CONTROL_MAX_BYTES,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// The phone's side of the pairing TLS: a fresh self-signed `CN=scanbus` keystore
+    /// certificate that nothing on the host could ever vouch for, and a
+    /// `CertificateRequest` with **no** `certificate_authorities` — which is the shape
+    /// §11.3 warns a client library can silently decline to answer.
+    fn phone_server_config(
+        versions: &[&'static rustls::SupportedProtocolVersion],
+        seen: Arc<Mutex<Option<rustls::pki_types::CertificateDer<'static>>>>,
+    ) -> rustls::ServerConfig {
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut params = rcgen::CertificateParams::default();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "scanbus");
+        let certificate = params.self_signed(&key_pair).unwrap();
+
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
+            .with_protocol_versions(versions)
+            .unwrap()
+            .with_client_cert_verifier(Arc::new(PhoneAcceptsAnyClient { seen, provider }))
+            .with_single_cert(
+                vec![certificate.der().clone()],
+                rustls::pki_types::PrivatePkcs8KeyDer::from(key_pair.serialize_der()).into(),
+            )
+            .unwrap()
+    }
+
+    /// The app does not validate the certificate it is about to pin — it pins it. This
+    /// records it instead, which is the same thing minus the storage.
+    #[derive(Debug)]
+    struct PhoneAcceptsAnyClient {
+        seen: Arc<Mutex<Option<rustls::pki_types::CertificateDer<'static>>>>,
+        provider: Arc<rustls::crypto::CryptoProvider>,
+    }
+
+    impl rustls::server::danger::ClientCertVerifier for PhoneAcceptsAnyClient {
+        fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+            &[]
+        }
+
+        fn verify_client_cert(
+            &self,
+            end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+            *self.seen.lock().unwrap() = Some(end_entity.clone().into_owned());
+            Ok(rustls::server::danger::ClientCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls12_signature(
+                message,
+                cert,
+                dss,
+                &self.provider.signature_verification_algorithms,
+            )
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls13_signature(
+                message,
+                cert,
+                dss,
+                &self.provider.signature_verification_algorithms,
+            )
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            self.provider
+                .signature_verification_algorithms
+                .supported_schemes()
+        }
     }
 
     /// What the fake phone puts in its TXT `id`.
     const DEVICE_ID: &str = "phone_a1b2c3";
+
+    /// A phone with no TLS 1.3 — every Android 8 and 9 one (§11.3).
+    const TLS12_ONLY: &[&rustls::SupportedProtocolVersion] = &[&rustls::version::TLS12];
 
     fn scanner_id() -> ScannerId {
         ScannerId::from_backend(ID, DEVICE_ID).unwrap()
@@ -2232,6 +2525,18 @@ mod tests {
     /// A backend that has just seen `address`, with the handshake deadlines shortened so
     /// a timeout is observable inside a test.
     fn backend_that_saw(address: &str) -> (TempDir, MobileBackend) {
+        backend_that_saw_ports(address, None)
+    }
+
+    /// The same, for a phone that also advertised a `tlsport`.
+    fn backend_that_saw_phone(phone: &FakePhone) -> (TempDir, MobileBackend) {
+        backend_that_saw_ports(&phone.address, phone.tls_address.clone())
+    }
+
+    fn backend_that_saw_ports(
+        address: &str,
+        tls_address: Option<String>,
+    ) -> (TempDir, MobileBackend) {
         let tmp = TempDir::new().unwrap();
         let backend = backend_in(&tmp)
             .with_pairing_timeouts(Duration::from_millis(200), Duration::from_millis(200));
@@ -2240,7 +2545,7 @@ mod tests {
             DiscoveryRecord {
                 device_id: DEVICE_ID.to_owned(),
                 address: address.to_owned(),
-                tls_address: None,
+                tls_address,
                 seen_at: Instant::now(),
             },
         )]);
@@ -2296,6 +2601,99 @@ mod tests {
             backend.advertised_profiles(&scanner_id()),
             vec![ProfileKind::Image]
         );
+        // No `tlsport` was advertised, so the pairing was cleartext and is recorded as
+        // such — §11.6's "never retroactively upgraded" starts here.
+        assert!(!backend.lock_paired()[&scanner_id()].tls);
+    }
+
+    /// §11.3 and §11.2 together, and the one test that would catch a second certificate
+    /// being minted for either role: the host dials the advertised `tlsport`, and what
+    /// arrives at the phone as a client certificate is the identity the upload listener
+    /// will present.
+    #[tokio::test]
+    async fn a_phone_that_advertises_tlsport_is_dialled_there_and_pinned_to_our_certificate() {
+        let phone = FakePhone::listen_with_tls(
+            Answer::Accept {
+                device_id: DEVICE_ID,
+            },
+            PhoneTls::Serves(rustls::ALL_VERSIONS),
+        )
+        .await;
+        let (_tmp, backend) = backend_that_saw_phone(&phone);
+
+        let (outcome, steps) = pair_with(&backend).await;
+        outcome.unwrap();
+
+        let pinned = phone
+            .pinned_certificate()
+            .expect("the phone was sent a client certificate to pin");
+        assert_eq!(
+            hex_lower(&Sha256::digest(pinned.as_ref())),
+            backend.certificate_fingerprint().unwrap()
+        );
+        assert_eq!(&pinned, backend.identity().unwrap().certificate());
+
+        // The SRV port is cleartext forever (§11.3): a host that touched it here either
+        // ignored `tlsport` or retried after the handshake.
+        assert_eq!(phone.cleartext_dials(), 0);
+        assert!(backend.lock_paired()[&scanner_id()].tls);
+
+        // And the pairing itself is unchanged by the transport: same six digits, same
+        // frames, same stored token.
+        let [scanbus_core::PairingProgress::AwaitingConfirmation { code }] = steps.as_slice()
+        else {
+            panic!("expected one AwaitingConfirmation, got {steps:?}");
+        };
+        assert_eq!(phone.nonce_shown().as_deref(), Some(code.as_str()));
+        assert!(backend.is_authorized(DEVICE_ID, "phone-token"));
+    }
+
+    /// Android 8 and 9 have no TLS 1.3, and §11.3 accepts 1.2 rather than refusing those
+    /// phones for a guarantee the six digits already give.
+    #[tokio::test]
+    async fn a_phone_that_offers_only_tls_1_2_still_pairs() {
+        let phone = FakePhone::listen_with_tls(
+            Answer::Accept {
+                device_id: DEVICE_ID,
+            },
+            PhoneTls::Serves(TLS12_ONLY),
+        )
+        .await;
+        let (_tmp, backend) = backend_that_saw_phone(&phone);
+
+        pair_with(&backend).await.0.unwrap();
+
+        assert!(phone.pinned_certificate().is_some());
+        assert!(backend.lock_paired()[&scanner_id()].tls);
+    }
+
+    /// The rule with no second chance: a phone that advertised `tlsport` and cannot
+    /// finish a handshake there is broken, and the SRV port that would have worked is
+    /// left alone. An automatic downgrade is something an attacker gets to trigger, and
+    /// it is cheaper for them to break a handshake than to strip the TXT key.
+    #[tokio::test]
+    async fn a_tlsport_that_does_not_speak_tls_is_not_retried_in_cleartext() {
+        let phone = FakePhone::listen_with_tls(
+            Answer::Accept {
+                device_id: DEVICE_ID,
+            },
+            PhoneTls::Broken,
+        )
+        .await;
+        let (_tmp, backend) = backend_that_saw_phone(&phone);
+
+        let (outcome, steps) = pair_with(&backend).await;
+
+        let error = outcome.expect_err("a failed handshake ends the pairing");
+        assert!(
+            matches!(&error, BackendError::NotReachable { detail, .. } if detail.contains("not retried in cleartext")),
+            "{error:?}"
+        );
+        assert_eq!(phone.cleartext_dials(), 0);
+        // No code was ever shown, so nothing asked a human to confirm a pairing that was
+        // never going to be stored.
+        assert!(steps.is_empty(), "{steps:?}");
+        assert!(backend.lock_paired().is_empty());
     }
 
     /// The phone advertised what it can do, so `SupportedProfiles` says that and not the

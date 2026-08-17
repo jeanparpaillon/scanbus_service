@@ -19,9 +19,12 @@ use rcgen::{
     CertificateParams, DnType, ExtendedKeyUsagePurpose, KeyPair, KeyUsagePurpose,
     PKCS_ECDSA_P256_SHA256, date_time_ymd,
 };
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::CryptoProvider;
 use rustls::pki_types::pem::PemObject;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use rustls::sign::CertifiedKey;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
+use rustls::sign::{CertifiedKey, SingleCertAndKey};
+use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 use sha2::{Digest, Sha256};
 
 /// The certificate, next to the device table of §8. It is public by nature — it is the
@@ -57,6 +60,7 @@ const NOT_AFTER_YMD: (i32, u8, u8) = (4096, 1, 1);
 pub struct HostIdentity {
     certified_key: Arc<CertifiedKey>,
     fingerprint: String,
+    pairing_client_config: Arc<ClientConfig>,
 }
 
 /// Redacted, like `PairedDevice`: the certificate bytes are noise
@@ -129,6 +133,17 @@ impl HostIdentity {
     /// to log.
     pub fn fingerprint_sha256(&self) -> &str {
         &self.fingerprint
+    }
+
+    /// The configuration for the one connection this host dials: the pairing connection
+    /// of §11.3, where the host is the TLS **client** and this certificate is the client
+    /// certificate the phone pins.
+    ///
+    /// Built once, here, and shared by every pairing — the config is immutable and
+    /// `rustls` takes it by `Arc` anyway, so a per-pairing build would only be a chance
+    /// for the two to drift.
+    pub fn pairing_client_config(&self) -> Arc<ClientConfig> {
+        Arc::clone(&self.pairing_client_config)
     }
 
     fn load(cert_path: &Path, key_path: &Path) -> Result<Self, IdentityError> {
@@ -213,17 +228,122 @@ impl HostIdentity {
         // installed depends on load order and on which crate got there first, and this
         // identity has to be the one `ring` can use, since that is the provider both
         // configurations are built with (§11 dependency notes in the workspace manifest).
-        let certified_key = CertifiedKey::from_der(
-            vec![certificate],
-            key,
-            &rustls::crypto::ring::default_provider(),
-        )
-        .map_err(IdentityError::Unusable)?;
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let certified_key = Arc::new(
+            CertifiedKey::from_der(vec![certificate], key, &provider)
+                .map_err(IdentityError::Unusable)?,
+        );
+
+        // Built here rather than at the first pairing so that a configuration `rustls`
+        // will not accept is a startup failure with the rest of §11.5, and not a pairing
+        // that fails on somebody's phone months later.
+        let pairing_client_config =
+            build_pairing_client_config(&provider, Arc::clone(&certified_key))
+                .map_err(IdentityError::Unusable)?;
 
         Ok(Self {
-            certified_key: Arc::new(certified_key),
+            certified_key,
             fingerprint,
+            pairing_client_config: Arc::new(pairing_client_config),
         })
+    }
+}
+
+/// The `ClientConfig` of §11.3, and the only one in this crate.
+///
+/// Two things in it would be defects anywhere else, so they are stated here rather than
+/// left to be discovered in review:
+///
+/// - **The phone's certificate is not verified.** [`AcceptAnyPhone`] returns success for
+///   any chain. That is not the hole it looks like: the certificate is a self-signed
+///   keystore certificate with `CN=scanbus`, from a phone this host has never spoken to,
+///   reached at an IP address no name could match — there is nothing on this host that
+///   could vouch for it, and no answer it could give that would mean anything. The phone
+///   is not the identity being established here; *we* are, by the client certificate
+///   below. What confirms the pairing in both directions is the six digits.
+/// - **The client certificate is sent unconditionally.** [`SingleCertAndKey`] ignores the
+///   `certificate_authorities` hint, and the phone's `CertificateRequest` carries none
+///   because it accepts any issuer. A resolver that only answered for a recognised CA
+///   would send nothing, the phone would refuse with "the computer sent no certificate to
+///   pin", and the failure would read as a phone bug.
+///
+/// The verifier is private to this module and is constructed nowhere else, which is what
+/// keeps it off the upload listener's configuration (§11.4) — there, the host is the
+/// server and verifies nothing at all.
+fn build_pairing_client_config(
+    provider: &Arc<CryptoProvider>,
+    certified_key: Arc<CertifiedKey>,
+) -> Result<ClientConfig, rustls::Error> {
+    Ok(ClientConfig::builder_with_provider(Arc::clone(provider))
+        // TLS 1.3 and 1.2, which is what "safe defaults" means for a `tls12` build:
+        // Android 8 and 9 offer no 1.3, and refusing those phones buys nothing the pin
+        // does not already give (§11.3).
+        .with_safe_default_protocol_versions()?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAnyPhone {
+            provider: Arc::clone(provider),
+        }))
+        .with_client_cert_resolver(Arc::new(SingleCertAndKey::from(certified_key))))
+}
+
+/// Accepts any certificate a phone presents while pairing. See
+/// [`build_pairing_client_config`] for why, and keep this private so that "which configs
+/// can reach it" stays a one-line answer.
+#[derive(Debug)]
+struct AcceptAnyPhone {
+    provider: Arc<CryptoProvider>,
+}
+
+impl ServerCertVerifier for AcceptAnyPhone {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    // The two below are *not* waved through with the identity. They check that the peer
+    // holds the private key for the certificate it just presented, which is a property of
+    // the handshake rather than a claim about who the phone is, and it is what stops a
+    // machine in the middle from replaying somebody else's certificate into this
+    // connection. Delegating to the provider's own implementation is also how they stay
+    // correct across a rustls upgrade.
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
@@ -376,6 +496,25 @@ mod tests {
             "{error:?}"
         );
         assert!(dir.path().join(KEY_FILE).exists(), "key was left alone");
+    }
+
+    /// §11.3's warning about client libraries that only answer for a recognised CA,
+    /// asserted where it can be asserted without a phone: the phone's
+    /// `CertificateRequest` carries no `certificate_authorities`, which reaches the
+    /// resolver as an empty hint list, and the certificate must go out anyway.
+    #[test]
+    fn the_pairing_config_sends_our_certificate_against_an_empty_ca_hint() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let identity = HostIdentity::load_or_generate(dir.path()).expect("first start generates");
+
+        let resolved = identity
+            .pairing_client_config()
+            .client_auth_cert_resolver
+            .resolve(&[], &[rustls::SignatureScheme::ECDSA_NISTP256_SHA256])
+            .expect("a CertificateRequest with no acceptable issuers is still answered");
+
+        // The same certificate, not merely an equivalent one: this is the pin (§11.2).
+        assert_eq!(resolved.cert, identity.certified_key().cert);
     }
 
     /// A key that does not belong to the certificate is caught at load, not at the first
