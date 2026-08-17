@@ -54,10 +54,13 @@ use scanbus_core::{
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+pub mod listener;
 pub mod registrar;
 pub mod skey;
 
+use listener::{BindError, Inert, Listener};
 use registrar::{SnmpTransport, UdpSnmp, probe_scan_to_pc};
+use skey::register::LISTENER_PORT;
 use skey::snmp::DEFAULT_COMMUNITY;
 
 /// Backend identifier, as it will be reported by [`ScannerBackend::id`].
@@ -145,6 +148,12 @@ pub struct BrotherBackend {
     /// and read at discovery time — see [`BrotherBackend::note_scan_to_pc`] for why the
     /// question is not asked on every discovery instead.
     scan_to_pc: Arc<Mutex<BTreeMap<ScannerId, ScanToPc>>>,
+    /// The one UDP/54925 socket every paired Brother sends its panel presses to.
+    ///
+    /// Shared with every clone of the backend, because the port is a process-wide resource
+    /// and not a per-scanner one ([`listener`]). Binds nothing until the first
+    /// [`start_listening`](ScannerBackend::start_listening).
+    listener: Arc<Listener>,
 }
 
 impl Default for BrotherBackend {
@@ -156,6 +165,7 @@ impl Default for BrotherBackend {
             runner: Arc::new(SystemCommandRunner),
             transport: Arc::new(UdpSnmp::default()),
             scan_to_pc: Arc::new(Mutex::new(BTreeMap::new())),
+            listener: Arc::new(Listener::new(LISTENER_PORT)),
         }
     }
 }
@@ -392,6 +402,66 @@ impl BrotherBackend {
             .lock()
             .expect("scan-to-PC notes")
             .insert(scanner.id.clone(), note);
+    }
+
+    /// The address this scanner's presses will arrive from, or why none ever will.
+    ///
+    /// Both answers come from what the *device* said or from what discovery found, never
+    /// from a guess about the model: a printer that was switched off during pairing is
+    /// absent from the scan-to-PC notes rather than recorded as key-less
+    /// ([`note_scan_to_pc`](Self::note_scan_to_pc)), so it gets a real listener and a
+    /// chance to work.
+    fn listen_target(&self, scanner: &ScannerInfo) -> Result<Ipv4Addr, String> {
+        let Some(device) = device_ipv4(scanner) else {
+            return Err(match usb_endpoint(&scanner.address) {
+                Some(endpoint) => format!(
+                    "{endpoint} is a USB connection, and scan-to-PC registration is a network \
+                     protocol"
+                ),
+                None => format!(
+                    "discovery found no IPv4 address for {}, so nothing can be registered to \
+                     send here",
+                    scanner.address
+                ),
+            });
+        };
+        match self
+            .scan_to_pc
+            .lock()
+            .expect("scan-to-PC notes")
+            .get(&scanner.id)
+        {
+            Some(ScanToPc::Unavailable { reason }) => Err(reason.clone()),
+            Some(ScanToPc::Available) | None => Ok(device),
+        }
+    }
+
+    /// What to tell the user when UDP/54925 already has an owner.
+    ///
+    /// The package check is what makes the message worth reading: naming `brscan-skey` on a
+    /// machine that has never had it installed would send someone hunting a package that is
+    /// not there, and naming "another process" on a machine where it *is* installed would
+    /// hide the answer. Only reached on a failed bind, so its `dpkg-query` costs nothing in
+    /// the normal path.
+    fn port_taken(&self, port: u16) -> String {
+        let shared = format!(
+            "scanbus will not share UDP/{port}: the kernel would hand each panel press to one \
+             of the two processes at random, so every other press would go missing. This \
+             scanner stays discovered and can still be scanned from the host; only its panel \
+             keys are unavailable."
+        );
+        match self.package_presence(BRSCAN_SKEY_PROBE).unwrap_or_default() {
+            Presence::Present => format!(
+                "UDP/{port} is already bound, and brscan-skey is installed on this machine, \
+                 which is what holds it. Stop it with `brscan-skey -t`, keep whatever launches \
+                 it from starting it again, and connect this scanner again. {shared}"
+            ),
+            Presence::RegisteredButMissing | Presence::Absent => format!(
+                "UDP/{port} is already bound by another process. brscan-skey is what normally \
+                 holds that port and does not appear to be installed here, so run \
+                 `ss -lunp | grep {port}` to see what does. {shared}"
+            ),
+        }
     }
 
     /// Which driver this scanner needs, from what discovery recorded about it.
@@ -636,18 +706,60 @@ impl ScannerBackend for BrotherBackend {
         }
     }
 
+    /// Subscribes this scanner to the one UDP/54925 socket every Brother sends to.
+    ///
+    /// # A scanner that can never be pressed still gets a stream
+    ///
+    /// The pairing machine's last step is this call (1.4), so a backend that errors here
+    /// can never reach `Paired=true`. Two of this backend's degraded paths are therefore
+    /// **not** errors: a device with no IPv4 address — a USB scanner, whose panel keys the
+    /// vendor daemon reaches over a USB path scanbus does not implement — and a device that
+    /// answered the scan-key OID with a refusal ([`brother-skeyless-backend.md`] §4). Both
+    /// are perfectly good pull scanners with `buttons.count = 0`, and both get an inert
+    /// stream: open, so the daemon does not read it as a listener that died and retry it
+    /// into `Status="error"`, and silent, because nothing will ever send them a datagram.
+    ///
+    /// `EADDRINUSE` is the opposite case and *is* an error, deliberately: a device that
+    /// could do walk-up is being stopped by something on *this* machine, which is fixable
+    /// and which the user has to be told about rather than left to discover from a panel
+    /// entry that does nothing.
+    ///
+    /// [`brother-skeyless-backend.md`]: https://github.com/jeanparpaillon/scanbus_service/blob/master/docs/brother-skeyless-backend.md
     async fn start_listening(
         &self,
         scanner: &ScannerInfo,
     ) -> Result<BoxStream<'static, ScanTrigger>, BackendError> {
-        Err(BackendError::Unsupported {
-            backend: ID,
-            operation: "start_listening",
+        let device = match self.listen_target(scanner) {
+            Ok(device) => device,
+            Err(reason) => {
+                info!(
+                    scanner = %scanner.id,
+                    %reason,
+                    "connected without a panel listener; this scanner has no keys to report",
+                );
+                return Ok(Box::pin(Inert::default()));
+            }
+        };
+
+        match self.listener.subscribe(scanner.id.clone(), device).await {
+            Ok(subscription) => Ok(Box::pin(subscription)),
+            Err(BindError::Taken { port }) => Err(BackendError::Other(self.port_taken(port))),
+            Err(error @ BindError::Io { .. }) => Err(BackendError::Other(format!(
+                "scanner {}: {error}; its panel keys are unavailable until the socket can be \
+                 opened, and it can still be scanned from the host",
+                scanner.id
+            ))),
         }
-        .with_scanner(scanner.id.clone()))
     }
 
-    async fn stop_listening(&self, _scanner_id: &ScannerId) -> Result<(), BackendError> {
+    /// Drops this scanner's subscription, and the socket with it if it was the last.
+    ///
+    /// Awaits the receive task, so the file descriptor is gone before this returns — which
+    /// is what makes a `Connect()`/`Disconnect()` cycle repeatable without a rebind ever
+    /// racing our own closing socket. A scanner that is not subscribed — never was, or
+    /// whose stream the caller already dropped — is a no-op and `Ok(())`, per the trait.
+    async fn stop_listening(&self, scanner_id: &ScannerId) -> Result<(), BackendError> {
+        self.listener.unsubscribe(scanner_id).await;
         Ok(())
     }
 
@@ -677,21 +789,6 @@ impl ScannerBackend for BrotherBackend {
             scanner: scanner_id.clone(),
             job: "fetch_pages".to_owned(),
         })
-    }
-}
-
-trait UnsupportedWithScanner {
-    fn with_scanner(self, scanner: ScannerId) -> BackendError;
-}
-
-impl UnsupportedWithScanner for BackendError {
-    fn with_scanner(self, scanner: ScannerId) -> BackendError {
-        match self {
-            BackendError::Unsupported { backend, operation } => BackendError::Other(format!(
-                "{operation} is not supported by backend {backend} for scanner {scanner}"
-            )),
-            other => other,
-        }
     }
 }
 
@@ -1626,6 +1723,253 @@ device 'airscan:escl:Brother MFC-L2710DW http://BRW001122334455.local:80/eSCL/' 
         assert_eq!(device_ipv4(&brother_mfc()), None);
     }
 
+    // -------------------------------------------------------------- the panel listener
+
+    /// The same four-button model, at a loopback address a test can send a datagram *from*.
+    const LOOPBACK_MFC: &str =
+        "device 'escl:http://127.0.0.2:80' is a Brother MFC-L2710DW flatbed scanner\n";
+
+    /// A backend whose listener asks for `port` instead of the fixed UDP/54925, which no
+    /// test may bind: it is the port the machine running the suite may well have
+    /// `brscan-skey` on, and two tests could not share it either.
+    fn listening_backend(
+        root: &TempDir,
+        scanimage: &'static str,
+        port: u16,
+    ) -> (BrotherBackend, Arc<FakeSnmp>) {
+        let transport = FakeSnmp::answering(Some(skey::snmp::ErrorStatus::NoError));
+        let runner = Arc::new(RecordingRunner {
+            scanimage,
+            ..RecordingRunner::default()
+        });
+        let scanimage_path = root.path().join("scanimage");
+        fs::write(&scanimage_path, b"stub").unwrap();
+
+        let backend = BrotherBackend {
+            scanimage_path,
+            transport: transport.clone(),
+            listener: Arc::new(Listener::new(port)),
+            ..backend(root, runner)
+        };
+        (backend, transport)
+    }
+
+    /// A free port from below the ephemeral range, so that no socket another test binds with
+    /// port 0 can land on the one this test's listener is about to ask for. See
+    /// [`listener`]'s own `free_port` for the longer version of why port 0 is not usable
+    /// here.
+    async fn free_port() -> u16 {
+        static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(25_925);
+
+        for _ in 0..64 {
+            let port = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let probe =
+                tokio::net::UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port)).await;
+            if probe.is_ok() {
+                drop(probe);
+                return port;
+            }
+        }
+        panic!("no free port for this test in 64 tries");
+    }
+
+    async fn press(from: Ipv4Addr, port: u16, function: skey::register::Function) {
+        let payload = format!(
+            "TYPE=BR;BUTTON=SCAN;USER=\"desktop\";FUNC={};HOST=127.0.0.1:{port};APPNUM={};\
+             CLIENT={from}",
+            function.as_str(),
+            function.appnum(),
+        );
+        let datagram = skey::event::Frame {
+            id: 0x01,
+            code: 0x01,
+            payload: &payload,
+        }
+        .to_datagram();
+
+        let socket = tokio::net::UdpSocket::bind(SocketAddrV4::new(from, 0))
+            .await
+            .unwrap();
+        socket
+            .send_to(&datagram, SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
+            .await
+            .unwrap();
+    }
+
+    async fn next_trigger(stream: &mut BoxStream<'static, ScanTrigger>) -> ScanTrigger {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            std::future::poll_fn(|cx| {
+                futures_core::Stream::poll_next(std::pin::Pin::new(&mut *stream), cx)
+            }),
+        )
+        .await
+        .expect("a press should arrive")
+        .expect("the stream must not end")
+    }
+
+    /// A press on a paired scanner's panel, from `Connect()` to a trigger with the button
+    /// index of the entry that was chosen.
+    #[tokio::test]
+    async fn a_paired_scanner_reports_its_panel_presses_as_button_triggers() {
+        // `brscan-skey` on disk because `ensure_installed` still requires it (5.2); 5.10 is
+        // what drops it from the dependency set. Its *files* being there is not the same
+        // thing as the daemon running, which is what would take the port.
+        let root = sysroot(&["/opt/brother/scanner/brscan4", "/usr/bin/brscan-skey"]);
+        let port = free_port().await;
+        let (backend, _) = listening_backend(&root, LOOPBACK_MFC, port);
+
+        let scanner = backend.discover().await.unwrap().remove(0);
+        ensure_installed_progress(&backend, &scanner)
+            .await
+            .0
+            .unwrap();
+
+        let mut stream = backend.start_listening(&scanner).await.unwrap();
+        press(
+            Ipv4Addr::new(127, 0, 0, 2),
+            port,
+            skey::register::Function::Ocr,
+        )
+        .await;
+
+        let trigger = next_trigger(&mut stream).await;
+        assert_eq!(trigger.scanner_id, scanner.id);
+        assert_eq!(trigger.kind, scanbus_core::TriggerKind::Button { index: 2 });
+        assert!(
+            !trigger.id.is_empty(),
+            "a trigger `fetch_pages` can be called with needs an id",
+        );
+
+        // And `Disconnect()` gives the port back, so the next `Connect()` can have it.
+        backend.stop_listening(&scanner.id).await.unwrap();
+        assert_eq!(backend.listener.port(), None);
+        let again = backend.start_listening(&scanner).await.unwrap();
+        assert_eq!(backend.listener.port(), Some(port));
+        // Dropping the stream is the other half of the contract: it releases the port too,
+        // without a `stop_listening`.
+        drop(again);
+        backend.stop_listening(&scanner.id).await.unwrap();
+        assert_eq!(backend.listener.port(), None);
+    }
+
+    /// `brscan-skey` holds the port first: the error names it, and the scanner is left
+    /// alone — still discovered, still reporting its keys, nothing sent to the device.
+    #[tokio::test]
+    async fn a_port_brscan_skey_holds_is_refused_by_name() {
+        let root = sysroot(&["/opt/brother/scanner/brscan4", "/usr/bin/brscan-skey"]);
+        let squatter = tokio::net::UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
+            .await
+            .unwrap();
+        let port = squatter.local_addr().unwrap().port();
+        let (backend, _) = listening_backend(&root, LOOPBACK_MFC, port);
+
+        let scanner = backend.discover().await.unwrap().remove(0);
+        let Err(error) = backend.start_listening(&scanner).await else {
+            panic!("the port is taken, so there is no listening to be done");
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("brscan-skey") && message.contains("brscan-skey -t"),
+            "the one likely cause must be named, with what to do about it: {message}",
+        );
+        assert!(
+            message.contains(&port.to_string()) && message.contains("scanned from the host"),
+            "and the port, and what still works: {message}",
+        );
+
+        // The scanner itself is untouched: discovery still reports it, with its keys.
+        let after = backend.discover().await.unwrap().remove(0);
+        assert_eq!(after.id, scanner.id);
+        assert_eq!(after.capabilities.buttons.count, 4);
+    }
+
+    /// The same failure on a machine with no `brscan-skey`: naming it as the culprit would
+    /// send the user hunting a package that is not there.
+    #[tokio::test]
+    async fn a_port_taken_by_something_else_says_how_to_find_out_what() {
+        let root = sysroot(&["/opt/brother/scanner/brscan4"]);
+        let squatter = tokio::net::UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
+            .await
+            .unwrap();
+        let port = squatter.local_addr().unwrap().port();
+        let (backend, _) = listening_backend(&root, LOOPBACK_MFC, port);
+
+        let scanner = backend.discover().await.unwrap().remove(0);
+        let Err(error) = backend.start_listening(&scanner).await else {
+            panic!("the port is taken");
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("does not appear to be installed") && message.contains("ss -lunp"),
+            "{message}",
+        );
+    }
+
+    /// A USB scanner and a model that refused the OID both connect, and neither binds the
+    /// port: pairing's last step is `start_listening`, so an error here would make a
+    /// perfectly good pull scanner unpairable.
+    #[tokio::test]
+    async fn a_scanner_with_no_panel_presses_to_deliver_still_connects() {
+        let usb = "device 'brother4:bus4;dev1:usb:001:002' is a Brother MFC-L2710DW\n";
+        for (case, scanimage, answer) in [
+            ("usb", usb, skey::snmp::ErrorStatus::NoError),
+            (
+                "refused the OID",
+                LOOPBACK_MFC,
+                skey::snmp::ErrorStatus::NoSuchName,
+            ),
+        ] {
+            let root = sysroot(&["/opt/brother/scanner/brscan4", "/usr/bin/brscan-skey"]);
+            let port = free_port().await;
+            let (mut backend, _) = listening_backend(&root, scanimage, port);
+            backend.transport = FakeSnmp::answering(Some(answer));
+
+            let scanner = backend.discover().await.unwrap().remove(0);
+            ensure_installed_progress(&backend, &scanner)
+                .await
+                .0
+                .unwrap_or_else(|error| panic!("{case} must still pair: {error}"));
+
+            let mut stream = backend
+                .start_listening(&scanner)
+                .await
+                .unwrap_or_else(|error| panic!("{case} must still connect: {error}"));
+            assert_eq!(
+                backend.listener.port(),
+                None,
+                "{case} has nothing to listen for and must not hold the port",
+            );
+
+            // Open, not ended: the daemon reads an ended stream as a listener that died and
+            // retries it until the scanner lands in `Status="error"`.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), next_trigger(&mut stream))
+                    .await
+                    .is_err(),
+                "{case} must be handed a stream that stays open and says nothing",
+            );
+
+            backend.stop_listening(&scanner.id).await.unwrap();
+        }
+    }
+
+    /// `stop_listening` on something that never listened, and twice over.
+    #[tokio::test]
+    async fn stopping_a_listener_that_is_not_running_is_not_an_error() {
+        let root = sysroot(&["/opt/brother/scanner/brscan4"]);
+        let port = free_port().await;
+        let (backend, _) = listening_backend(&root, LOOPBACK_MFC, port);
+        let scanner = backend.discover().await.unwrap().remove(0);
+
+        backend.stop_listening(&scanner.id).await.unwrap();
+        let stream = backend.start_listening(&scanner).await.unwrap();
+        backend.stop_listening(&scanner.id).await.unwrap();
+        drop(stream);
+        backend.stop_listening(&scanner.id).await.unwrap();
+        assert_eq!(backend.listener.port(), None);
+    }
+
     async fn ensure_installed_progress(
         backend: &BrotherBackend,
         scanner: &ScannerInfo,
@@ -1889,6 +2233,7 @@ device 'airscan:escl:Brother MFC-L2710DW http://BRW001122334455.local:80/eSCL/' 
         // lib.rs would have stopped meaning anything the moment it was added.
         let sources = [
             ("lib.rs", include_str!("lib.rs")),
+            ("listener.rs", include_str!("listener.rs")),
             ("registrar.rs", include_str!("registrar.rs")),
             ("skey/mod.rs", include_str!("skey/mod.rs")),
             ("skey/snmp.rs", include_str!("skey/snmp.rs")),

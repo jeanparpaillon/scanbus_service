@@ -154,6 +154,27 @@ with it.
   but they must not enable the user unit, create global symlinks, or edit other users' session
   state on install or removal.
 
+### Inbound UDP/54925, for the Brother panel
+
+The Brother backend binds **UDP/54925** and the printer sends the panel event to it, so a host
+firewall that drops unsolicited inbound UDP breaks walk-up scanning while leaving discovery and
+pull scanning working — a failure that looks like "the entry is on the panel and pressing it does
+nothing". This is Brother's own documented requirement, not something scanbus invented: it is the
+port their support pages tell users to open for network scanning, and it is what `brscan-skey`
+binds too. It is worth a line in the package description and in whatever the maintainer scripts
+print; `ufw allow 54925/udp` or the equivalent zone rule is the whole fix.
+
+Two things follow from the port being fixed and well known rather than negotiated:
+
+- **The socket is process-wide and refcounted, not per scanner**
+  ([`listener.rs`](../scanbus-backend-brother/src/listener.rs)). It is bound on the first
+  `Connect()` and released on the last `Disconnect()`, so a daemon with no Brother device
+  connected holds nothing and leaves the port to whoever else wants it.
+- **`EADDRINUSE` is reported as `brscan-skey`, by name.** The package must not try to make the
+  two coexist — `SO_REUSEPORT` would have the kernel deliver each press to one of the two
+  processes at random — and must not stop or mask a vendor daemon it does not own. Naming it and
+  refusing is the whole of the handling.
+
 ## 5. Testing strategy
 
 - A `MockBackend` implementing `ScannerBackend` with synthetic events (`ButtonPressedEvent` triggered manually in tests) → covers the whole D-Bus/profile pipeline without hardware.

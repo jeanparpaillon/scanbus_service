@@ -219,6 +219,8 @@ the part that can be wrong, and hardware is the slowest possible place to find t
 ```text
 scanbus-backend-brother/src/
 ├── lib.rs           discovery, ensure_installed, the ScannerBackend impl
+├── registrar.rs     the socket and the clock of the registration: one lease per device
+├── listener.rs      the socket of the event: one UDP/54925 for every device
 └── skey/
     ├── snmp.rs      BER encode/decode for GetRequest/SetRequest/Response
     ├── register.rs  the registration string, the lease, the refresh task
@@ -226,9 +228,10 @@ scanbus-backend-brother/src/
     └── fields.rs    the KEY=VALUE; grammar both of the above are written in
 ```
 
-As built, the three protocol modules open nothing — no socket, no file, no clock — and a test
-in `lib.rs` holds them to it. The lease refresh task named above is the first thing that will
-need one, and it belongs with the listener rather than here.
+As built, the four `skey` modules open nothing — no socket, no file, no clock — and a test in
+`lib.rs` holds them to it. Everything that does is in the two modules above them, and they are
+split the way the resources are: a lease is per device, so `registrar.rs` owns a task and a
+socket per device; the event port is per host, so `listener.rs` owns exactly one.
 
 **No SNMP crate.** Two PDU types, one transport, no MIB parsing, no v3 crypto — the BER encoder
 and decoder are roughly two hundred lines with exhaustive round-trip tests, which is a smaller
@@ -269,8 +272,21 @@ did nothing. `LabelConfigurable` stays `false`: the labels are the firmware's.
 - **The device rejects the registration OID** — an older or newer generation (the arch notes
   mention models documenting TCP 5566 and 54921 instead). The scanner stays usable as a pull
   scanner, `buttons.count` is 0, and nothing pretends a panel entry exists.
+- **The device is on USB** — the vendor daemon reaches panel keys over a separate USB path that
+  scanbus does not implement, and there is no address to register. Same outcome as the previous
+  case.
 - **`brscan-skey` is installed and running** — refuse to bind, name it, and leave the scanner
   pull-scannable. Do not try to coexist on the port.
+
+Those three are not the same kind of degradation, and the difference is visible on the bus.
+`start_listening()` is the pairing machine's last step (1.4), so an error from it lands the
+scanner in `PairingState="failed"`. That is right for the port being taken — something on *this*
+machine is stopping a device that could do walk-up, it is fixable, and the user has to be told
+rather than left with a panel entry that does nothing — and wrong for the other two, where the
+scanner is working exactly as designed and would become unpairable, i.e. unusable even as a pull
+scanner. A device with nothing to report is therefore handed a stream that stays **open and
+silent** instead: ending it immediately would be read by the daemon as a listener that died and
+retried until the scanner reached `Status="error"`.
 - **A vendor driver is installed** — it is used for acquisition only when the device offers no
   eSCL. Its presence is never a requirement.
 - **A panel password is set on the device** — the registration needs it in `BRID=`, scrambled
