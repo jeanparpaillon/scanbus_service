@@ -91,6 +91,15 @@ const DEVICE_STORE_VERSION: u32 = 2;
 struct DiscoveryRecord {
     device_id: String,
     address: String,
+    /// Where to dial for a TLS pairing, from the `tlsport` TXT key (§11.3), or `None`
+    /// when the phone advertised none and has no keystore identity to serve.
+    ///
+    /// The port is read as a port and then formatted against the same address the SRV
+    /// record gave, rather than kept as a bare `u16`, because the only thing it is ever
+    /// used for is a dial to that same phone: doing it here keeps the IPv6 bracketing
+    /// hazard `address` already documents in one place, and hands the dial of §11.3
+    /// something it can pass to [`MobileBackend::connect_to_record`] unchanged.
+    tls_address: Option<String>,
     seen_at: Instant,
 }
 
@@ -1657,6 +1666,35 @@ fn scanner_from_service(service: &mdns_sd::ServiceInfo) -> Option<(ScannerInfo, 
     // before any network attempt happens.
     let address = SocketAddr::new(*ip, service.get_port()).to_string();
 
+    // §11.3. Absence is a statement — "no keystore identity" — and there is deliberately
+    // no `tls=0`, so a phone written before §11 reads exactly as it always did and no
+    // other TXT key changes meaning.
+    //
+    // A key that is present but unusable is treated as absent rather than dropping the
+    // service, and the reason is that it buys nothing: an attacker who can forge this
+    // record can strip the key outright, and §11.6 already accounts for that path — the
+    // pairing that follows is cleartext, the app marks it unencrypted and warns, and the
+    // six digits are what bound it. A garbled value reaches the same place, so refusing
+    // to show the phone at all would only take a working cleartext pairing away from
+    // someone whose app has a bug. It is logged at `warn` and not at `debug` because,
+    // unlike the drops above, this one is nobody's normal traffic.
+    let tls_address = match properties.get_property_val_str("tlsport") {
+        None => None,
+        Some(value) => match value.trim().parse::<u16>() {
+            // Port 0 means "any port" to a bind and is not connectable, so it is not a
+            // port a phone can be serving on.
+            Ok(port) if port != 0 => Some(SocketAddr::new(*ip, port).to_string()),
+            _ => {
+                warn!(
+                    instance = %instance,
+                    tlsport = %value,
+                    "ignoring unusable tlsport; pairing this phone will be cleartext"
+                );
+                None
+            }
+        },
+    };
+
     Some((
         ScannerInfo {
             id: scanner_id,
@@ -1676,6 +1714,7 @@ fn scanner_from_service(service: &mdns_sd::ServiceInfo) -> Option<(ScannerInfo, 
         DiscoveryRecord {
             device_id: id.to_owned(),
             address,
+            tls_address,
             seen_at: Instant::now(),
         },
     ))
@@ -2201,6 +2240,7 @@ mod tests {
             DiscoveryRecord {
                 device_id: DEVICE_ID.to_owned(),
                 address: address.to_owned(),
+                tls_address: None,
                 seen_at: Instant::now(),
             },
         )]);
@@ -2399,6 +2439,7 @@ mod tests {
             DiscoveryRecord {
                 device_id: DEVICE_ID.to_owned(),
                 address: phone.address.clone(),
+                tls_address: None,
                 seen_at: Instant::now() - DISCOVERY_RECORD_TTL - Duration::from_secs(1),
             },
         );
@@ -2632,6 +2673,7 @@ mod tests {
             DiscoveryRecord {
                 device_id: DEVICE_ID.to_owned(),
                 address: phone.address,
+                tls_address: None,
                 seen_at: Instant::now(),
             },
         )]);
@@ -2676,6 +2718,7 @@ mod tests {
             DiscoveryRecord {
                 device_id: DEVICE_ID.to_owned(),
                 address: phone.address,
+                tls_address: None,
                 seen_at: Instant::now(),
             },
         )]);
@@ -2958,6 +3001,78 @@ mod tests {
         let paired = backend.lock_paired().clone();
         backend.persist_paired_locked(&paired).unwrap();
         assert!(load_store(&path).unwrap().devices[&scanner_id()].tls);
+    }
+
+    /// One sighting of a phone, with whatever TXT it advertised.
+    fn service_with(ip: &str, txt: &[(&str, &str)]) -> mdns_sd::ServiceInfo {
+        mdns_sd::ServiceInfo::new(SERVICE_TYPE, "phone", "phone.local.", ip, 45481, txt).unwrap()
+    }
+
+    #[test]
+    fn a_tlsport_txt_key_is_read_as_the_port_to_dial_for_tls() {
+        let service = service_with(
+            "192.168.1.5",
+            &[("v", "1"), ("id", DEVICE_ID), ("tlsport", "8443")],
+        );
+
+        let (scanner, record) = scanner_from_service(&service).unwrap();
+
+        // The SRV port is untouched: §11.3 keeps it cleartext forever, because it is the
+        // only port a host built before §11 knows how to find.
+        assert_eq!(record.address, "192.168.1.5:45481");
+        assert_eq!(scanner.address, "192.168.1.5:45481");
+        assert_eq!(record.tls_address.as_deref(), Some("192.168.1.5:8443"));
+    }
+
+    /// The formatting `address` is careful about, applied to the second port too: a
+    /// hand-rolled `"{ip}:{port}"` would make `fe80::1:8443` out of an IPv6 phone, which
+    /// the socket layer rejects before any network attempt happens.
+    #[test]
+    fn a_tlsport_on_an_ipv6_phone_is_bracketed_like_the_srv_address() {
+        let service = service_with(
+            "fe80::1",
+            &[("v", "1"), ("id", DEVICE_ID), ("tlsport", "8443")],
+        );
+
+        let (_, record) = scanner_from_service(&service).unwrap();
+
+        assert_eq!(record.address, "[fe80::1]:45481");
+        assert_eq!(record.tls_address.as_deref(), Some("[fe80::1]:8443"));
+        assert!(record.tls_address.unwrap().parse::<SocketAddr>().is_ok());
+    }
+
+    /// No `tlsport` is a phone with no keystore identity, and nothing else about the
+    /// record changes — a phone advertising what it always advertised still pairs.
+    #[test]
+    fn a_record_without_tlsport_is_a_phone_with_no_tls() {
+        let service = service_with("192.168.1.5", &[("v", "1"), ("id", DEVICE_ID)]);
+
+        let (scanner, record) = scanner_from_service(&service).unwrap();
+
+        assert_eq!(scanner.id, scanner_id());
+        assert_eq!(record.device_id, DEVICE_ID);
+        assert_eq!(record.address, "192.168.1.5:45481");
+        assert_eq!(record.tls_address, None);
+    }
+
+    /// A value that is not a port a phone can be serving on is treated as absent, not as
+    /// a reason to hide the phone: an attacker who can forge this record can strip the
+    /// key outright (§11.6), so dropping the service here would deny someone a working
+    /// cleartext pairing without denying an attacker anything.
+    #[test]
+    fn an_unusable_tlsport_reads_as_no_tls_rather_than_dropping_the_phone() {
+        for value in ["0", "not-a-port", "70000", "-1", "8443 8444", ""] {
+            let service = service_with(
+                "192.168.1.5",
+                &[("v", "1"), ("id", DEVICE_ID), ("tlsport", value)],
+            );
+
+            let (scanner, record) = scanner_from_service(&service)
+                .unwrap_or_else(|| panic!("tlsport={value:?} dropped the whole service"));
+
+            assert_eq!(scanner.address, "192.168.1.5:45481");
+            assert_eq!(record.tls_address, None, "tlsport={value:?}");
+        }
     }
 
     /// The nonce is the whole security value of the comparison: six digits, every one of
