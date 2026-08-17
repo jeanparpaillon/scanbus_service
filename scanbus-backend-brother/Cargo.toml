@@ -1,6 +1,6 @@
 [package]
 name = "scanbus-backend-brother"
-description = "Brother backend for scanbus (brscan4/brscan5 + brscan-skey)"
+description = "Brother backend for scanbus"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
