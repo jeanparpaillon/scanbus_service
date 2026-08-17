@@ -116,6 +116,7 @@ reload:
 	systemctl --user daemon-reload
 	dbus-send --session --type=method_call --dest=org.freedesktop.DBus \
 		/ org.freedesktop.DBus.ReloadConfig
+	systemctl --user restart scanbus.service || true
 
 test:
 	cargo test --workspace --features $(BACKENDS)
