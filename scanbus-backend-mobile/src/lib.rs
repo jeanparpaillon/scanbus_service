@@ -74,7 +74,12 @@ pub const FETCH_CLAIM_TIMEOUT: Duration = Duration::from_secs(5);
 pub const UPLOAD_PAGE_BUFFER: usize = 2;
 pub const DEFAULT_UPLOAD_RESOLUTION_DPI: u32 = 300;
 
-const DEVICE_STORE_VERSION: u32 = 1;
+/// What this crate writes. Bumped to 2 by §11.5's per-device `tls` flag.
+///
+/// The number is what a *newer* scanbus writes, not a compatibility gate: older stores
+/// are read and upgraded in place (see [`load_store`]), because refusing one would take
+/// every pairing on the host with it.
+const DEVICE_STORE_VERSION: u32 = 2;
 
 /// What one sighting of a phone is worth to a pairing: an address to dial, and the TXT
 /// `id` that `pair_response.device_id` has to match.
@@ -104,6 +109,14 @@ struct PairedDevice {
     token_sha256: String,
     profiles: Vec<ProfileKind>,
     paired_at: u64,
+    /// Whether the handshake that produced this record ran over TLS (§11.5).
+    ///
+    /// This is the only record anywhere that the phone pinned our certificate: the app
+    /// keeps the fingerprint, we keep the fact that it has one. It is what makes a
+    /// cleartext upload bearing this `device_id` answerable `unauthorized` (§11.4)
+    /// instead of trusted, and it cannot be recovered later — a pairing whose flag is
+    /// lost can only be re-made by a human.
+    tls: bool,
 }
 
 /// Redacted on purpose: the token must not reach a log through a `?device` that seemed
@@ -115,6 +128,7 @@ impl fmt::Debug for PairedDevice {
             .field("token_sha256", &"<redacted>")
             .field("profiles", &self.profiles)
             .field("paired_at", &self.paired_at)
+            .field("tls", &self.tls)
             .finish()
     }
 }
@@ -135,6 +149,12 @@ struct PersistedDevice {
     #[serde(default)]
     profiles: Vec<ProfileKind>,
     paired_at: u64,
+    /// Absent in a version 1 record, and `false` is the truth about one: it was written
+    /// before this host could speak TLS at all, so that pairing was made in cleartext
+    /// (§11.6). Defaulting the other way would claim a pin nobody holds and lock the
+    /// phone out of the only path it knows.
+    #[serde(default)]
+    tls: bool,
 }
 
 impl Default for PersistedDeviceStore {
@@ -154,6 +174,7 @@ impl From<&PairedDevice> for PersistedDevice {
             token_sha256: device.token_sha256.clone(),
             profiles: device.profiles.clone(),
             paired_at: device.paired_at,
+            tls: device.tls,
         }
     }
 }
@@ -165,6 +186,7 @@ impl From<PersistedDevice> for PairedDevice {
             token_sha256: device.token_sha256,
             profiles: device.profiles,
             paired_at: device.paired_at,
+            tls: device.tls,
         }
     }
 }
@@ -623,6 +645,11 @@ impl MobileBackend {
             token_sha256: hash_token(&response.token),
             profiles: response.capabilities.profiles,
             paired_at: unix_timestamp_now(),
+            // Cleartext, and recorded as such. The `tlsport` TXT key and the TLS dial of
+            // §11.3 are not wired yet, so every pairing this build makes is one §11.6
+            // describes: unencrypted, marked, and never retroactively upgraded. The flag
+            // is set from how the dial actually went, never from what was intended.
+            tls: false,
         };
         self.store_paired_device(&scanner.id, device)?;
 
@@ -1351,18 +1378,35 @@ fn load_store(path: &Path) -> Result<PersistedDeviceStore, String> {
             path.display()
         )
     })?;
-    let store: PersistedDeviceStore = serde_json::from_slice(&bytes).map_err(|error| {
+    let mut store: PersistedDeviceStore = serde_json::from_slice(&bytes).map_err(|error| {
         format!(
             "cannot parse mobile device store {}: {error}",
             path.display()
         )
     })?;
 
-    if store.version != DEVICE_STORE_VERSION {
+    // Only a store from the future is unreadable. An older one is upgraded in place:
+    // every field added since is `#[serde(default)]` and the default is what the older
+    // record actually meant, so the upgrade is the deserialization itself and the version
+    // is only stamped forward for the next write. Treating an old store the way
+    // [`rename_store_aside`] treats a corrupt one would drop every pairing on the host on
+    // the upgrade that introduced the field — §11.6 is explicit that pairings made before
+    // TLS keep working.
+    if store.version > DEVICE_STORE_VERSION {
         return Err(format!(
-            "mobile device store version {} is unsupported (expected {})",
+            "mobile device store version {} is newer than this scanbus understands \
+			 (writes {})",
             store.version, DEVICE_STORE_VERSION
         ));
+    }
+    if store.version < DEVICE_STORE_VERSION {
+        debug!(
+            path = %path.display(),
+            from = store.version,
+            to = DEVICE_STORE_VERSION,
+            "upgrading mobile device store; pairings without a tls flag are cleartext"
+        );
+        store.version = DEVICE_STORE_VERSION;
     }
 
     Ok(store)
@@ -2665,6 +2709,7 @@ mod tests {
                         token_sha256: hash_token("phone-token"),
                         profiles: vec![ProfileKind::Image],
                         paired_at: unix_timestamp_now(),
+                        tls: false,
                     },
                 )]),
             },
@@ -2719,6 +2764,7 @@ mod tests {
                         token_sha256: hash_token("phone-token"),
                         profiles: vec![ProfileKind::Image],
                         paired_at: unix_timestamp_now(),
+                        tls: false,
                     },
                 )]),
             },
@@ -2789,6 +2835,129 @@ mod tests {
                 .fingerprint_sha256(),
             fingerprint
         );
+    }
+
+    /// The upgrade §11.6 depends on: a store written before TLS existed keeps its
+    /// pairings, and they keep working. The version bump makes the wrong answer available
+    /// — a version check that only accepts its own number would send this file through
+    /// `rename_store_aside` and unpair the host on a package upgrade — so the absent flag
+    /// has to read as `false` rather than as an unreadable store.
+    #[tokio::test]
+    async fn a_version_1_store_upgrades_in_place_and_its_pairings_are_cleartext() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("devices.json");
+        ensure_store_dir(tmp.path()).unwrap();
+        let token_sha256 = hash_token("phone-token");
+        fs::write(
+            &path,
+            format!(
+                r#"{{
+                  "version": 1,
+                  "upload_port": 0,
+                  "devices": {{
+                    "{scanner}": {{
+                      "device_id": "{DEVICE_ID}",
+                      "token_sha256": "{token_sha256}",
+                      "profiles": ["image"],
+                      "paired_at": 1700000000
+                    }}
+                  }}
+                }}"#,
+                scanner = scanner_id()
+            ),
+        )
+        .unwrap();
+
+        let store = load_store(&path).unwrap();
+        assert_eq!(
+            store.version, DEVICE_STORE_VERSION,
+            "an old store is upgraded on read, not refused"
+        );
+        let device = &store.devices[&scanner_id()];
+        assert!(
+            !device.tls,
+            "a pairing made before the host had a certificate cannot have been pinned"
+        );
+
+        // And the same thing through a real start: the phone is still paired, still
+        // authorized by the token it was issued, and still online.
+        let backend = MobileBackend::with_store_path(path.clone(), DISCOVERY_TIMEOUT, 0);
+        assert!(backend.is_authorized(DEVICE_ID, "phone-token"));
+        assert_eq!(backend.status_for(&scanner_id()), Status::Online);
+        assert!(!backend.lock_paired()[&scanner_id()].tls);
+
+        let paired = backend.lock_paired().clone();
+        backend.persist_paired_locked(&paired).unwrap();
+        let rewritten = fs::read_to_string(&path).unwrap();
+        assert!(
+            rewritten.contains("\"version\": 2"),
+            "the next write stamps the new version: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("\"tls\": false"),
+            "the flag is written out explicitly once known: {rewritten}"
+        );
+        assert!(rewritten.contains(&token_sha256), "the pairing survived");
+    }
+
+    /// The one direction that is not an upgrade. A store this build cannot understand was
+    /// written by a newer scanbus, and reading it with defaults would silently discard
+    /// whatever that version recorded — a `tls` flag among it, if a downgrade is what got
+    /// us here. Refusing is the same path a corrupt store takes: renamed aside, loudly.
+    #[test]
+    fn a_store_from_a_newer_scanbus_is_refused_rather_than_read_with_defaults() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("devices.json");
+        ensure_store_dir(tmp.path()).unwrap();
+        fs::write(
+            &path,
+            format!(
+                r#"{{"version": {}, "upload_port": 0, "devices": {{}}}}"#,
+                DEVICE_STORE_VERSION + 1
+            ),
+        )
+        .unwrap();
+
+        let error = load_store(&path).unwrap_err();
+        assert!(error.contains("newer than this scanbus"), "{error}");
+
+        assert!(load_or_reset_store(&path).devices.is_empty());
+        assert!(!path.exists(), "the unreadable store is renamed aside");
+    }
+
+    /// The flag is only worth having if it survives a restart: it is the sole record that
+    /// a phone pinned us, and §11.4 answers `unauthorized` on the strength of it.
+    #[tokio::test]
+    async fn the_tls_flag_survives_a_restart() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("devices.json");
+        persist_device_store(
+            &path,
+            &PersistedDeviceStore {
+                version: DEVICE_STORE_VERSION,
+                upload_port: 0,
+                devices: BTreeMap::from([(
+                    scanner_id(),
+                    PersistedDevice {
+                        device_id: DEVICE_ID.to_owned(),
+                        token_sha256: hash_token("phone-token"),
+                        profiles: vec![ProfileKind::Image],
+                        paired_at: unix_timestamp_now(),
+                        tls: true,
+                    },
+                )]),
+            },
+        )
+        .unwrap();
+
+        let backend = MobileBackend::with_store_path(path.clone(), DISCOVERY_TIMEOUT, 0);
+        assert!(backend.lock_paired()[&scanner_id()].tls);
+
+        // Round-tripped rather than only read: the rewrite is where a flag that the
+        // in-memory record dropped would disappear for good.
+        let paired = backend.lock_paired().clone();
+        backend.persist_paired_locked(&paired).unwrap();
+        assert!(load_store(&path).unwrap().devices[&scanner_id()].tls);
     }
 
     /// The nonce is the whole security value of the comparison: six digits, every one of
