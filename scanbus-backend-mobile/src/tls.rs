@@ -24,7 +24,7 @@ use rustls::crypto::CryptoProvider;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls::sign::{CertifiedKey, SingleCertAndKey};
-use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
+use rustls::{ClientConfig, DigitallySignedStruct, ServerConfig, SignatureScheme};
 use sha2::{Digest, Sha256};
 
 /// The certificate, next to the device table of §8. It is public by nature — it is the
@@ -61,6 +61,7 @@ pub struct HostIdentity {
     certified_key: Arc<CertifiedKey>,
     fingerprint: String,
     pairing_client_config: Arc<ClientConfig>,
+    upload_server_config: Arc<ServerConfig>,
 }
 
 /// Redacted, like `PairedDevice`: the certificate bytes are noise
@@ -144,6 +145,17 @@ impl HostIdentity {
     /// for the two to drift.
     pub fn pairing_client_config(&self) -> Arc<ClientConfig> {
         Arc::clone(&self.pairing_client_config)
+    }
+
+    /// The configuration for the connections the *phone* dials: the upload listener of
+    /// §11.4, where the host is the TLS **server** and presents this same certificate.
+    ///
+    /// "Same" is the requirement of §11.2 and it is met here by construction rather than
+    /// by convention — both configurations are built from the one [`CertifiedKey`] above,
+    /// in [`Self::assemble`], so there is no arrangement of this crate in which the
+    /// listener can come to present a certificate other than the one a pairing pinned.
+    pub fn upload_server_config(&self) -> Arc<ServerConfig> {
+        Arc::clone(&self.upload_server_config)
     }
 
     fn load(cert_path: &Path, key_path: &Path) -> Result<Self, IdentityError> {
@@ -240,11 +252,15 @@ impl HostIdentity {
         let pairing_client_config =
             build_pairing_client_config(&provider, Arc::clone(&certified_key))
                 .map_err(IdentityError::Unusable)?;
+        let upload_server_config =
+            build_upload_server_config(&provider, Arc::clone(&certified_key))
+                .map_err(IdentityError::Unusable)?;
 
         Ok(Self {
             certified_key,
             fingerprint,
             pairing_client_config: Arc::new(pairing_client_config),
+            upload_server_config: Arc::new(upload_server_config),
         })
     }
 }
@@ -284,6 +300,35 @@ fn build_pairing_client_config(
             provider: Arc::clone(provider),
         }))
         .with_client_cert_resolver(Arc::new(SingleCertAndKey::from(certified_key))))
+}
+
+/// The `ServerConfig` of §11.4, for the half of the upload listener that speaks TLS.
+///
+/// It is the mirror image of [`build_pairing_client_config`] and shorter for a reason:
+/// as the server, this host verifies nothing and offers everything.
+///
+/// - **No client certificate is requested** — [`with_no_client_auth`] rather than a
+///   verifier that accepts anything. The app has no identity this host could check, and
+///   what authenticates an upload is the token; asking for a certificate would only
+///   produce `CertificateRequest`s the app answers empty and handshake failures to
+///   explain. It is also the reason there is no `ClientCertVerifier` anywhere in this
+///   crate outside its tests.
+/// - **The same [`SingleCertAndKey`], over the same `Arc<CertifiedKey>`** as the pairing
+///   config. This is the whole of §11.2 in one line: the phone pinned the SHA-256 of the
+///   certificate it was shown while pairing, and it refuses this connection — permanently,
+///   with no prompt and no way to click through — if a different one arrives.
+///
+/// [`with_no_client_auth`]: rustls::ConfigBuilder::with_no_client_auth
+fn build_upload_server_config(
+    provider: &Arc<CryptoProvider>,
+    certified_key: Arc<CertifiedKey>,
+) -> Result<ServerConfig, rustls::Error> {
+    Ok(ServerConfig::builder_with_provider(Arc::clone(provider))
+        // 1.3 and 1.2, for the same reason as the client config: an Android 8 or 9 phone
+        // that paired over 1.2 has to be able to upload over it too (§11.3).
+        .with_safe_default_protocol_versions()?
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::new(SingleCertAndKey::from(certified_key))))
 }
 
 /// Accepts any certificate a phone presents while pairing. See

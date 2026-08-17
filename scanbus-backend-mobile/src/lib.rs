@@ -450,11 +450,14 @@ impl MobileBackend {
     /// instead is leave the scanners they affect `Offline` while keeping the reason, so
     /// that `Connect()` on one of them says what is wrong instead of timing out.
     ///
-    /// The identity failure is deliberately the wider of the two for now: it takes down
-    /// every paired phone, including ones paired in cleartext that a host with no
-    /// certificate could still serve perfectly well (§11.6). Narrowing it to the phones
-    /// that actually pinned something needs the per-device `tls` flag of §11.5, which the
-    /// device store does not carry yet.
+    /// The identity failure is deliberately the wider of the two: it takes down every
+    /// paired phone, including ones paired in cleartext that a host with no certificate
+    /// could still serve perfectly well — the upload listener's cleartext half needs no
+    /// identity at all (§11.4). The per-device `tls` flag of §11.5 now exists and would be
+    /// enough to narrow it to the phones that actually pinned something, and it is left
+    /// wide on purpose: an unreadable key is a state somebody has to be told about, and a
+    /// host that keeps working for most of its phones is a host nobody looks at until the
+    /// rest of them fail.
     fn unavailable_reason(&self) -> Option<String> {
         self.listener_error()
             .or_else(|| self.identity_error().map(str::to_owned))
@@ -491,6 +494,14 @@ impl MobileBackend {
         binding.task_started = true;
         drop(binding);
 
+        // The same certificate the pairing dial presents as a client certificate (§11.2),
+        // and `None` only when there is no identity at all — in which case this listener
+        // still serves the cleartext half of §11.4, which is what every phone paired
+        // before §11 uses.
+        let server_config = self
+            .identity
+            .as_ref()
+            .map(|identity| identity.upload_server_config());
         let paired = Arc::clone(&self.paired);
         let subscriptions = Arc::clone(&self.subscriptions);
         let pending_uploads = Arc::clone(&self.pending_uploads);
@@ -498,6 +509,7 @@ impl MobileBackend {
         let task = handle.spawn(async move {
             run_upload_listener(
                 listener,
+                server_config,
                 paired,
                 subscriptions,
                 pending_uploads,
@@ -1144,6 +1156,7 @@ impl Drop for MobileBackend {
 
 async fn run_upload_listener(
     listener: TcpListener,
+    server_config: Option<Arc<rustls::ServerConfig>>,
     paired: Arc<Mutex<BTreeMap<ScannerId, PairedDevice>>>,
     subscriptions: Arc<Mutex<BTreeMap<ScannerId, mpsc::Sender<scanbus_core::ScanTrigger>>>>,
     pending_uploads: Arc<Mutex<BTreeMap<String, PendingUpload>>>,
@@ -1153,13 +1166,21 @@ async fn run_upload_listener(
         let Ok((socket, _)) = listener.accept().await else {
             continue;
         };
+        let server_config = server_config.clone();
         let paired = Arc::clone(&paired);
         let subscriptions = Arc::clone(&subscriptions);
         let pending_uploads = Arc::clone(&pending_uploads);
         let next_trigger_id = Arc::clone(&next_trigger_id);
+        // The demux and, on a TLS connection, the handshake happen in here rather than in
+        // the accept loop above: §11.4 spends them from the "connections awaiting their
+        // first frame" budget of §5, and a phone that opens a connection and then stalls
+        // mid-handshake must cost this listener no more than one that opens a connection
+        // and sends no frame. Doing either before the spawn would let one such phone stop
+        // every other one from being accepted.
         tokio::spawn(async move {
             let _ = handle_upload_connection(
                 socket,
+                server_config,
                 paired,
                 subscriptions,
                 pending_uploads,
@@ -1170,21 +1191,147 @@ async fn run_upload_listener(
     }
 }
 
+/// The first byte of every TLS connection there is: `ContentType.handshake` (§11.4).
+const TLS_HANDSHAKE_CONTENT_TYPE: u8 = 0x16;
+
+/// The top byte of our `u32` length prefix. The first frame of an upload is a control
+/// frame capped at 64 KiB (§3), so on a cleartext connection it cannot be anything else.
+const FRAME_LENGTH_TOP_BYTE: u8 = 0x00;
+
+/// One accepted connection, before it is known which protocol it speaks.
+///
+/// §11.4's demux, and the reason the listener needs no second port the way the phone does
+/// (§11.3): [`TcpStream::peek`] leaves the byte where it was, so the TLS acceptor still
+/// finds the `ClientHello` it is looking for. A read here would consume the byte, and
+/// there would be no way to give it back.
+///
+/// The deadline covers the peek, the handshake and the first frame together. It is one
+/// budget rather than three because the three are one thing from the listener's side —
+/// a connection that has not yet said anything it can be held to — and §11.4 asks for the
+/// handshake to be inside that budget rather than in front of it.
 async fn handle_upload_connection(
-    mut socket: TcpStream,
+    socket: TcpStream,
+    server_config: Option<Arc<rustls::ServerConfig>>,
     paired: Arc<Mutex<BTreeMap<ScannerId, PairedDevice>>>,
     subscriptions: Arc<Mutex<BTreeMap<ScannerId, mpsc::Sender<scanbus_core::ScanTrigger>>>>,
     pending_uploads: Arc<Mutex<BTreeMap<String, PendingUpload>>>,
     next_trigger_id: Arc<AtomicU64>,
 ) -> Result<(), ProtocolError> {
-    let first = match read_upload_header(&mut socket).await {
+    let deadline = Instant::now() + UPLOAD_FRAME_TIMEOUT;
+
+    let mut first_byte = [0_u8; 1];
+    let peeked = timeout(
+        deadline.saturating_duration_since(Instant::now()),
+        socket.peek(&mut first_byte),
+    )
+    .await
+    .map_err(|_| ProtocolError::Malformed {
+        context: "connected to the upload port and sent nothing".to_owned(),
+    })?
+    .map_err(|error| ProtocolError::Malformed {
+        context: format!("could not read the first byte of an upload connection: {error}"),
+    })?;
+    if peeked == 0 {
+        return Err(ProtocolError::Malformed {
+            context: "an upload connection closed before its first byte".to_owned(),
+        });
+    }
+
+    match first_byte[0] {
+        TLS_HANDSHAKE_CONTENT_TYPE => {
+            // No identity, so nothing to hand the acceptor. This is unreachable through a
+            // pairing — a host with no certificate refuses to pair at all — and it is not
+            // answered with an error frame, because whatever is at the other end is
+            // waiting for a `ServerHello`, not for JSON.
+            let Some(server_config) = server_config else {
+                return Err(ProtocolError::Malformed {
+                    context: "a phone opened a TLS upload connection, but this host has no \
+					          TLS identity to answer it with"
+                        .to_owned(),
+                });
+            };
+            let socket = timeout(
+                deadline.saturating_duration_since(Instant::now()),
+                tokio_rustls::TlsAcceptor::from(server_config).accept(socket),
+            )
+            .await
+            .map_err(|_| ProtocolError::Malformed {
+                context: "an upload TLS handshake did not finish inside the first-frame budget"
+                    .to_owned(),
+            })?
+            .map_err(|error| ProtocolError::Malformed {
+                context: format!("an upload TLS handshake failed: {error}"),
+            })?;
+            serve_upload(
+                socket,
+                true,
+                deadline,
+                paired,
+                subscriptions,
+                pending_uploads,
+                next_trigger_id,
+            )
+            .await
+        }
+        // Cleartext, exactly as before §11: every phone paired before it dials this and
+        // must keep working forever (§11.6).
+        FRAME_LENGTH_TOP_BYTE => {
+            serve_upload(
+                socket,
+                false,
+                deadline,
+                paired,
+                subscriptions,
+                pending_uploads,
+                next_trigger_id,
+            )
+            .await
+        }
+        // Not this protocol under either reading, so there is nobody to send an ack to.
+        // Dropping the socket is the whole of the answer.
+        other => {
+            debug!(
+                first_byte = format!("0x{other:02x}"),
+                "closing a connection on the mobile upload port: not a TLS handshake and not \
+				 a control frame"
+            );
+            Err(ProtocolError::Malformed {
+                context: format!("first byte 0x{other:02x} is neither TLS nor a control frame"),
+            })
+        }
+    }
+}
+
+/// An upload, over whichever of the two transports [`handle_upload_connection`] found.
+///
+/// Generic over the socket for the same reason [`MobileBackend::pair_over`] is: the frames
+/// of §3 are byte-identical on both, and nothing from here down is allowed to know which
+/// one it got. The one thing that does know is `over_tls`, and it goes exactly one place —
+/// [`authorize_upload`].
+#[allow(clippy::too_many_arguments)]
+async fn serve_upload<S: AsyncRead + AsyncWrite + Unpin + Send>(
+    mut socket: S,
+    over_tls: bool,
+    deadline: Instant,
+    paired: Arc<Mutex<BTreeMap<ScannerId, PairedDevice>>>,
+    subscriptions: Arc<Mutex<BTreeMap<ScannerId, mpsc::Sender<scanbus_core::ScanTrigger>>>>,
+    pending_uploads: Arc<Mutex<BTreeMap<String, PendingUpload>>>,
+    next_trigger_id: Arc<AtomicU64>,
+) -> Result<(), ProtocolError> {
+    // What is left of the budget the handshake was also spent from.
+    let first = match read_upload_header(
+        &mut socket,
+        deadline.saturating_duration_since(Instant::now()),
+    )
+    .await
+    {
         Ok(first) => first,
         Err(error) => {
             let _ = send_error_ack(&mut socket, ack_reason_for(&error)).await;
             return Err(error);
         }
     };
-    let scanner_id = match authorize_upload(&paired, &first.device_id, &first.token) {
+    let scanner_id = match authorize_upload(&paired, &first.device_id, &first.token, over_tls) {
         Ok(scanner_id) => scanner_id,
         Err(error) => {
             let _ = send_error_ack(&mut socket, ack_reason_for(&error)).await;
@@ -1249,8 +1396,8 @@ async fn handle_upload_connection(
     result
 }
 
-async fn stream_upload_pages(
-    socket: &mut TcpStream,
+async fn stream_upload_pages<S: AsyncRead + AsyncWrite + Unpin + Send>(
+    socket: &mut S,
     first: Upload,
     pages_tx: mpsc::Sender<Result<RawPage, BackendError>>,
 ) -> Result<(), ProtocolError> {
@@ -1291,7 +1438,7 @@ async fn stream_upload_pages(
             return Ok(());
         }
 
-        let next = read_upload_header(socket).await?;
+        let next = read_upload_header(socket, UPLOAD_FRAME_TIMEOUT).await?;
         if next.device_id != current.device_id || next.token != current.token {
             return Err(ProtocolError::Unauthorized {
                 device_id: next.device_id,
@@ -1317,9 +1464,17 @@ async fn stream_upload_pages(
     }
 }
 
-async fn read_upload_header(socket: &mut TcpStream) -> Result<Upload, ProtocolError> {
+/// Reads one upload header, within `budget`.
+///
+/// The budget is a parameter rather than [`UPLOAD_FRAME_TIMEOUT`] because the *first*
+/// header shares its deadline with the demux and the TLS handshake that may have preceded
+/// it (§11.4); every header after that gets the full frame timeout of its own.
+async fn read_upload_header<S: AsyncRead + AsyncWrite + Unpin + Send>(
+    socket: &mut S,
+    budget: Duration,
+) -> Result<Upload, ProtocolError> {
     let frame = timeout(
-        UPLOAD_FRAME_TIMEOUT,
+        budget,
         read_frame(socket, FrameKind::Control, DEFAULT_CONTROL_MAX_BYTES),
     )
     .await
@@ -1337,26 +1492,60 @@ async fn read_upload_header(socket: &mut TcpStream) -> Result<Upload, ProtocolEr
     Ok(upload)
 }
 
+/// Whether this upload may proceed, and for which scanner.
+///
+/// Two rules, and §11.4 is explicit that they are not symmetric:
+///
+/// - **A device paired over TLS may not upload in cleartext.** Without this the pin buys
+///   the host nothing: a token captured before the pairing was encrypted, or lifted from a
+///   phone afterwards, would simply be replayed on the cleartext path that has to stay
+///   open for everybody else. `unauthorized` is the reason rather than a new one because
+///   the app's documented response to it — discard the pairing and pair again — is exactly
+///   the repair, and a reason the app does not know would leave it with nothing to do.
+/// - **A device paired in cleartext may upload over TLS.** Accepted: the token still
+///   authenticates it and encryption is never worse than none. There is no pin to check
+///   and the host does not invent one — a fingerprint learned at first upload is a
+///   fingerprint of whatever answered (§11.1).
 fn authorize_upload(
     paired: &Arc<Mutex<BTreeMap<ScannerId, PairedDevice>>>,
     device_id: &str,
     token: &str,
+    over_tls: bool,
 ) -> Result<ScannerId, ProtocolError> {
-    paired
+    let unauthorized = || ProtocolError::Unauthorized {
+        device_id: device_id.to_owned(),
+    };
+
+    let (scanner_id, paired_over_tls) = paired
         .lock()
         .expect("mobile paired device lock poisoned")
         .iter()
         .find_map(|(scanner_id, device)| {
             (device.device_id == device_id
                 && constant_time_eq(&device.token_sha256, &hash_token(token)))
-            .then(|| scanner_id.clone())
+            .then(|| (scanner_id.clone(), device.tls))
         })
-        .ok_or_else(|| ProtocolError::Unauthorized {
-            device_id: device_id.to_owned(),
-        })
+        .ok_or_else(unauthorized)?;
+
+    if paired_over_tls && !over_tls {
+        // Loud, because the two things that produce it are a phone downgraded by
+        // something on the network and a token being replayed by something else, and
+        // neither is visible anywhere but here. The token itself is never logged.
+        warn!(
+            %device_id,
+            scanner = %scanner_id,
+            "refusing a cleartext upload from a phone that paired over TLS; the phone will \
+             be told to pair again"
+        );
+        return Err(unauthorized());
+    }
+
+    Ok(scanner_id)
 }
 
-async fn send_ok_ack(socket: &mut TcpStream) -> Result<(), ProtocolError> {
+async fn send_ok_ack<S: AsyncRead + AsyncWrite + Unpin + Send>(
+    socket: &mut S,
+) -> Result<(), ProtocolError> {
     send_ack(
         socket,
         Ack {
@@ -1367,7 +1556,10 @@ async fn send_ok_ack(socket: &mut TcpStream) -> Result<(), ProtocolError> {
     .await
 }
 
-async fn send_error_ack(socket: &mut TcpStream, reason: AckReason) -> Result<(), ProtocolError> {
+async fn send_error_ack<S: AsyncRead + AsyncWrite + Unpin + Send>(
+    socket: &mut S,
+    reason: AckReason,
+) -> Result<(), ProtocolError> {
     send_ack(
         socket,
         Ack {
@@ -1378,7 +1570,10 @@ async fn send_error_ack(socket: &mut TcpStream, reason: AckReason) -> Result<(),
     .await
 }
 
-async fn send_ack(socket: &mut TcpStream, ack: Ack) -> Result<(), ProtocolError> {
+async fn send_ack<S: AsyncRead + AsyncWrite + Unpin + Send>(
+    socket: &mut S,
+    ack: Ack,
+) -> Result<(), ProtocolError> {
     let payload = serialize_control_message(&Message::Ack(ack))?;
     write_frame(
         socket,
@@ -2932,6 +3127,168 @@ mod tests {
         ack
     }
 
+    /// What the app's side of a TLS upload learns, beyond the ack (§11.4).
+    struct TlsUpload {
+        ack: Ack,
+        /// The leaf certificate the host presented. The real app compares this against
+        /// what it pinned while pairing and hangs up if it differs.
+        server_certificate: rustls::pki_types::CertificateDer<'static>,
+        /// Whether a `CertificateRequest` arrived. It must not: the app has no identity
+        /// and would answer it empty.
+        asked_for_a_client_certificate: bool,
+    }
+
+    /// The same upload as [`upload_once`], over TLS — the app's side of §11.4.
+    async fn upload_once_tls(port: u16, upload: Upload, page: Vec<u8>) -> TlsUpload {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let phone = Arc::new(PhoneUploadClient {
+            provider: Arc::clone(&provider),
+            certificate_requests: Arc::new(AtomicU64::new(0)),
+        });
+        let config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(
+                Arc::clone(&phone) as Arc<dyn rustls::client::danger::ServerCertVerifier>
+            )
+            // Not `with_no_client_auth`, which would make the assertion below untestable:
+            // this resolver is what a `CertificateRequest` would reach, so counting its
+            // calls is how "no client certificate is requested" is observed from here.
+            .with_client_cert_resolver(
+                Arc::clone(&phone) as Arc<dyn rustls::client::ResolvesClientCert>
+            );
+
+        let socket = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut socket = tokio_rustls::TlsConnector::from(Arc::new(config))
+            .connect(
+                ServerName::from(std::net::IpAddr::from(std::net::Ipv4Addr::LOCALHOST)),
+                socket,
+            )
+            .await
+            .expect("the host completed the handshake");
+        let server_certificate = socket
+            .get_ref()
+            .1
+            .peer_certificates()
+            .expect("the host presented a certificate")
+            .first()
+            .expect("a leaf certificate")
+            .clone()
+            .into_owned();
+
+        let payload = serialize_control_message(&Message::Upload(upload)).unwrap();
+        write_frame(
+            &mut socket,
+            FrameKind::Control,
+            &payload,
+            DEFAULT_CONTROL_MAX_BYTES,
+        )
+        .await
+        .unwrap();
+        write_frame(&mut socket, FrameKind::Page, &page, DEFAULT_PAGE_MAX_BYTES)
+            .await
+            .unwrap();
+
+        let ack = read_frame(&mut socket, FrameKind::Control, DEFAULT_CONTROL_MAX_BYTES)
+            .await
+            .unwrap();
+        let Message::Ack(ack) = parse_control_message(&ack).unwrap() else {
+            panic!("expected ack");
+        };
+        TlsUpload {
+            ack,
+            server_certificate,
+            asked_for_a_client_certificate: phone.certificate_requests.load(Ordering::SeqCst) > 0,
+        }
+    }
+
+    /// The app uploading: it pins rather than validates, so it accepts any chain here and
+    /// checks the fingerprint itself; and it has no certificate of its own to offer.
+    #[derive(Debug)]
+    struct PhoneUploadClient {
+        provider: Arc<rustls::crypto::CryptoProvider>,
+        certificate_requests: Arc<AtomicU64>,
+    }
+
+    impl rustls::client::ResolvesClientCert for PhoneUploadClient {
+        fn resolve(
+            &self,
+            _root_hint_subjects: &[&[u8]],
+            _sigschemes: &[rustls::SignatureScheme],
+        ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+            self.certificate_requests.fetch_add(1, Ordering::SeqCst);
+            None
+        }
+
+        fn has_certs(&self) -> bool {
+            false
+        }
+    }
+
+    impl rustls::client::danger::ServerCertVerifier for PhoneUploadClient {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls12_signature(
+                message,
+                cert,
+                dss,
+                &self.provider.signature_verification_algorithms,
+            )
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls13_signature(
+                message,
+                cert,
+                dss,
+                &self.provider.signature_verification_algorithms,
+            )
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            self.provider
+                .signature_verification_algorithms
+                .supported_schemes()
+        }
+    }
+
+    /// One page, uploaded and fetched, with the trigger dance the listener requires: it
+    /// waits for somebody to claim the pages before it acks, so a test that only waits for
+    /// the ack deadlocks.
+    async fn fetch_one_page(
+        backend: &MobileBackend,
+        triggers: &mut BoxStream<'static, scanbus_core::ScanTrigger>,
+    ) {
+        let trigger = triggers.next().await.unwrap();
+        let mut pages = backend
+            .fetch_pages(&scanner_id(), &trigger.id)
+            .await
+            .unwrap();
+        pages.next().await.unwrap().unwrap();
+        assert!(pages.next().await.is_none());
+    }
+
     #[tokio::test]
     async fn an_upload_emits_a_push_trigger_and_fetches_its_page() {
         let phone = FakePhone::listen(Answer::Accept {
@@ -3039,6 +3396,153 @@ mod tests {
 
         assert_eq!(ack.status, AckStatus::Error);
         assert_eq!(ack.reason, Some(AckReason::NotConnected));
+    }
+
+    /// The other half of §11.2, and the one an upload proves: the certificate the phone
+    /// pinned during pairing is the certificate the listener presents. A second identity
+    /// minted for the server role passes every other test in this file and fails here.
+    #[tokio::test]
+    async fn an_upload_over_tls_presents_the_certificate_the_pairing_pinned() {
+        let phone = FakePhone::listen_with_tls(
+            Answer::Accept {
+                device_id: DEVICE_ID,
+            },
+            PhoneTls::Serves(rustls::ALL_VERSIONS),
+        )
+        .await;
+        let (_tmp, backend) = backend_that_saw_phone(&phone);
+        pair_with(&backend).await.0.unwrap();
+        let mut triggers = backend.start_listening(&scanner_info()).await.unwrap();
+
+        let send = tokio::spawn(upload_once_tls(
+            backend.upload_port(),
+            Upload {
+                v: PROTOCOL_VERSION,
+                device_id: DEVICE_ID.to_owned(),
+                token: "phone-token".to_owned(),
+                profile: ProfileKind::Image,
+                page: 1,
+                of: 1,
+                format: "jpeg".to_owned(),
+            },
+            vec![0xff, 0xd8, 0xff, 0xd9],
+        ));
+        fetch_one_page(&backend, &mut triggers).await;
+
+        let upload = send.await.unwrap();
+        assert_eq!(upload.ack.status, AckStatus::Ok);
+        assert_eq!(
+            upload.server_certificate,
+            phone
+                .pinned_certificate()
+                .expect("the pairing pinned a certificate")
+        );
+        // §11.4: no client certificate is requested. The app has none to send, and a
+        // `CertificateRequest` here would only produce handshake failures to explain.
+        assert!(!upload.asked_for_a_client_certificate);
+    }
+
+    /// §11.4's asymmetric rule, and the acceptance case with no counterpart on the app
+    /// side: the token is the right one, and it is refused because it arrived in clear.
+    #[tokio::test]
+    async fn a_cleartext_upload_from_a_phone_paired_over_tls_is_unauthorized() {
+        let phone = FakePhone::listen_with_tls(
+            Answer::Accept {
+                device_id: DEVICE_ID,
+            },
+            PhoneTls::Serves(rustls::ALL_VERSIONS),
+        )
+        .await;
+        let (_tmp, backend) = backend_that_saw_phone(&phone);
+        pair_with(&backend).await.0.unwrap();
+        let mut triggers = backend.start_listening(&scanner_info()).await.unwrap();
+
+        let ack = upload_once(
+            backend.upload_port(),
+            Upload {
+                v: PROTOCOL_VERSION,
+                device_id: DEVICE_ID.to_owned(),
+                token: "phone-token".to_owned(),
+                profile: ProfileKind::Image,
+                page: 1,
+                of: 1,
+                format: "jpeg".to_owned(),
+            },
+            vec![0xff, 0xd8, 0xff, 0xd9],
+        )
+        .await;
+
+        assert_eq!(ack.status, AckStatus::Error);
+        // The reason the app already knows how to repair: discard the pairing, pair again.
+        assert_eq!(ack.reason, Some(AckReason::Unauthorized));
+        // And no job was started off it, which is the thing a replay would be after.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), triggers.next())
+                .await
+                .is_err()
+        );
+    }
+
+    /// The converse, which §11.4 allows: the token still authenticates the phone, there is
+    /// no pin to check, and the host does not invent one from whatever answered.
+    #[tokio::test]
+    async fn a_phone_paired_in_cleartext_may_upload_over_tls() {
+        let phone = FakePhone::listen(Answer::Accept {
+            device_id: DEVICE_ID,
+        })
+        .await;
+        let (_tmp, backend) = backend_that_saw(&phone.address);
+        pair_with(&backend).await.0.unwrap();
+        assert!(!backend.lock_paired()[&scanner_id()].tls);
+        let mut triggers = backend.start_listening(&scanner_info()).await.unwrap();
+
+        let send = tokio::spawn(upload_once_tls(
+            backend.upload_port(),
+            Upload {
+                v: PROTOCOL_VERSION,
+                device_id: DEVICE_ID.to_owned(),
+                token: "phone-token".to_owned(),
+                profile: ProfileKind::Image,
+                page: 1,
+                of: 1,
+                format: "jpeg".to_owned(),
+            },
+            vec![0xff, 0xd8, 0xff, 0xd9],
+        ));
+        fetch_one_page(&backend, &mut triggers).await;
+
+        assert_eq!(send.await.unwrap().ack.status, AckStatus::Ok);
+        // Still a cleartext pairing: nothing about an encrypted upload upgrades the flag,
+        // because there was never a fingerprint for it to mean anything against (§11.6).
+        assert!(!backend.lock_paired()[&scanner_id()].tls);
+    }
+
+    /// The third row of §11.4's table. Nothing is sent back — whatever is at the other end
+    /// is not speaking this protocol under either reading, so there is nobody to ack to.
+    #[tokio::test]
+    async fn a_first_byte_that_is_neither_tls_nor_a_frame_is_closed_without_an_ack() {
+        let tmp = TempDir::new().unwrap();
+        let backend = backend_in(&tmp);
+
+        let mut socket = TcpStream::connect(("127.0.0.1", backend.upload_port()))
+            .await
+            .unwrap();
+        socket.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
+
+        let mut answer = Vec::new();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), socket.read_to_end(&mut answer))
+            .await
+            .expect("the host closed the connection instead of holding it open");
+
+        match outcome {
+            Ok(0) => {}
+            // The host drops the socket with the bytes it peeked at still unread, and
+            // Linux answers that with an RST rather than a FIN. Both are the connection
+            // being closed; what matters is that nothing came back through it.
+            Err(error) if error.kind() == io::ErrorKind::ConnectionReset => {}
+            other => panic!("expected the connection to be closed, got {other:?}"),
+        }
+        assert!(answer.is_empty(), "the host answered {answer:?}");
     }
 
     #[test]
