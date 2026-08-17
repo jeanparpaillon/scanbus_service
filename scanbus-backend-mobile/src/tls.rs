@@ -162,7 +162,9 @@ impl HostIdentity {
             KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).map_err(IdentityError::Generate)?;
 
         let mut params = CertificateParams::default();
-        params.distinguished_name.push(DnType::CommonName, COMMON_NAME);
+        params
+            .distinguished_name
+            .push(DnType::CommonName, COMMON_NAME);
         params.not_before = date_time_ymd(NOT_BEFORE_YMD.0, NOT_BEFORE_YMD.1, NOT_BEFORE_YMD.2);
         params.not_after = date_time_ymd(NOT_AFTER_YMD.0, NOT_AFTER_YMD.1, NOT_AFTER_YMD.2);
         params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
@@ -369,7 +371,10 @@ mod tests {
 
         let error = HostIdentity::load_or_generate(dir.path()).expect_err("must not regenerate");
 
-        assert!(matches!(error, IdentityError::Incomplete { .. }), "{error:?}");
+        assert!(
+            matches!(error, IdentityError::Incomplete { .. }),
+            "{error:?}"
+        );
         assert!(dir.path().join(KEY_FILE).exists(), "key was left alone");
     }
 

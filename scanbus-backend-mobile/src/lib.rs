@@ -406,6 +406,26 @@ impl MobileBackend {
             .clone()
     }
 
+    /// Why paired phones cannot be served, or `None` when they can.
+    ///
+    /// Two startup failures answer this, and §11.5 asks for the second to behave exactly
+    /// like the first: an `upload_port` somebody else already holds (§5), and a TLS
+    /// identity that could not be read. Neither aborts the daemon and neither is
+    /// repaired — the second least of all, since the only repair available would be to
+    /// mint a key over the unreadable one and unpair every phone at once. What they do
+    /// instead is leave the scanners they affect `Offline` while keeping the reason, so
+    /// that `Connect()` on one of them says what is wrong instead of timing out.
+    ///
+    /// The identity failure is deliberately the wider of the two for now: it takes down
+    /// every paired phone, including ones paired in cleartext that a host with no
+    /// certificate could still serve perfectly well (§11.6). Narrowing it to the phones
+    /// that actually pinned something needs the per-device `tls` flag of §11.5, which the
+    /// device store does not carry yet.
+    fn unavailable_reason(&self) -> Option<String> {
+        self.listener_error()
+            .or_else(|| self.identity_error().map(str::to_owned))
+    }
+
     #[cfg(test)]
     fn has_subscription(&self, scanner_id: &ScannerId) -> bool {
         self.subscriptions
@@ -490,10 +510,13 @@ impl MobileBackend {
         scanner: &ScannerInfo,
         progress: &mpsc::Sender<scanbus_core::PairingProgress>,
     ) -> Result<(), BackendError> {
-        if !self.listener_is_bound() {
-            let detail = self
-                .listener_error()
-                .unwrap_or_else(|| "the mobile upload listener is down".to_owned());
+        // Refusing on a broken identity, not quietly pairing in cleartext instead. A host
+        // with no certificate cannot present one, so every pairing it made here would be
+        // a downgrade the operator never asked for — recorded by the app as unencrypted,
+        // warned about there and nowhere else, and undone only by pairing again. §11.6
+        // reserves that outcome for an attacker who strips `tlsport`; the host must not
+        // arrive at it on its own because a file was unreadable.
+        if let Some(detail) = self.unavailable_reason() {
             return Err(BackendError::Other(format!(
                 "mobile pairing is unavailable: {detail}"
             )));
@@ -635,13 +658,19 @@ impl MobileBackend {
             .unwrap_or_default()
     }
 
+    /// A paired phone is only as reachable as the host's half of the connection it is
+    /// going to make.
+    ///
+    /// An unpaired one stays `Online` whatever is wrong here: it was discovered, it is
+    /// answering, and what is broken is the host's ability to serve a pairing rather than
+    /// anything about the phone. [`MobileBackend::pair`] is where that surfaces, with the
+    /// reason attached.
     fn status_for(&self, scanner: &ScannerId) -> Status {
-        if self.lock_paired().contains_key(scanner) {
-            if self.listener_is_bound() {
-                Status::Online
-            } else {
-                Status::Offline
-            }
+        if !self.lock_paired().contains_key(scanner) {
+            return Status::Online;
+        }
+        if self.unavailable_reason().is_some() {
+            Status::Offline
         } else {
             Status::Online
         }
@@ -843,10 +872,9 @@ impl ScannerBackend for MobileBackend {
         &self,
         scanner: &ScannerInfo,
     ) -> Result<BoxStream<'static, scanbus_core::ScanTrigger>, BackendError> {
-        if self.lock_paired().contains_key(&scanner.id) && !self.listener_is_bound() {
-            let detail = self
-                .listener_error()
-                .unwrap_or_else(|| "the mobile upload listener is down".to_owned());
+        if self.lock_paired().contains_key(&scanner.id)
+            && let Some(detail) = self.unavailable_reason()
+        {
             return Err(BackendError::Other(format!(
                 "mobile uploads are unavailable: {detail}"
             )));
@@ -2669,6 +2697,98 @@ mod tests {
         assert_eq!(store.upload_port, port);
 
         drop(blocker);
+    }
+
+    /// §11.5's other startup failure, and the one with a wrong answer available: a key
+    /// that cannot be read must leave the phones offline and the file alone. The
+    /// tempting repair — treat it as a first start, mint a new key — unpairs every phone
+    /// on the host at once and cannot be undone from either side.
+    #[tokio::test]
+    async fn an_unreadable_tls_key_leaves_paired_phones_offline_and_the_key_untouched() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("devices.json");
+        persist_device_store(
+            &path,
+            &PersistedDeviceStore {
+                version: DEVICE_STORE_VERSION,
+                upload_port: 0,
+                devices: BTreeMap::from([(
+                    scanner_id(),
+                    PersistedDevice {
+                        device_id: DEVICE_ID.to_owned(),
+                        token_sha256: hash_token("phone-token"),
+                        profiles: vec![ProfileKind::Image],
+                        paired_at: unix_timestamp_now(),
+                    },
+                )]),
+            },
+        )
+        .unwrap();
+
+        // A host that has run once, so there is a real pair on disk to damage — the
+        // interesting case is not a missing identity but a broken one.
+        let fingerprint = tls::HostIdentity::load_or_generate(tmp.path())
+            .unwrap()
+            .fingerprint_sha256()
+            .to_owned();
+        let key_path = tmp.path().join(tls::KEY_FILE);
+        let good_key = fs::read(&key_path).unwrap();
+        let damaged = b"-----BEGIN PRIVATE KEY-----\nnot base64\n".to_vec();
+        fs::write(&key_path, &damaged).unwrap();
+
+        let backend = MobileBackend::with_store_path(path.clone(), DISCOVERY_TIMEOUT, 0);
+
+        // The listener is fine. Nothing about this failure is the port's fault, and a
+        // test that let the two run together could not tell which one it was observing.
+        assert!(backend.listener_is_bound());
+        assert!(backend.listener_error().is_none());
+        assert!(backend.identity().is_none());
+        assert!(
+            backend.identity_error().unwrap().contains(tls::KEY_FILE),
+            "the reason has to name the file an operator must fix: {:?}",
+            backend.identity_error()
+        );
+        assert_eq!(backend.status_for(&scanner_id()), Status::Offline);
+
+        // The point of the whole test.
+        assert_eq!(fs::read(&key_path).unwrap(), damaged);
+        assert_eq!(
+            tls::HostIdentity::load_or_generate(tmp.path())
+                .unwrap_err()
+                .to_string(),
+            backend.identity_error().unwrap(),
+            "a second start must fail the same way rather than having repaired anything"
+        );
+
+        let error = match backend.start_listening(&scanner_info()).await {
+            Ok(_) => {
+                panic!("a paired mobile scanner must refuse Connect() when the host has no key")
+            }
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("mobile uploads are unavailable"),
+            "unexpected error: {error}"
+        );
+
+        // Pairing refuses too, rather than silently making a cleartext pairing the
+        // operator would only discover from the app's warning (§11.6).
+        let (outcome, _) = pair_with(&backend).await;
+        let error = outcome.expect_err("pairing must refuse while the host has no identity");
+        assert!(
+            error.to_string().contains("mobile pairing is unavailable"),
+            "unexpected error: {error}"
+        );
+
+        // Why refusing was worth it: put the key back and the host is the same host the
+        // phones pinned. A regeneration would have made this restore impossible.
+        fs::write(&key_path, &good_key).unwrap();
+        assert_eq!(
+            tls::HostIdentity::load_or_generate(tmp.path())
+                .unwrap()
+                .fingerprint_sha256(),
+            fingerprint
+        );
     }
 
     /// The nonce is the whole security value of the comparison: six digits, every one of
