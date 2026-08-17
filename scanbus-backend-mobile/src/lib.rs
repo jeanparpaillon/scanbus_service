@@ -10,7 +10,7 @@ use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -33,7 +33,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Backend identifier, as reported by `ScannerBackend::id`.
 pub const ID: &str = "mobile";
@@ -76,6 +76,16 @@ pub const UPLOAD_FRAME_TIMEOUT: Duration = Duration::from_secs(30);
 pub const FETCH_CLAIM_TIMEOUT: Duration = Duration::from_secs(5);
 pub const UPLOAD_PAGE_BUFFER: usize = 2;
 pub const DEFAULT_UPLOAD_RESOLUTION_DPI: u32 = 300;
+
+/// Where `mobile.require_tls` (§11.5) is read from.
+///
+/// The daemon has no configuration file yet — nothing in it is configurable, and adding
+/// a file, a format and a reload path to carry one boolean would be a subsystem this
+/// issue did not ask for. The environment is what a systemd unit already has a line for
+/// (`Environment=SCANBUS_MOBILE_REQUIRE_TLS=1`), which is exactly the office-network
+/// deployment §11.5 describes. When a configuration file does land, `mobile.require_tls`
+/// is the key this becomes and this variable is the fallback for it.
+pub const REQUIRE_TLS_ENV: &str = "SCANBUS_MOBILE_REQUIRE_TLS";
 
 /// What this crate writes. Bumped to 2 by §11.5's per-device `tls` flag.
 ///
@@ -299,6 +309,14 @@ pub struct MobileBackend {
     /// Why, kept for the same reason [`ListenerBinding::bind_error`] is — the daemon has
     /// to be able to say what is wrong with a scanner that came up unusable.
     identity_error: Option<Arc<str>>,
+    /// `mobile.require_tls` (§11.5): no pairing with a phone that advertises no
+    /// `tlsport`, and no cleartext upload from anybody, whatever the device table says.
+    ///
+    /// Shared rather than copied because the upload listener is spawned during
+    /// construction and holds it for the life of the process. A plain field would be read
+    /// once, into that task, and [`MobileBackend::with_require_tls`] would then be a
+    /// setter that silently does nothing to the half of the switch that refuses uploads.
+    require_tls: Arc<AtomicBool>,
     listener: Arc<Mutex<ListenerBinding>>,
     listener_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     subscriptions: Arc<Mutex<BTreeMap<ScannerId, mpsc::Sender<scanbus_core::ScanTrigger>>>>,
@@ -378,6 +396,18 @@ impl MobileBackend {
             }
         }
 
+        let require_tls = require_tls_from_env();
+        if require_tls {
+            // At `info`, not `debug`: this is the line somebody reads when a phone that
+            // paired last week suddenly cannot, and the answer is that the host was
+            // restarted with the switch on.
+            info!(
+                variable = REQUIRE_TLS_ENV,
+                "mobile TLS is required: phones without a tlsport will not be paired and \
+                 cleartext uploads are refused"
+            );
+        }
+
         let backend = Self {
             discovery_timeout,
             connect_timeout: PAIR_CONNECT_TIMEOUT,
@@ -390,6 +420,7 @@ impl MobileBackend {
             store_path: Arc::new(store_path),
             identity,
             identity_error,
+            require_tls: Arc::new(AtomicBool::new(require_tls)),
             listener: Arc::new(Mutex::new(listener)),
             listener_task: Arc::new(Mutex::new(None)),
             subscriptions: Arc::new(Mutex::new(BTreeMap::new())),
@@ -502,6 +533,7 @@ impl MobileBackend {
             .identity
             .as_ref()
             .map(|identity| identity.upload_server_config());
+        let require_tls = Arc::clone(&self.require_tls);
         let paired = Arc::clone(&self.paired);
         let subscriptions = Arc::clone(&self.subscriptions);
         let pending_uploads = Arc::clone(&self.pending_uploads);
@@ -510,6 +542,7 @@ impl MobileBackend {
             run_upload_listener(
                 listener,
                 server_config,
+                require_tls,
                 paired,
                 subscriptions,
                 pending_uploads,
@@ -531,6 +564,21 @@ impl MobileBackend {
         self.connect_timeout = connect;
         self.confirm_timeout = confirm;
         self
+    }
+
+    /// Sets `mobile.require_tls` (§11.5) directly, for a test or a simulator run that
+    /// cannot reach [`REQUIRE_TLS_ENV`] — a process-wide variable is not something one
+    /// test can set without deciding it for every other test in the binary.
+    ///
+    /// Takes effect on the already-running listener too; see the field's own note.
+    pub fn with_require_tls(self, require: bool) -> Self {
+        self.require_tls.store(require, Ordering::Relaxed);
+        self
+    }
+
+    /// Whether this host refuses cleartext outright (§11.5).
+    pub fn requires_tls(&self) -> bool {
+        self.require_tls.load(Ordering::Relaxed)
     }
 
     /// Whether an upload bearing `device_id` and `token` is from a phone this backend
@@ -601,6 +649,28 @@ impl MobileBackend {
                 // this flag the reason a later cleartext upload is refused, so it has to
                 // record what the connection was, never what was hoped for.
                 (response, true)
+            }
+            // §11.5's switch, and the only place the pairing half of it can live: after
+            // this line the difference between the two phones is gone. The refusal is
+            // before the dial rather than after the handshake because there is nothing to
+            // learn from dialling — the absent TXT key is the whole of what the phone has
+            // to say about its own TLS (§11.3), and a phone with no keystore identity
+            // cannot acquire one by being asked twice.
+            //
+            // `Other`, not a new error: §11.7 keeps `Scanner1` unchanged, and the reason
+            // string is what reaches the user. It names the switch, because "this phone is
+            // too old for this network" and "somebody set a variable" look identical from
+            // the front of a GUI and only one of them is worth calling anybody about.
+            None if self.requires_tls() => {
+                warn!(
+                    scanner = %scanner.id,
+                    variable = REQUIRE_TLS_ENV,
+                    "refusing to pair a phone that advertises no tlsport"
+                );
+                return Err(BackendError::Other(format!(
+                    "this phone offers no encrypted pairing port and {REQUIRE_TLS_ENV} is set: \
+                     pairing it would put its token and its pages on the network in clear"
+                )));
             }
             None => {
                 let socket = self.connect_to_record(&scanner.id, &record.address).await?;
@@ -1154,9 +1224,11 @@ impl Drop for MobileBackend {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_upload_listener(
     listener: TcpListener,
     server_config: Option<Arc<rustls::ServerConfig>>,
+    require_tls: Arc<AtomicBool>,
     paired: Arc<Mutex<BTreeMap<ScannerId, PairedDevice>>>,
     subscriptions: Arc<Mutex<BTreeMap<ScannerId, mpsc::Sender<scanbus_core::ScanTrigger>>>>,
     pending_uploads: Arc<Mutex<BTreeMap<String, PendingUpload>>>,
@@ -1167,6 +1239,7 @@ async fn run_upload_listener(
             continue;
         };
         let server_config = server_config.clone();
+        let require_tls = Arc::clone(&require_tls);
         let paired = Arc::clone(&paired);
         let subscriptions = Arc::clone(&subscriptions);
         let pending_uploads = Arc::clone(&pending_uploads);
@@ -1181,6 +1254,7 @@ async fn run_upload_listener(
             let _ = handle_upload_connection(
                 socket,
                 server_config,
+                require_tls.load(Ordering::Relaxed),
                 paired,
                 subscriptions,
                 pending_uploads,
@@ -1209,9 +1283,11 @@ const FRAME_LENGTH_TOP_BYTE: u8 = 0x00;
 /// budget rather than three because the three are one thing from the listener's side —
 /// a connection that has not yet said anything it can be held to — and §11.4 asks for the
 /// handshake to be inside that budget rather than in front of it.
+#[allow(clippy::too_many_arguments)]
 async fn handle_upload_connection(
     socket: TcpStream,
     server_config: Option<Arc<rustls::ServerConfig>>,
+    require_tls: bool,
     paired: Arc<Mutex<BTreeMap<ScannerId, PairedDevice>>>,
     subscriptions: Arc<Mutex<BTreeMap<ScannerId, mpsc::Sender<scanbus_core::ScanTrigger>>>>,
     pending_uploads: Arc<Mutex<BTreeMap<String, PendingUpload>>>,
@@ -1265,6 +1341,7 @@ async fn handle_upload_connection(
             serve_upload(
                 socket,
                 true,
+                require_tls,
                 deadline,
                 paired,
                 subscriptions,
@@ -1274,11 +1351,13 @@ async fn handle_upload_connection(
             .await
         }
         // Cleartext, exactly as before §11: every phone paired before it dials this and
-        // must keep working forever (§11.6).
+        // must keep working forever (§11.6) — unless `require_tls` is set, in which case
+        // it is served far enough to be told `unauthorized` and no further.
         FRAME_LENGTH_TOP_BYTE => {
             serve_upload(
                 socket,
                 false,
+                require_tls,
                 deadline,
                 paired,
                 subscriptions,
@@ -1306,12 +1385,13 @@ async fn handle_upload_connection(
 ///
 /// Generic over the socket for the same reason [`MobileBackend::pair_over`] is: the frames
 /// of §3 are byte-identical on both, and nothing from here down is allowed to know which
-/// one it got. The one thing that does know is `over_tls`, and it goes exactly one place —
-/// [`authorize_upload`].
-#[allow(clippy::too_many_arguments)]
+/// one it got. The one thing that does know is `over_tls`, and it — with the `require_tls`
+/// it is weighed against — goes exactly one place: [`authorize_upload`].
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 async fn serve_upload<S: AsyncRead + AsyncWrite + Unpin + Send>(
     mut socket: S,
     over_tls: bool,
+    require_tls: bool,
     deadline: Instant,
     paired: Arc<Mutex<BTreeMap<ScannerId, PairedDevice>>>,
     subscriptions: Arc<Mutex<BTreeMap<ScannerId, mpsc::Sender<scanbus_core::ScanTrigger>>>>,
@@ -1331,7 +1411,13 @@ async fn serve_upload<S: AsyncRead + AsyncWrite + Unpin + Send>(
             return Err(error);
         }
     };
-    let scanner_id = match authorize_upload(&paired, &first.device_id, &first.token, over_tls) {
+    let scanner_id = match authorize_upload(
+        &paired,
+        &first.device_id,
+        &first.token,
+        over_tls,
+        require_tls,
+    ) {
         Ok(scanner_id) => scanner_id,
         Err(error) => {
             let _ = send_error_ack(&mut socket, ack_reason_for(&error)).await;
@@ -1506,11 +1592,19 @@ async fn read_upload_header<S: AsyncRead + AsyncWrite + Unpin + Send>(
 ///   authenticates it and encryption is never worse than none. There is no pin to check
 ///   and the host does not invent one — a fingerprint learned at first upload is a
 ///   fingerprint of whatever answered (§11.1).
+///
+/// `require_tls` (§11.5) collapses both into one: on a host that is set that way no
+/// cleartext upload is authorized at all, whatever the device table says about who sent
+/// it. That is what makes it a network policy rather than a per-pairing property — the
+/// operator who sets it is saying nothing unencrypted crosses this LAN, and a phone
+/// paired before the switch was thrown is exactly the case they mean.
+#[allow(clippy::fn_params_excessive_bools)]
 fn authorize_upload(
     paired: &Arc<Mutex<BTreeMap<ScannerId, PairedDevice>>>,
     device_id: &str,
     token: &str,
     over_tls: bool,
+    require_tls: bool,
 ) -> Result<ScannerId, ProtocolError> {
     let unauthorized = || ProtocolError::Unauthorized {
         device_id: device_id.to_owned(),
@@ -1527,15 +1621,19 @@ fn authorize_upload(
         })
         .ok_or_else(unauthorized)?;
 
-    if paired_over_tls && !over_tls {
-        // Loud, because the two things that produce it are a phone downgraded by
-        // something on the network and a token being replayed by something else, and
-        // neither is visible anywhere but here. The token itself is never logged.
+    if !over_tls && (paired_over_tls || require_tls) {
+        // Loud, because the things that produce it are a phone downgraded by something on
+        // the network, a token being replayed by something else, and a switch somebody
+        // set — and none of the three is visible anywhere but here. The token itself is
+        // never logged. `required` is what separates "somebody is attacking this pairing"
+        // from "this phone predates the policy", which is the difference between calling
+        // the operator and calling the police.
         warn!(
             %device_id,
             scanner = %scanner_id,
-            "refusing a cleartext upload from a phone that paired over TLS; the phone will \
-             be told to pair again"
+            pinned = paired_over_tls,
+            required = require_tls,
+            "refusing a cleartext upload; the phone will be told to pair again"
         );
         return Err(unauthorized());
     }
@@ -1655,6 +1753,39 @@ fn host_name() -> String {
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "scanbus".to_owned())
+}
+
+/// `mobile.require_tls` as [`REQUIRE_TLS_ENV`] spells it. Default `false` (§11.5).
+fn require_tls_from_env() -> bool {
+    require_tls_setting(std::env::var_os(REQUIRE_TLS_ENV).as_deref())
+}
+
+/// The reading of it, split out because a process-wide variable cannot be set by one test
+/// without setting it for every other test in the binary.
+///
+/// A value that is neither spelling is a typo — `ture`, `enabled`, `TLS` — and the quiet
+/// way to handle it is to leave the switch off, which is the failure somebody discovers
+/// by finding their traffic in clear months later. So it is refused loudly and still left
+/// off: aborting over an environment variable would take out a daemon that was working
+/// before somebody edited a unit file, and an operator who set this wants their phones to
+/// keep scanning, not their host to stop.
+fn require_tls_setting(value: Option<&std::ffi::OsStr>) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    let value = value.to_string_lossy().trim().to_ascii_lowercase();
+    match value.as_str() {
+        "1" | "true" | "yes" | "on" => true,
+        "" | "0" | "false" | "no" | "off" => false,
+        other => {
+            warn!(
+                variable = REQUIRE_TLS_ENV,
+                value = other,
+                "unrecognised value; mobile TLS is NOT required. Use 1 or 0"
+            );
+            false
+        }
+    }
 }
 
 fn default_store_path() -> PathBuf {
@@ -2891,6 +3022,57 @@ mod tests {
         assert!(backend.lock_paired().is_empty());
     }
 
+    /// §11.5's switch, pairing half. The phone here is not broken — it is an older or
+    /// smaller build with no keystore identity, which every other test in this file pairs
+    /// happily. On the network §11.5 describes it is refused instead, and refused before
+    /// the dial: the absent TXT key is everything the phone has to say about its own TLS,
+    /// and it cannot acquire one by being asked again.
+    #[tokio::test]
+    async fn require_tls_refuses_to_pair_a_phone_that_advertises_no_tlsport() {
+        let phone = FakePhone::listen(Answer::Accept {
+            device_id: DEVICE_ID,
+        })
+        .await;
+        let (_tmp, backend) = backend_that_saw(&phone.address);
+        let backend = backend.with_require_tls(true);
+
+        let (outcome, steps) = pair_with(&backend).await;
+
+        let error = outcome.expect_err("a phone with no tlsport is not paired here");
+        // Named, per the acceptance: "this phone is too old for this network" and
+        // "somebody set a variable" are the same screen otherwise.
+        assert!(
+            error.to_string().contains(REQUIRE_TLS_ENV),
+            "the reason has to name the switch: {error}"
+        );
+        // Nothing was dialled and nobody was asked to confirm anything.
+        assert!(steps.is_empty(), "{steps:?}");
+        assert_eq!(phone.nonce_shown(), None);
+        assert!(backend.lock_paired().is_empty());
+        assert!(!backend.is_authorized(DEVICE_ID, "phone-token"));
+    }
+
+    /// And the other half of the switch: it refuses one kind of phone, not pairing. A
+    /// phone that advertises `tlsport` pairs exactly as it does with the switch off,
+    /// which is what makes this a policy and not an outage.
+    #[tokio::test]
+    async fn require_tls_pairs_a_phone_that_advertises_tlsport_as_usual() {
+        let phone = FakePhone::listen_with_tls(
+            Answer::Accept {
+                device_id: DEVICE_ID,
+            },
+            PhoneTls::Serves(rustls::ALL_VERSIONS),
+        )
+        .await;
+        let (_tmp, backend) = backend_that_saw_phone(&phone);
+        let backend = backend.with_require_tls(true);
+
+        pair_with(&backend).await.0.unwrap();
+
+        assert!(backend.is_authorized(DEVICE_ID, "phone-token"));
+        assert!(backend.lock_paired()[&scanner_id()].tls);
+    }
+
     /// The phone advertised what it can do, so `SupportedProfiles` says that and not the
     /// daemon's full list — including across the discovery round that follows.
     #[tokio::test]
@@ -3543,6 +3725,90 @@ mod tests {
             other => panic!("expected the connection to be closed, got {other:?}"),
         }
         assert!(answer.is_empty(), "the host answered {answer:?}");
+    }
+
+    /// §11.5's switch, upload half, and the case it exists for. This phone paired in
+    /// cleartext, legitimately, and §11.6 promises that pairing keeps working — but the
+    /// promise is to the *default* host. An operator who sets the switch is saying nothing
+    /// unencrypted crosses this LAN, and a phone paired before they said it is precisely
+    /// who they mean; the device table's answer is overridden rather than consulted.
+    ///
+    /// The refusal is still an ack rather than a dropped socket: `unauthorized` is what
+    /// the app knows how to repair, and re-pairing over TLS is the repair.
+    #[tokio::test]
+    async fn require_tls_refuses_a_cleartext_upload_from_a_phone_paired_before_the_switch() {
+        let phone = FakePhone::listen(Answer::Accept {
+            device_id: DEVICE_ID,
+        })
+        .await;
+        let (_tmp, backend) = backend_that_saw(&phone.address);
+        pair_with(&backend).await.0.unwrap();
+        assert!(
+            !backend.lock_paired()[&scanner_id()].tls,
+            "a cleartext pairing is what makes this the interesting case"
+        );
+
+        // Thrown after the pairing, exactly as a restart with the variable set would be.
+        let backend = backend.with_require_tls(true);
+        let mut triggers = backend.start_listening(&scanner_info()).await.unwrap();
+
+        let ack = upload_once(
+            backend.upload_port(),
+            Upload {
+                v: PROTOCOL_VERSION,
+                device_id: DEVICE_ID.to_owned(),
+                token: "phone-token".to_owned(),
+                profile: ProfileKind::Image,
+                page: 1,
+                of: 1,
+                format: "jpeg".to_owned(),
+            },
+            vec![0xff, 0xd8, 0xff, 0xd9],
+        )
+        .await;
+
+        assert_eq!(ack.status, AckStatus::Error);
+        assert_eq!(ack.reason, Some(AckReason::Unauthorized));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), triggers.next())
+                .await
+                .is_err(),
+            "no job may start off a refused upload"
+        );
+
+        // The same phone, the same token, over TLS: served. The switch refuses a
+        // transport, not a pairing — a phone that gets an app update and starts dialling
+        // TLS needs no attention from anybody.
+        let send = tokio::spawn(upload_once_tls(
+            backend.upload_port(),
+            Upload {
+                v: PROTOCOL_VERSION,
+                device_id: DEVICE_ID.to_owned(),
+                token: "phone-token".to_owned(),
+                profile: ProfileKind::Image,
+                page: 1,
+                of: 1,
+                format: "jpeg".to_owned(),
+            },
+            vec![0xff, 0xd8, 0xff, 0xd9],
+        ));
+        fetch_one_page(&backend, &mut triggers).await;
+        assert_eq!(send.await.unwrap().ack.status, AckStatus::Ok);
+    }
+
+    /// Default `false`, and the two spellings §11.5's key is read in. A typo leaves the
+    /// switch off, which is the whole reason it is also logged at `warn`.
+    #[test]
+    fn require_tls_is_off_unless_the_variable_says_otherwise() {
+        use std::ffi::OsStr;
+
+        assert!(!require_tls_setting(None), "the default is off (§11.5)");
+        for on in ["1", "true", "TRUE", "yes", "on", " 1 "] {
+            assert!(require_tls_setting(Some(OsStr::new(on))), "{on}");
+        }
+        for off in ["", "0", "false", "no", "off", "ture", "enabled"] {
+            assert!(!require_tls_setting(Some(OsStr::new(off))), "{off}");
+        }
     }
 
     #[test]

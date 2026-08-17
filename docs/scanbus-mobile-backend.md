@@ -553,6 +553,18 @@ flag recording whether the pairing was made over TLS, which bumps its version.
 advertise `tlsport` is not paired at all, and a cleartext upload is refused whatever the
 device table says.
 
+The daemon has no configuration file, so until it has one the key is read from the
+environment as `SCANBUS_MOBILE_REQUIRE_TLS`, which is a line a systemd unit already knows
+how to carry. Two consequences worth stating rather than discovering:
+
+- **A value that is neither spelling leaves the switch off**, loudly. Aborting the daemon
+  over an environment variable would take down a host that worked until somebody edited a
+  unit file; an operator who sets this wants their phones encrypted, not their host
+  stopped. The `warn` line is the only thing standing between a typo and traffic in clear.
+- **The pairing refusal names the variable.** "This phone is too old for this network" and
+  "somebody set a variable" are the same screen from the front of a GUI, and only one of
+  them is worth calling anybody about.
+
 ### 11.6 What this buys, and what it does not
 
 - A passive observer on the LAN no longer sees the token or the pages. That is the whole

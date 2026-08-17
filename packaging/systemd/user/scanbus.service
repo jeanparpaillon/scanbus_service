@@ -9,6 +9,11 @@ StartLimitBurst=5
 Type=dbus
 BusName=org.scanbus
 ExecStart=/usr/bin/scanbus-daemon
+# mobile.require_tls: refuse to pair a phone whose app offers no encrypted port, and
+# refuse every cleartext upload, including from phones paired before this was set. Off by
+# default because turning it on strands every phone that has not been re-paired since.
+# Anything other than 1/true/yes/on leaves it off, with a warning in the journal.
+#Environment=SCANBUS_MOBILE_REQUIRE_TLS=1
 Restart=on-failure
 RestartSec=2
 TimeoutStopSec=45
