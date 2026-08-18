@@ -1807,6 +1807,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "futures-core",
+ "scanbus-backend-common",
  "scanbus-core",
  "tempfile",
  "tokio",

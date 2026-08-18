@@ -7,6 +7,9 @@ rust-version.workspace = true
 repository.workspace = true
 
 [dependencies]
+# Acquisition goes through the same `scanbus-scanimage` streaming helper HP uses (6.3),
+# so ADF batching and end-of-feed are one implementation rather than two.
+scanbus-backend-common.workspace = true
 scanbus-core.workspace = true
 async-trait.workspace = true
 futures-core.workspace = true

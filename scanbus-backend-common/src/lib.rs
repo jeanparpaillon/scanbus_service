@@ -20,6 +20,23 @@ use tracing::warn;
 pub const DEFAULT_SCANIMAGE_HELPER: &str = "/usr/libexec/scanbus/scanbus-scanimage";
 const PAGE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// `scanimage` exits with the `SANE_Status` it stopped on, and these two are how a feed
+/// *ends* rather than how it fails.
+///
+/// `--batch` asks for pages until the source runs out, so the last iteration of a
+/// successful ADF run is always a refusal: `SANE_STATUS_NO_DOCS` when the feeder is
+/// empty, `SANE_STATUS_EOF` when the backend reports the document ended. Treating those
+/// as failures is what would land a completed two-page batch in `Job1.Status="error"` at
+/// the exact moment it finished — which is the case
+/// [`ScannerBackend::fetch_pages`](scanbus_core::ScannerBackend::fetch_pages) documents
+/// as "the ADF ran out of sheets", i.e. the end of the stream and not an `Err` item.
+///
+/// They only mean that **after at least one page**. Exiting `NO_DOCS` having produced
+/// nothing is a feeder that was empty when the user asked for a scan, which the user has
+/// to be told about, so it stays an error and keeps whatever `scanimage` wrote to stderr.
+const SANE_STATUS_EOF: i32 = 5;
+const SANE_STATUS_NO_DOCS: i32 = 7;
+
 struct ReceiverStream(mpsc::Receiver<Result<RawPage, BackendError>>);
 
 impl futures_core::Stream for ReceiverStream {
@@ -92,6 +109,7 @@ pub async fn fetch_pages_via_scanimage(
         });
 
         let outcome = stream_scanimage_pages(&config, &tempdir, &mut child, &sender).await;
+        let delivered = outcome.as_ref().copied().unwrap_or(0);
         let stderr = stderr_task.await.unwrap_or_default();
         let stderr = String::from_utf8_lossy(&stderr).trim().to_owned();
 
@@ -99,6 +117,7 @@ pub async fn fetch_pages_via_scanimage(
             let _ = sender.send(Err(error)).await;
         } else if let Ok(Some(status)) = child.try_wait()
             && !status.success()
+            && !ended_at_end_of_feed(status.code(), delivered)
         {
             let detail = if stderr.is_empty() {
                 format!(
@@ -125,19 +144,27 @@ pub async fn fetch_pages_via_scanimage(
     Ok(Box::pin(ReceiverStream(receiver)))
 }
 
+/// Whether a non-zero `scanimage` exit is the end of a feed rather than a failure.
+///
+/// See [`SANE_STATUS_NO_DOCS`] for why the page count is part of the question.
+const fn ended_at_end_of_feed(code: Option<i32>, pages_delivered: u32) -> bool {
+    pages_delivered > 0 && matches!(code, Some(SANE_STATUS_EOF) | Some(SANE_STATUS_NO_DOCS))
+}
+
+/// Streams the batch files as they are completed, and reports how many were delivered.
 async fn stream_scanimage_pages(
     config: &ScanimageConfig,
     tempdir: &TempDir,
     child: &mut tokio::process::Child,
     sender: &mpsc::Sender<Result<RawPage, BackendError>>,
-) -> Result<(), BackendError> {
+) -> Result<u32, BackendError> {
     let mut next_page = 1u32;
 
     loop {
         if sender.is_closed() {
             let _ = child.kill().await;
             let _ = child.wait().await;
-            return Ok(());
+            return Ok(next_page - 1);
         }
 
         while let Some(data) = read_complete_page(tempdir.path(), next_page).await? {
@@ -169,7 +196,7 @@ async fn stream_scanimage_pages(
                         })?;
                     next_page += 1;
                 }
-                return Ok(());
+                return Ok(next_page - 1);
             }
             Ok(None) => tokio::time::sleep(PAGE_POLL_INTERVAL).await,
             Err(error) => {
@@ -392,6 +419,56 @@ exit 7\n",
         assert!(matches!(error, BackendError::Other(_)));
         assert!(error.to_string().contains("ADF jam"), "{error}");
         assert!(stream.next().await.is_none());
+    }
+
+    /// The normal end of a `--batch` ADF run, which is a *refusal* from the device.
+    ///
+    /// Without this the two-page batch of an acceptance run lands in `Job1` as an error
+    /// on its last page, having produced both pages correctly.
+    #[tokio::test]
+    async fn a_feeder_that_runs_out_after_a_page_ends_the_stream_rather_than_failing_it() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let script = tempdir.path().join("scanimage-adf.sh");
+        fs::write(
+            &script,
+            "#!/bin/sh\n\
+batch=\n\
+for arg in \"$@\"; do\n\
+  case \"$arg\" in\n\
+    --batch=*) batch=${arg#--batch=} ;;\n\
+  esac\n\
+done\n\
+printf 'P5\\n1 1\\n255\\n\\001' > \"$(printf \"$batch\" 1)\"\n\
+echo 'Document feeder out of documents' >&2\n\
+exit 7\n",
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script, perms).unwrap();
+
+        let mut config = ScanimageConfig::new(scanner(), "airscan:e0:Brother MFC-J5335DW");
+        config.program = script;
+        let mut stream = fetch_pages_via_scanimage(config).await.unwrap();
+
+        let page = stream.next().await.unwrap().unwrap();
+        assert_eq!(page.index, 0);
+        assert!(
+            stream.next().await.is_none(),
+            "end of feed must end the stream, not put an Err on it"
+        );
+    }
+
+    /// The same exit code with nothing scanned is the opposite case: the feeder was empty
+    /// when the user asked, and they have to be told.
+    #[test]
+    fn an_empty_feeder_is_only_an_end_of_feed_once_a_page_exists() {
+        assert!(ended_at_end_of_feed(Some(SANE_STATUS_NO_DOCS), 1));
+        assert!(ended_at_end_of_feed(Some(SANE_STATUS_EOF), 2));
+        assert!(!ended_at_end_of_feed(Some(SANE_STATUS_NO_DOCS), 0));
+        // A jam mid-batch is a failure however many pages came out before it.
+        assert!(!ended_at_end_of_feed(Some(6), 3));
+        assert!(!ended_at_end_of_feed(None, 3));
     }
 
     #[test]

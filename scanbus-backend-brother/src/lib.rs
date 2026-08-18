@@ -1,24 +1,38 @@
-//! Brother backend: discovery plus install checks for `brscan4`/`brscan5`.
+//! Brother backend: eSCL discovery and acquisition, plus the scan-key protocol.
 //!
-//! The first implementation intentionally starts from `scanimage -L`: on the target
-//! machine it already enumerates Brother devices through the proprietary SANE backend
-//! as well as any eSCL-capable ones through airscan, which gives us one probe to parse
-//! instead of a fresh SNMP/mDNS implementation before the basics are tested.
+//! Discovery starts from `scanimage -L`, which already enumerates every eSCL-capable
+//! device through `sane-airscan` — one probe to parse instead of a fresh mDNS
+//! implementation before the basics are tested.
 //!
-//! # This backend never installs anything
+//! # Nothing from Brother's website is needed, or used
 //!
-//! `brscan4`/`brscan5` and `brscan-skey` are `.deb` files from Brother's website,
-//! outside any apt repository ([`scanbus-rust-implementation.md`] §4). The obvious
-//! reading of that — download the `.deb` and hand it to `dpkg -i` through `pkexec` —
-//! is deliberately not implemented: it would make every scanbus install a supply-chain
-//! decision the user was never shown, and would turn a session daemon into a
-//! privilege-escalation surface reachable from the session bus by any process.
+//! `brscan4`/`brscan5` and `brscan-skey` used to be this backend's dependencies, and both
+//! are `.deb` files outside any apt repository. They are gone
+//! ([`brother-skeyless-backend.md`] §2, and 5.10): the panel protocol is spoken here
+//! ([`skey`]) and the image comes over **eSCL**, which every Brother network model of the
+//! last several years offers and which `sane-airscan` — one `apt install`, from the
+//! distribution archive — already speaks. On the development machine's MFC-J5335DW that
+//! is the same device the vendor driver reaches:
 //!
-//! [`ensure_installed`](BrotherBackend::ensure_installed) therefore *verifies, or
-//! refuses*: it reports what is missing, by name and by where it comes from, and stops.
-//! Assisted installation is a later, separate step, and needs pieces this backend does
-//! not have — pinned URLs and checksums shipped in the package rather than fetched, an
-//! explicit confirmation through a UI, and a policy file the distribution can audit.
+//! ```text
+//! device `brother4:net1;dev0' is a Brother MFC-J5335DW MFC-J5335DW
+//! device `airscan:e0:Brother MFC-J5335DW' is a eSCL Brother MFC-J5335DW ip=192.168.1.3
+//! ```
+//!
+//! A `brother4:`/`brother5:` sighting is therefore still *read* — it is evidence that a
+//! Brother device exists, which keeps a device with no eSCL discoverable so that pairing
+//! can explain itself — but it is never an acquisition path and never selects a driver.
+//! There is no vendor package to check for, no per-model driver table, and
+//! [`Driver`](https://github.com/jeanparpaillon/scanbus_service/issues/69) is gone with
+//! them.
+//!
+//! # This backend still never installs anything
+//!
+//! [`ensure_installed`](BrotherBackend::ensure_installed) *verifies, or refuses*: it
+//! reports what is missing, by name and by where it comes from, and stops. What changed
+//! with 5.10 is only what it names — `sane-airscan`, which the user installs with `apt`,
+//! rather than two packages behind a vendor download form. Assisted installation is still
+//! a later, separate step, and needs pieces this backend does not have.
 //!
 //! Two things enforce that in code rather than in prose: every subprocess goes through
 //! [`CommandRunner`], so a test can assert the exact set of programs this crate is able
@@ -46,6 +60,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use futures_core::stream::BoxStream;
+use scanbus_backend_common::{DEFAULT_SCANIMAGE_HELPER, ScanimageConfig, fetch_pages_via_scanimage};
 use scanbus_core::{
     BackendError, ButtonsCapability, Capabilities, ColorMode, PairingProgress, ProfileKind,
     RawPage, RestoreDisposition, ScanTrigger, ScannerBackend, ScannerId, ScannerInfo, Source,
@@ -54,26 +69,29 @@ use scanbus_core::{
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+pub mod acquisition;
 pub mod listener;
 pub mod registrar;
 pub mod skey;
 
+use acquisition::{ButtonMapping, EsclDevice};
 use listener::{BindError, Inert, Listener};
 use registrar::{SnmpTransport, UdpSnmp, probe_scan_to_pc};
-use skey::register::LISTENER_PORT;
+use skey::register::{Function, LISTENER_PORT};
 use skey::snmp::DEFAULT_COMMUNITY;
 
 /// Backend identifier, as it will be reported by [`ScannerBackend::id`].
 pub const ID: &str = "brother-skey";
 
 const SCANNER_ID_BACKEND: &str = "brother";
-const SCANNER_BACKEND_NAME: &str = "proprietary:brother";
+const SCANNER_BACKEND_NAME: &str = "escl:brother";
 
-/// Where the packages come from, since no apt repository carries them.
+/// How the one dependency is installed, named in every "not installed" message.
 ///
-/// Named in every "not installed" message: a user told only "brscan4 is missing" has
-/// nowhere to go, because `apt install brscan4` cannot work on any distribution.
-const BROTHER_SUPPORT_SITE: &str = "https://support.brother.com/";
+/// The whole point of 5.10: the old messages had to send the user to a vendor download
+/// form, because `apt install brscan4` works on no distribution. This one is a command
+/// that works.
+const AIRSCAN_INSTALL_HINT: &str = "apt install sane-airscan";
 
 /// Everything the backend needs to decide whether one package is usable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,24 +104,28 @@ struct PackageProbe {
     files: &'static [&'static str],
 }
 
-const BRSCAN4_PROBE: PackageProbe = PackageProbe {
-    package: "brscan4",
+/// The one package acquisition needs, and the only dependency pairing checks.
+///
+/// The `.so` path is architecture-dependent, which is exactly why the file list is a fast
+/// path rather than the answer — [`BrotherBackend::package_presence`] falls through to the
+/// package's own file list for anything not spelled here.
+const AIRSCAN_PROBE: PackageProbe = PackageProbe {
+    package: "sane-airscan",
     files: &[
-        "/opt/brother/scanner/brscan4",
-        "/usr/lib64/sane/libsane-brother4.so",
-        "/usr/lib/x86_64-linux-gnu/sane/libsane-brother4.so",
+        "/usr/lib/x86_64-linux-gnu/sane/libsane-airscan.so.1",
+        "/usr/lib/aarch64-linux-gnu/sane/libsane-airscan.so.1",
+        "/usr/lib64/sane/libsane-airscan.so.1",
+        "/usr/lib/sane/libsane-airscan.so.1",
     ],
 };
 
-const BRSCAN5_PROBE: PackageProbe = PackageProbe {
-    package: "brscan5",
-    files: &[
-        "/opt/brother/scanner/brscan5",
-        "/usr/lib64/sane/libsane-brother5.so",
-        "/usr/lib/x86_64-linux-gnu/sane/libsane-brother5.so",
-    ],
-};
-
+/// `brscan-skey`, which is **not** a dependency any more and is still worth detecting.
+///
+/// Nothing requires it, nothing checks for it during pairing, and acquisition never goes
+/// near it. It survives here for one message only: it is what normally holds UDP/54925,
+/// so [`BrotherBackend::port_taken`] can say "this machine has it installed" instead of
+/// sending the user hunting for an unnamed process. See [`listener`] for why the port is
+/// not shared.
 const BRSCAN_SKEY_PROBE: PackageProbe = PackageProbe {
     package: "brscan-skey",
     files: &["/usr/bin/brscan-skey", "/opt/brother/scanner/brscan-skey"],
@@ -133,6 +155,9 @@ impl CommandRunner for SystemCommandRunner {
 #[derive(Debug, Clone)]
 pub struct BrotherBackend {
     scanimage_path: PathBuf,
+    /// The packaged wrapper acquisition runs, so that the daemon's own `scanimage` path
+    /// is one file the distribution owns rather than a guess per backend.
+    scanimage_helper_path: PathBuf,
     dpkg_query_path: PathBuf,
     /// Prefix every probed path is resolved against. `/` outside tests; a tempdir in
     /// them, which is what lets a test mask `brscan4` without touching the machine.
@@ -154,18 +179,37 @@ pub struct BrotherBackend {
     /// and not a per-scanner one ([`listener`]). Binds nothing until the first
     /// [`start_listening`](ScannerBackend::start_listening).
     listener: Arc<Listener>,
+    /// The eSCL device each scanner is acquired from, as discovery last saw it.
+    ///
+    /// [`fetch_pages`](ScannerBackend::fetch_pages) is handed a [`ScannerId`] and a
+    /// trigger id and nothing else, so the device name and the capability lists it needs
+    /// have to be carried here from discovery — the same shape HP's `sane_names` map has,
+    /// for the same reason. Shared with every clone: `discover` runs on one and
+    /// `fetch_pages` on another.
+    escl: Arc<Mutex<BTreeMap<ScannerId, EsclDevice>>>,
+    /// What the daemon has assigned to each panel key, per scanner.
+    ///
+    /// Written by [`set_button_mapping`](ScannerBackend::set_button_mapping) and read by
+    /// [`fetch_pages`](ScannerBackend::fetch_pages), which is the only reason the backend
+    /// keeps it: a press carries an index, and the profile that decides how to scan lives
+    /// on the daemon's side of the seam (1.3). Not durable — the daemon's own button
+    /// store is (4.1), and it replays the assignments on startup (4.2).
+    buttons: Arc<Mutex<BTreeMap<(ScannerId, u32), ButtonMapping>>>,
 }
 
 impl Default for BrotherBackend {
     fn default() -> Self {
         Self {
             scanimage_path: PathBuf::from("/usr/bin/scanimage"),
+            scanimage_helper_path: PathBuf::from(DEFAULT_SCANIMAGE_HELPER),
             dpkg_query_path: PathBuf::from("/usr/bin/dpkg-query"),
             sysroot: PathBuf::from("/"),
             runner: Arc::new(SystemCommandRunner),
             transport: Arc::new(UdpSnmp::default()),
             scan_to_pc: Arc::new(Mutex::new(BTreeMap::new())),
             listener: Arc::new(Listener::new(LISTENER_PORT)),
+            escl: Arc::new(Mutex::new(BTreeMap::new())),
+            buttons: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 }
@@ -184,45 +228,32 @@ enum ScanToPc {
     Unavailable { reason: String },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum Driver {
-    Brscan4,
-    Brscan5,
-}
-
-impl Driver {
-    const fn probe(self) -> PackageProbe {
-        match self {
-            Self::Brscan4 => BRSCAN4_PROBE,
-            Self::Brscan5 => BRSCAN5_PROBE,
-        }
-    }
-
-    const fn package(self) -> &'static str {
-        self.probe().package
-    }
-}
-
+/// How one `scanimage -L` line reaches the device.
+///
+/// The vendor SANE backends collapse into a single [`Transport::Vendor`]: telling
+/// `brother4:` from `brother5:` only ever existed to pick which `.deb` to demand, and
+/// neither is an acquisition path any more. The variant stays because the *sighting*
+/// still means something — a Brother device is there — which is what keeps a model with
+/// no eSCL discoverable instead of silently absent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Transport {
-    Brother4,
-    Brother5,
     Airscan,
     Escl,
+    Vendor,
     Other,
 }
 
 impl Transport {
-    const fn is_vendor(self) -> bool {
-        matches!(self, Self::Brother4 | Self::Brother5)
+    /// Whether this sighting is one acquisition can run against.
+    const fn is_escl(self) -> bool {
+        matches!(self, Self::Airscan | Self::Escl)
     }
 
     const fn as_str(self) -> &'static str {
         match self {
-            Self::Brother4 => "brother4",
-            Self::Brother5 => "brother5",
             Self::Airscan => "airscan",
             Self::Escl => "escl",
+            Self::Vendor => "vendor",
             Self::Other => "other",
         }
     }
@@ -271,20 +302,10 @@ impl Presence {
     }
 }
 
+/// What this machine can acquire with, which is now one question and not three.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct InstalledState {
-    brscan4: Presence,
-    brscan5: Presence,
-    brscan_skey: Presence,
-}
-
-impl InstalledState {
-    const fn driver_installed(self, driver: Driver) -> bool {
-        match driver {
-            Driver::Brscan4 => self.brscan4.is_usable(),
-            Driver::Brscan5 => self.brscan5.is_usable(),
-        }
-    }
+    airscan: Presence,
 }
 
 impl BrotherBackend {
@@ -326,11 +347,30 @@ impl BrotherBackend {
 
         let installed = self.installed_state()?;
         let scan_to_pc = self.scan_to_pc.lock().expect("scan-to-PC notes").clone();
-        scanners_from_sightings(
+        let scanners = scanners_from_sightings(
             parse_scanimage_output(&String::from_utf8_lossy(&output.stdout)),
             installed,
             &scan_to_pc,
-        )
+        )?;
+
+        // Discovery is the only place the eSCL device name is seen, and `fetch_pages`
+        // gets a `ScannerId` and nothing else. Recorded rather than re-derived, and
+        // *replaced* on every run: `sane-airscan` numbers its devices by discovery order,
+        // so `airscan:e0:` and `airscan:e2:` were the same printer twice on this machine
+        // within one session — a name cached once and never refreshed opens the wrong
+        // device, or none.
+        {
+            let mut escl = self.escl.lock().expect("eSCL device notes");
+            for scanner in &scanners {
+                if let Some(device) = escl_device(scanner) {
+                    escl.insert(scanner.id.clone(), device);
+                } else {
+                    escl.remove(&scanner.id);
+                }
+            }
+        }
+
+        Ok(scanners)
     }
 
     /// Ask the device whether it does scan-to-PC at all, and remember what it said.
@@ -464,24 +504,6 @@ impl BrotherBackend {
         }
     }
 
-    /// Which driver this scanner needs, from what discovery recorded about it.
-    fn required_driver_for(scanner: &ScannerInfo) -> Result<Driver, BackendError> {
-        let metadata = brother_metadata(scanner).ok_or_else(|| BackendError::InstallFailed {
-            package: "brother-driver".to_owned(),
-            detail: format!(
-                "scanner {} is missing Brother discovery metadata; rediscover it first",
-                scanner.id
-            ),
-        })?;
-        metadata.driver.ok_or_else(|| BackendError::InstallFailed {
-            package: "brother-driver".to_owned(),
-            detail: format!(
-                "scanbus does not know whether model {} requires brscan4 or brscan5 yet",
-                scanner.name
-            ),
-        })
-    }
-
     /// One dependency step: announce it, check it, and refuse if it is not usable.
     ///
     /// The [`PairingProgress::Installing`] goes out *before* the check, not after it.
@@ -521,27 +543,56 @@ impl BrotherBackend {
         })
     }
 
-    /// The driver this model needs, then `brscan-skey`, each its own progress step.
+    /// `sane-airscan`, and then that this device actually offers eSCL.
     ///
-    /// Two steps rather than one because they fail for different reasons and are fixed
-    /// by installing different packages: a machine can have `brscan4` from an earlier
-    /// SANE-only setup and no `brscan-skey` at all, which is exactly the case where
-    /// scanning works and walk-up keys do not.
+    /// Two steps, and they fail for different reasons: a machine with no `sane-airscan`
+    /// is one `apt install` from working, and a device that only ever appeared as
+    /// `brother4:` will not be fixed by installing anything. Both are still
+    /// [`PairingProgress::Installing`] steps, because the observable sequence is what a
+    /// client's progress UI is written against — see [`Self::check_dependency`].
+    ///
+    /// The vendor packages are checked for *nothing*. `brscan4`, `brscan5` and
+    /// `brscan-skey` may be installed or not; acquisition goes over eSCL either way, and
+    /// the only thing this backend still asks about `brscan-skey` is whether it is what
+    /// holds UDP/54925 when a bind fails ([`Self::port_taken`]).
     async fn check_dependencies(
         &self,
         scanner: &ScannerInfo,
         progress: &mpsc::Sender<PairingProgress>,
     ) -> Result<(), BackendError> {
-        let driver = Self::required_driver_for(scanner)?;
-        self.check_dependency(driver.probe(), progress).await?;
-        self.check_dependency(BRSCAN_SKEY_PROBE, progress).await
+        self.check_dependency(AIRSCAN_PROBE, progress).await?;
+        Self::check_escl_device(scanner)
+    }
+
+    /// That discovery found an eSCL way in to *this* device.
+    ///
+    /// The degraded path of [`brother-skeyless-backend.md`] §4: a model with no eSCL is
+    /// still discovered, so that pairing can say what is wrong instead of the scanner
+    /// silently not being there. It fails pairing rather than deferring to the first
+    /// press, because a panel entry that produces an error when it is used is worse than
+    /// a pairing that explained itself while the user was watching.
+    ///
+    /// [`brother-skeyless-backend.md`]: https://github.com/jeanparpaillon/scanbus_service/blob/master/docs/brother-skeyless-backend.md
+    fn check_escl_device(scanner: &ScannerInfo) -> Result<(), BackendError> {
+        if escl_device(scanner).is_some() {
+            return Ok(());
+        }
+
+        Err(BackendError::InstallFailed {
+            package: AIRSCAN_PROBE.package.to_owned(),
+            detail: format!(
+                "{} was found, but not over eSCL: scanbus acquires Brother scans through \
+                 sane-airscan and this device offered no eSCL interface to discovery. Check \
+                 that `{AIRSCAN_INSTALL_HINT}` has been run, that the scanner has network \
+                 scanning enabled, and rediscover — scanbus no longer uses brscan4/brscan5",
+                scanner.name
+            ),
+        })
     }
 
     fn installed_state(&self) -> Result<InstalledState, BackendError> {
         Ok(InstalledState {
-            brscan4: self.package_presence(BRSCAN4_PROBE)?,
-            brscan5: self.package_presence(BRSCAN5_PROBE)?,
-            brscan_skey: self.package_presence(BRSCAN_SKEY_PROBE)?,
+            airscan: self.package_presence(AIRSCAN_PROBE)?,
         })
     }
 
@@ -628,21 +679,22 @@ impl BrotherBackend {
 
 /// What a client is told about a package it has to install itself.
 ///
-/// Names the package and where it comes from, because neither is guessable: `apt
-/// install brscan4` works on no distribution, and the two failures need different
-/// actions from the user.
+/// Names the package *and the command*, because the two failures need different actions.
+/// This is the message 5.10 exists to change: it used to have to point at a vendor
+/// download form, and now it points at the distribution archive.
 fn missing_package_detail(probe: PackageProbe, presence: Presence) -> String {
     let package = probe.package;
     match presence {
         Presence::Present => format!("{package} is installed"),
         Presence::RegisteredButMissing => format!(
             "{package} is registered as installed but none of its files are on disk; \
-             reinstall the package from {BROTHER_SUPPORT_SITE} — scanbus does not install it"
+             reinstall it with `{AIRSCAN_INSTALL_HINT} --reinstall` and pair again — \
+             scanbus does not install it"
         ),
         Presence::Absent => format!(
-            "{package} is not installed and is in no distribution repository; \
-             download it from {BROTHER_SUPPORT_SITE} and install it, then pair again — \
-             scanbus does not install it"
+            "{package} is not installed; scanbus acquires Brother scans over eSCL and \
+             needs it. Run `{AIRSCAN_INSTALL_HINT}` and pair again — scanbus does not \
+             install it"
         ),
     }
 }
@@ -767,28 +819,127 @@ impl ScannerBackend for BrotherBackend {
         RestoreDisposition::Paired
     }
 
+    /// Records what the daemon assigned to a panel key, so acquisition knows how to scan.
+    ///
+    /// **This does not yet put the entry on the printer's panel.** Registering a function
+    /// with the device — and stopping the refresh when a key is cleared, which is how an
+    /// entry disappears from the LCD — is the registration half of the design
+    /// ([`brother-skeyless-backend.md`] §3) and lands with 5.11. What is here is the half
+    /// 5.10 needs: [`fetch_pages`](Self::fetch_pages) receives a trigger id, resolves it
+    /// to the key that was pressed, and has to turn that key into a `--source` and a
+    /// `--resolution`. The profile that decides those is the daemon's
+    /// ([`ScanTrigger`] carries an index and never a profile, per 1.3), so the only way
+    /// it can reach acquisition is for the assignment to be handed down and kept.
+    ///
+    /// `None` removes the assignment, per the trait: a cleared key is not the same as an
+    /// unchanged one, and a scan started from a key nobody has assigned falls back to the
+    /// device's own defaults rather than to whatever was mapped there last week.
+    ///
+    /// [`brother-skeyless-backend.md`]: https://github.com/jeanparpaillon/scanbus_service/blob/master/docs/brother-skeyless-backend.md
     async fn set_button_mapping(
         &self,
-        _scanner_id: &ScannerId,
-        _button_index: u32,
-        _profile: Option<ProfileKind>,
-        _options: &BTreeMap<String, Value>,
+        scanner_id: &ScannerId,
+        button_index: u32,
+        profile: Option<ProfileKind>,
+        options: &BTreeMap<String, Value>,
     ) -> Result<(), BackendError> {
-        Err(BackendError::Unsupported {
-            backend: ID,
-            operation: "set_button_mapping",
-        })
+        if Function::from_button_index(button_index).is_none() {
+            return Err(BackendError::Other(format!(
+                "scanner {scanner_id} has {} panel entries, indices 0..={}; asked to map \
+                 button {button_index}",
+                Function::ALL.len(),
+                Function::ALL.len() - 1,
+            )));
+        }
+
+        let mut buttons = self.buttons.lock().expect("brother button assignments");
+        match profile {
+            Some(profile) => {
+                buttons.insert(
+                    (scanner_id.clone(), button_index),
+                    ButtonMapping {
+                        profile,
+                        options: options.clone(),
+                    },
+                );
+            }
+            None => {
+                buttons.remove(&(scanner_id.clone(), button_index));
+            }
+        }
+        Ok(())
     }
 
+    /// Runs the scan the press asked for, over eSCL.
+    ///
+    /// Three lookups, each of which can fail for a reason the caller has to be able to
+    /// tell apart:
+    ///
+    /// 1. **The press.** [`Listener::take_press`] both resolves the trigger id and
+    ///    consumes it, which is what makes a second call for the same id
+    ///    [`BackendError::UnknownJob`] rather than a second scan — the trait's
+    ///    "callable exactly once per `trigger_id`".
+    /// 2. **The device.** The eSCL name discovery last saw, from
+    ///    [`BrotherBackend::escl`]. Absent means the scanner is paired but has not been
+    ///    seen over eSCL since this daemon started; `NotReachable` says so, because
+    ///    rediscovering is the fix and reinstalling nothing is.
+    /// 3. **The assignment**, which may legitimately be absent — see
+    ///    [`acquisition::scanimage_args`].
+    ///
+    /// The transfer itself is [`fetch_pages_via_scanimage`], unchanged from HP's (6.3):
+    /// the ADF batching, the partial-PNM detection and the end-of-feed rule are one
+    /// implementation in `scanbus-backend-common`, not two.
     async fn fetch_pages(
         &self,
         scanner_id: &ScannerId,
-        _trigger_id: &str,
+        trigger_id: &str,
     ) -> Result<BoxStream<'static, Result<RawPage, BackendError>>, BackendError> {
-        Err(BackendError::UnknownJob {
-            scanner: scanner_id.clone(),
-            job: "fetch_pages".to_owned(),
-        })
+        let Some(press) = self.listener.take_press(scanner_id, trigger_id) else {
+            return Err(BackendError::UnknownJob {
+                scanner: scanner_id.clone(),
+                job: trigger_id.to_owned(),
+            });
+        };
+
+        let device = self
+            .escl
+            .lock()
+            .expect("eSCL device notes")
+            .get(scanner_id)
+            .cloned();
+        let Some(device) = device else {
+            return Err(BackendError::NotReachable {
+                scanner: scanner_id.clone(),
+                detail: format!(
+                    "no eSCL device is on record for {scanner_id}; run a discovery so the \
+                     scanner is seen over eSCL again, then press the key once more"
+                ),
+            });
+        };
+
+        let button = press.function.button_index();
+        let mapping = self
+            .buttons
+            .lock()
+            .expect("brother button assignments")
+            .get(&(scanner_id.clone(), button))
+            .cloned();
+        let acquisition = acquisition::scanimage_args(mapping.as_ref(), &device);
+
+        info!(
+            scanner = %scanner_id,
+            trigger = %trigger_id,
+            function = %press.function,
+            device = %device.device_uri,
+            args = ?acquisition.args,
+            "acquiring over eSCL",
+        );
+
+        let mut config = ScanimageConfig::new(scanner_id.clone(), device.device_uri.clone());
+        config.program = self.scanimage_helper_path.clone();
+        config.resolution_dpi = acquisition.resolution_dpi;
+        config.extra_args = acquisition.args;
+        fetch_pages_via_scanimage(config).await
     }
 }
 
@@ -814,7 +965,6 @@ fn scanners_from_sightings(
                 address_hint: None,
                 stable_hint: None,
             });
-        let driver = required_driver(&sighting);
         let address = sighting
             .address_hint
             .clone()
@@ -835,15 +985,14 @@ fn scanners_from_sightings(
                 .unwrap_or_else(|| display_name(&sighting.description)),
             backend: SCANNER_BACKEND_NAME.to_owned(),
             address: address.clone(),
-            capabilities: capabilities_for_sighting(
-                &sighting,
-                driver,
-                installed,
-                scan_to_pc.get(&id),
-            ),
+            capabilities: capabilities_for_sighting(&sighting, installed, scan_to_pc.get(&id)),
             status: Status::Online,
         };
-        let precedence = if sighting.transport.is_vendor() { 0 } else { 1 };
+        // Inverted by 5.10: the eSCL sighting is the one acquisition runs against, so it
+        // has to be the one that survives dedup. A `brother4:` line for the same device
+        // only wins when it is the *only* sighting, which is the degraded case where the
+        // scanner is reported so that pairing can explain why it cannot be used.
+        let precedence = if sighting.transport.is_escl() { 0 } else { 1 };
         match scanners.get(&id) {
             Some((current_precedence, _)) if *current_precedence <= precedence => {}
             _ => {
@@ -891,10 +1040,8 @@ fn parse_scanimage_line(line: &str) -> Option<Sighting> {
 }
 
 fn transport_from_uri(uri: &str) -> Transport {
-    if uri.starts_with("brother4:") {
-        Transport::Brother4
-    } else if uri.starts_with("brother5:") {
-        Transport::Brother5
+    if uri.starts_with("brother4:") || uri.starts_with("brother5:") {
+        Transport::Vendor
     } else if uri.starts_with("airscan:") {
         Transport::Airscan
     } else if uri.starts_with("escl:") || uri.starts_with("http://") || uri.starts_with("https://")
@@ -906,7 +1053,7 @@ fn transport_from_uri(uri: &str) -> Transport {
 }
 
 fn is_brother_sighting(sighting: &Sighting) -> bool {
-    sighting.transport.is_vendor()
+    matches!(sighting.transport, Transport::Vendor)
         || contains_brother_marker(&sighting.device_uri)
         || contains_brother_marker(&sighting.description)
 }
@@ -921,7 +1068,7 @@ fn enrichments_by_model(sightings: &[Sighting]) -> BTreeMap<String, Enrichment> 
     let mut stable = BTreeMap::<String, BTreeSet<String>>::new();
 
     for sighting in sightings {
-        if sighting.transport.is_vendor() || !is_brother_sighting(sighting) {
+        if !sighting.transport.is_escl() || !is_brother_sighting(sighting) {
             continue;
         }
         let Some(model_key) = sighting.model_key.as_ref() else {
@@ -962,53 +1109,47 @@ fn unique_entry(set: &BTreeSet<String>) -> Option<&String> {
     if set.len() == 1 { set.first() } else { None }
 }
 
-fn required_driver(sighting: &Sighting) -> Option<Driver> {
-    if let Some(model_key) = sighting.model_key.as_deref() {
-        if matches!(
-            model_key,
-            "mfc-l2710dw" | "mfc-l2750dw" | "dcp-l2530dw" | "dcp-l2550dw" | "mfc-l3770cdw"
-        ) {
-            return Some(Driver::Brscan4);
-        }
-        if matches!(model_key, "ads-1800w" | "ads-4700w" | "mfc-j1010dw") {
-            return Some(Driver::Brscan5);
-        }
-    }
-
-    match sighting.transport {
-        Transport::Brother4 => Some(Driver::Brscan4),
-        Transport::Brother5 => Some(Driver::Brscan5),
-        _ => None,
-    }
-}
-
 /// What one sighting can do, including what the device itself said about its panel keys.
 ///
 /// `scan_to_pc` is `None` for a scanner that has never been asked — every scanner, until
-/// it is paired. The model table's optimism stands until the device contradicts it, which
-/// is the right way round: a scanner nobody has paired yet is not evidence of anything,
-/// and a `count` that dropped to zero on its own would be indistinguishable from a bug.
+/// it is paired. The four panel entries stand until the device contradicts them, which is
+/// the right way round: a scanner nobody has paired yet is not evidence of anything, and
+/// a `count` that dropped to zero on its own would be indistinguishable from a bug.
+///
+/// # No model table
+///
+/// 5.1 answered "what can this scanner do?" from a five-model lookup on the name, which
+/// meant every other Brother — the development machine's MFC-J5335DW included — was
+/// published with an empty resolution list and no sources at all. It is gone. What
+/// replaces it is what the sighting itself says: the `escl:` backend prints its paper
+/// paths into the description (`… adf,platen scanner`), and where a sighting is silent
+/// the eSCL baseline below is used and marked as such, rather than a guess from a name.
 fn capabilities_for_sighting(
     sighting: &Sighting,
-    driver: Option<Driver>,
     installed: InstalledState,
     scan_to_pc: Option<&ScanToPc>,
 ) -> Capabilities {
-    let mut capabilities = model_capabilities(sighting.model_key.as_deref()).unwrap_or_default();
+    let mut capabilities = escl_capabilities(sighting);
     let mut extra = BTreeMap::from([(
         "device_uri".to_owned(),
         Value::Str(sighting.device_uri.clone()),
     )]);
-    if let Some(driver) = driver {
-        extra.insert("driver".to_owned(), Value::Str(driver.package().to_owned()));
-        extra.insert(
-            "driver_installed".to_owned(),
-            Value::Bool(installed.driver_installed(driver)),
-        );
-    }
     extra.insert(
         "transport".to_owned(),
         Value::Str(sighting.transport.as_str().to_owned()),
+    );
+    // The acquisition choice, visible in `scanbus show --json`: which device name a scan
+    // will be run against, or nothing at all when this Brother was only ever seen through
+    // the vendor SANE backend, which scanbus no longer uses.
+    if sighting.transport.is_escl() {
+        extra.insert(
+            "acquisition_uri".to_owned(),
+            Value::Str(sighting.device_uri.clone()),
+        );
+    }
+    extra.insert(
+        "airscan_installed".to_owned(),
+        Value::Bool(installed.airscan.is_usable()),
     );
     if let Some(stable_hint) = sighting.stable_hint.as_ref() {
         extra.insert("stable_hint".to_owned(), Value::Str(stable_hint.clone()));
@@ -1028,8 +1169,9 @@ fn capabilities_for_sighting(
             extra.insert("scan_to_pc".to_owned(), Value::Bool(true));
         }
         Some(ScanToPc::Unavailable { reason }) => {
-            // Zero buttons whatever the model table says: the table is a guess from a
-            // model name, and this is the device's own answer. Nothing else about the
+            // Zero buttons whatever the panel protocol offers in general: the four entries
+            // are what the firmware defines, and this is the device's own answer about
+            // whether it will accept any of them. Nothing else about the
             // scanner changes — it stays discovered, pairable, and scannable.
             capabilities.buttons = ButtonsCapability {
                 count: 0,
@@ -1072,60 +1214,84 @@ fn device_ipv4(scanner: &ScannerInfo) -> Option<Ipv4Addr> {
         .and_then(|address| address.parse().ok())
 }
 
-fn model_capabilities(model_key: Option<&str>) -> Option<Capabilities> {
-    match model_key? {
-        "mfc-l2710dw" | "mfc-l2750dw" | "dcp-l2550dw" => Some(Capabilities {
-            resolutions: vec![100, 200, 300, 600],
-            color_modes: vec![ColorMode::Color, ColorMode::Gray, ColorMode::Bw],
-            sources: vec![Source::Flatbed, Source::Adf],
-            duplex: true,
-            buttons: ButtonsCapability {
-                count: 4,
-                label_configurable: false,
-                labels: Vec::new(),
-            },
+/// The resolutions every eSCL device on this desk has offered, used where a sighting is
+/// silent about them.
+///
+/// `scanimage -A` against the MFC-J5335DW over `sane-airscan` reports
+/// `--resolution 100|200|300|600dpi`, and `--mode Color|Gray`. Published as a baseline
+/// rather than as a fact about the model: the alternative is an empty list, which a
+/// client renders as a scanner that can do nothing.
+const ESCL_BASELINE_RESOLUTIONS: &[u32] = &[100, 200, 300, 600];
+
+/// What an eSCL sighting says the device can do.
+///
+/// The paper paths come from the description when it carries them and default to the
+/// glass when it does not — a device with no ADF is the safe assumption, because asking
+/// a flatbed for its feeder fails at `sane_start` while asking a feeder for its glass
+/// does not.
+///
+/// Buttons are the *protocol's* four entries, not a per-model claim: the firmware builds
+/// its *Scan to PC* menu from `FUNC`, so a Brother that speaks the registration OID has
+/// exactly these four and no others ([`skey::register::Function`]). A device that refuses
+/// the OID has this reduced to zero by its caller, from the device's own answer.
+fn escl_capabilities(sighting: &Sighting) -> Capabilities {
+    if !sighting.transport.is_escl() {
+        // Seen only through the vendor SANE backend, which scanbus does not use. It is a
+        // scanner, and nothing is known about what it can be asked for.
+        return Capabilities {
+            buttons: panel_buttons(),
             ..Capabilities::default()
-        }),
-        "dcp-l2530dw" => Some(Capabilities {
-            resolutions: vec![100, 200, 300, 600],
-            color_modes: vec![ColorMode::Color, ColorMode::Gray, ColorMode::Bw],
-            sources: vec![Source::Flatbed, Source::Adf],
-            duplex: false,
-            buttons: ButtonsCapability {
-                count: 4,
-                label_configurable: false,
-                labels: Vec::new(),
-            },
-            ..Capabilities::default()
-        }),
-        _ => Some(Capabilities {
-            buttons: ButtonsCapability {
-                count: 0,
-                label_configurable: false,
-                labels: Vec::new(),
-            },
-            ..Capabilities::default()
-        }),
+        };
+    }
+
+    Capabilities {
+        resolutions: ESCL_BASELINE_RESOLUTIONS.to_vec(),
+        color_modes: vec![ColorMode::Color, ColorMode::Gray],
+        sources: acquisition::sources_from_description(&sighting.description)
+            .unwrap_or_else(|| vec![Source::Flatbed]),
+        // eSCL advertises duplex as a separate ADF source (`ADF Duplex`), which no
+        // `scanimage -L` line carries. Claimed only when the description says so.
+        duplex: sighting.description.to_ascii_lowercase().contains("duplex"),
+        buttons: panel_buttons(),
+        ..Capabilities::default()
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct BrotherMetadata {
-    driver: Option<Driver>,
+/// The device's physical menu: the four `FUNC` entries, with the firmware's own labels.
+fn panel_buttons() -> ButtonsCapability {
+    ButtonsCapability {
+        count: u32::try_from(Function::ALL.len()).expect("four panel entries fit in a u32"),
+        label_configurable: false,
+        labels: Function::ALL
+            .iter()
+            .map(|function| function.device_label().to_owned())
+            .collect(),
+    }
 }
 
-fn brother_metadata(scanner: &ScannerInfo) -> Option<BrotherMetadata> {
-    let dict = scanner
+/// The eSCL device a discovered scanner is acquired from, if it has one.
+///
+/// Read back out of the capability dict rather than passed alongside it, so that the
+/// thing `scanbus show --json` prints and the thing `fetch_pages` runs against are the
+/// same value by construction.
+fn escl_device(scanner: &ScannerInfo) -> Option<EsclDevice> {
+    let device_uri = scanner
         .capabilities
         .extra
         .get("brother")
-        .and_then(as_dict)?;
-    let driver = dict.get("driver").and_then(|value| match value {
-        Value::Str(package) if package == "brscan4" => Some(Driver::Brscan4),
-        Value::Str(package) if package == "brscan5" => Some(Driver::Brscan5),
-        _ => None,
-    });
-    Some(BrotherMetadata { driver })
+        .and_then(as_dict)
+        .and_then(|dict| dict.get("acquisition_uri"))
+        .and_then(|value| match value {
+            Value::Str(uri) => Some(uri.clone()),
+            _ => None,
+        })?;
+
+    Some(EsclDevice {
+        device_uri,
+        resolutions: scanner.capabilities.resolutions.clone(),
+        color_modes: scanner.capabilities.color_modes.clone(),
+        sources: scanner.capabilities.sources.clone(),
+    })
 }
 
 fn as_dict(value: &Value) -> Option<&BTreeMap<String, Value>> {
@@ -1250,6 +1416,7 @@ fn command_output(stdout: &[u8], stderr: &[u8]) -> String {
 mod tests {
     use std::fs;
     use std::net::SocketAddrV4;
+    use std::os::unix::fs::PermissionsExt as _;
     use std::os::unix::process::ExitStatusExt as _;
     use std::process::ExitStatus;
     use std::sync::Mutex;
@@ -1260,6 +1427,9 @@ mod tests {
 
     use super::*;
 
+    /// The SANE library path the one dependency lives at on this machine.
+    const AIRSCAN_SO: &str = "/usr/lib/x86_64-linux-gnu/sane/libsane-airscan.so.1";
+
     #[test]
     fn scanimage_lines_are_parsed() {
         let output = r#"
@@ -1269,7 +1439,9 @@ device 'airscan:escl:Brother MFC-L2710DW http://BRW001122334455.local:80/eSCL/' 
 
         let parsed = parse_scanimage_output(output);
         assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0].transport, Transport::Brother4);
+        // `brother4:` and `brother5:` are one transport now: which of the two `.deb`s a
+        // model wanted stopped being a question the day acquisition left them.
+        assert_eq!(parsed[0].transport, Transport::Vendor);
         assert_eq!(parsed[0].model.as_deref(), Some("MFC-L2710DW"));
         assert_eq!(parsed[1].transport, Transport::Airscan);
         assert_eq!(
@@ -1278,8 +1450,12 @@ device 'airscan:escl:Brother MFC-L2710DW http://BRW001122334455.local:80/eSCL/' 
         );
     }
 
+    /// The precedence inversion of 5.10, on the two lines the same printer produces.
+    ///
+    /// Dedup by physical address is unchanged — one scanner comes out — but the survivor
+    /// is now the eSCL sighting, because that is the one a scan can be run against.
     #[test]
-    fn vendor_sighting_inherits_stable_identity_from_unique_airscan_match() {
+    fn the_escl_sighting_wins_the_dedup_and_is_what_a_scan_runs_against() {
         let scanners = scanners_from_sightings(
             vec![
                 parse_scanimage_line("device 'brother4:net1;dev0' is 'Brother MFC-L2710DW'")
@@ -1288,9 +1464,7 @@ device 'airscan:escl:Brother MFC-L2710DW http://BRW001122334455.local:80/eSCL/' 
                     .unwrap(),
             ],
             InstalledState {
-                brscan4: Presence::Present,
-                brscan5: Presence::Absent,
-                brscan_skey: Presence::Present,
+                airscan: Presence::Present,
             },
             &never_asked(),
         )
@@ -1310,35 +1484,83 @@ device 'airscan:escl:Brother MFC-L2710DW http://BRW001122334455.local:80/eSCL/' 
             .and_then(as_dict)
             .unwrap();
         assert_eq!(
-            brother.get("driver"),
-            Some(&Value::Str("brscan4".to_owned()))
+            brother.get("transport"),
+            Some(&Value::Str("airscan".to_owned()))
         );
-        assert_eq!(brother.get("driver_installed"), Some(&Value::Bool(true)));
+        // The acquisition choice, visible on the bus rather than only in this crate.
+        assert_eq!(
+            brother.get("acquisition_uri"),
+            Some(&Value::Str(
+                "airscan:escl:http://BRW001122334455.local:80/eSCL/".to_owned()
+            ))
+        );
+        assert_eq!(brother.get("airscan_installed"), Some(&Value::Bool(true)));
+        // Nothing about a vendor driver survives on the wire.
+        assert!(!brother.contains_key("driver"), "{brother:?}");
+        assert!(!brother.contains_key("driver_installed"), "{brother:?}");
         assert_eq!(scanners[0].capabilities.buttons.count, 4);
     }
 
+    /// A model nobody wrote a table entry for, which is every model but five.
+    ///
+    /// The old per-model table published this scanner with no resolutions, no sources and
+    /// no buttons. What it can do now comes from the sighting and from the panel protocol,
+    /// neither of which needs to have heard of the model.
     #[test]
-    fn unknown_models_keep_zero_buttons_and_no_driver_guess() {
-        let scanners =
-            scanners_from_sightings(
-                vec![parse_scanimage_line(
-                "device 'airscan:escl:http://192.168.1.23:80/eSCL/' is 'Brother Scanner XYZ'",
-            )
-            .unwrap()],
-                InstalledState::default(),
-                &never_asked(),
-            )
-            .unwrap();
+    fn an_unknown_model_is_described_from_its_sighting_rather_than_from_a_table() {
+        let scanners = scanners_from_sightings(
+            vec![
+                parse_scanimage_line(
+                    "device 'escl:http://192.168.1.3:80' is a Brother MFC-J5335DW adf,platen scanner",
+                )
+                .unwrap(),
+            ],
+            InstalledState::default(),
+            &never_asked(),
+        )
+        .unwrap();
 
         assert_eq!(scanners.len(), 1);
-        assert_eq!(scanners[0].capabilities.buttons.count, 0);
+        let capabilities = &scanners[0].capabilities;
+        assert_eq!(capabilities.resolutions, vec![100, 200, 300, 600]);
+        assert_eq!(capabilities.color_modes, vec![ColorMode::Color, ColorMode::Gray]);
+        // Read off `adf,platen` in the description, not out of a model name.
+        assert_eq!(capabilities.sources, vec![Source::Flatbed, Source::Adf]);
+        assert!(!capabilities.duplex);
+        // The firmware's four `FUNC` entries, with the firmware's labels.
+        assert_eq!(capabilities.buttons.count, 4);
+        assert_eq!(capabilities.buttons.labels[0], "Scan to File");
+        assert!(!capabilities.buttons.label_configurable);
+    }
+
+    /// The degraded case of the design's §4: no eSCL anywhere, so the scanner is still
+    /// discovered — the alternative is a printer that is simply not there — but nothing
+    /// claims a scan can be run against it.
+    #[test]
+    fn a_device_seen_only_through_the_vendor_backend_is_still_discovered() {
+        let scanners = scanners_from_sightings(
+            vec![
+                parse_scanimage_line("device 'brother4:net1;dev0' is 'Brother MFC-L2710DW'")
+                    .unwrap(),
+            ],
+            InstalledState::default(),
+            &never_asked(),
+        )
+        .unwrap();
+
+        assert_eq!(scanners.len(), 1);
         let brother = scanners[0]
             .capabilities
             .extra
             .get("brother")
             .and_then(as_dict)
             .unwrap();
-        assert!(!brother.contains_key("driver"));
+        assert_eq!(
+            brother.get("transport"),
+            Some(&Value::Str("vendor".to_owned()))
+        );
+        assert!(!brother.contains_key("acquisition_uri"), "{brother:?}");
+        assert_eq!(escl_device(&scanners[0]), None);
     }
 
     #[test]
@@ -1450,8 +1672,25 @@ device 'airscan:escl:Brother MFC-L2710DW http://BRW001122334455.local:80/eSCL/' 
         }
     }
 
-    /// The MFC-L2710DW of this machine, as discovery hands it to `ensure_installed`.
+    /// The MFC-J5335DW of this machine over eSCL, as discovery hands it to
+    /// `ensure_installed`.
     fn brother_mfc() -> ScannerInfo {
+        scanners_from_sightings(
+            vec![
+                parse_scanimage_line(
+                    "device 'escl:http://192.168.1.3:80' is a Brother MFC-J5335DW adf,platen scanner",
+                )
+                .unwrap(),
+            ],
+            InstalledState::default(),
+            &never_asked(),
+        )
+        .unwrap()
+        .remove(0)
+    }
+
+    /// The same printer on a machine where nothing speaks eSCL to it.
+    fn vendor_only_mfc() -> ScannerInfo {
         scanners_from_sightings(
             vec![
                 parse_scanimage_line("device 'brother4:net1;dev0' is 'Brother MFC-L2710DW'")
@@ -1567,7 +1806,7 @@ device 'airscan:escl:Brother MFC-L2710DW http://BRW001122334455.local:80/eSCL/' 
     /// its buttons.
     #[tokio::test]
     async fn a_device_that_refuses_the_oid_keeps_a_scanner_and_loses_its_buttons() {
-        let root = sysroot(&["/opt/brother/scanner/brscan4", "/usr/bin/brscan-skey"]);
+        let root = sysroot(&[AIRSCAN_SO, "/usr/bin/brscan-skey"]);
         let device = FakeSnmp::answering(Some(skey::snmp::ErrorStatus::NoSuchName));
         let (backend, _) = networked_backend(&root, device.clone());
 
@@ -1624,7 +1863,7 @@ device 'airscan:escl:Brother MFC-L2710DW http://BRW001122334455.local:80/eSCL/' 
 
     #[tokio::test]
     async fn a_device_that_knows_the_oid_keeps_its_buttons() {
-        let root = sysroot(&["/opt/brother/scanner/brscan4", "/usr/bin/brscan-skey"]);
+        let root = sysroot(&[AIRSCAN_SO, "/usr/bin/brscan-skey"]);
         let device = FakeSnmp::answering(Some(skey::snmp::ErrorStatus::NoError));
         let (backend, _) = networked_backend(&root, device);
 
@@ -1647,7 +1886,7 @@ device 'airscan:escl:Brother MFC-L2710DW http://BRW001122334455.local:80/eSCL/' 
     /// to undo.
     #[tokio::test]
     async fn a_printer_that_does_not_answer_is_not_recorded_as_button_less() {
-        let root = sysroot(&["/opt/brother/scanner/brscan4", "/usr/bin/brscan-skey"]);
+        let root = sysroot(&[AIRSCAN_SO, "/usr/bin/brscan-skey"]);
         let device = FakeSnmp::answering(None);
         let (backend, _) = networked_backend(&root, device);
 
@@ -1670,7 +1909,7 @@ device 'airscan:escl:Brother MFC-L2710DW http://BRW001122334455.local:80/eSCL/' 
     /// useful than leaving four keys advertised that nothing will ever deliver.
     #[tokio::test]
     async fn a_usb_scanner_reports_no_panel_keys_and_says_why() {
-        let root = sysroot(&["/opt/brother/scanner/brscan4", "/usr/bin/brscan-skey"]);
+        let root = sysroot(&[AIRSCAN_SO, "/usr/bin/brscan-skey"]);
         let device = FakeSnmp::answering(Some(skey::snmp::ErrorStatus::NoError));
         let runner = Arc::new(RecordingRunner {
             scanimage: "device 'brother4:bus4;dev1:usb:001:002' is a Brother MFC-L2710DW\n",
@@ -1685,10 +1924,11 @@ device 'airscan:escl:Brother MFC-L2710DW http://BRW001122334455.local:80/eSCL/' 
         };
 
         let scanner = backend.discover().await.unwrap().remove(0);
-        ensure_installed_progress(&backend, &scanner)
-            .await
-            .0
-            .unwrap();
+        // The scan-to-PC question directly rather than through `ensure_installed`: this
+        // device is only visible over `brother4:`, so pairing now stops at the eSCL check
+        // (`a_device_with_no_escl_fails_pairing_and_says_why`) before it ever gets here.
+        // What is under test is the panel, not acquisition.
+        backend.note_scan_to_pc(&scanner).await;
 
         assert!(
             device.asked().is_empty(),
@@ -1720,14 +1960,14 @@ device 'airscan:escl:Brother MFC-L2710DW http://BRW001122334455.local:80/eSCL/' 
 
         // A vendor URI names a SANE device, not an address, and an mDNS name is not one
         // this backend resolves. Neither may be guessed at.
-        assert_eq!(device_ipv4(&brother_mfc()), None);
+        assert_eq!(device_ipv4(&vendor_only_mfc()), None);
     }
 
     // -------------------------------------------------------------- the panel listener
 
     /// The same four-button model, at a loopback address a test can send a datagram *from*.
     const LOOPBACK_MFC: &str =
-        "device 'escl:http://127.0.0.2:80' is a Brother MFC-L2710DW flatbed scanner\n";
+        "device 'escl:http://127.0.0.2:80' is a Brother MFC-L2710DW adf,platen scanner\n";
 
     /// A backend whose listener asks for `port` instead of the fixed UDP/54925, which no
     /// test may bind: it is the port the machine running the suite may well have
@@ -1812,10 +2052,10 @@ device 'airscan:escl:Brother MFC-L2710DW http://BRW001122334455.local:80/eSCL/' 
     /// index of the entry that was chosen.
     #[tokio::test]
     async fn a_paired_scanner_reports_its_panel_presses_as_button_triggers() {
-        // `brscan-skey` on disk because `ensure_installed` still requires it (5.2); 5.10 is
-        // what drops it from the dependency set. Its *files* being there is not the same
-        // thing as the daemon running, which is what would take the port.
-        let root = sysroot(&["/opt/brother/scanner/brscan4", "/usr/bin/brscan-skey"]);
+        // `brscan-skey`'s files on disk deliberately: 5.10 dropped it from the dependency
+        // set, and its being present must change nothing. Files being there is not the
+        // same thing as the daemon running, which is what would take the port.
+        let root = sysroot(&[AIRSCAN_SO, "/usr/bin/brscan-skey"]);
         let port = free_port().await;
         let (backend, _) = listening_backend(&root, LOOPBACK_MFC, port);
 
@@ -1857,7 +2097,7 @@ device 'airscan:escl:Brother MFC-L2710DW http://BRW001122334455.local:80/eSCL/' 
     /// alone — still discovered, still reporting its keys, nothing sent to the device.
     #[tokio::test]
     async fn a_port_brscan_skey_holds_is_refused_by_name() {
-        let root = sysroot(&["/opt/brother/scanner/brscan4", "/usr/bin/brscan-skey"]);
+        let root = sysroot(&[AIRSCAN_SO, "/usr/bin/brscan-skey"]);
         let squatter = tokio::net::UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
             .await
             .unwrap();
@@ -1888,7 +2128,7 @@ device 'airscan:escl:Brother MFC-L2710DW http://BRW001122334455.local:80/eSCL/' 
     /// send the user hunting a package that is not there.
     #[tokio::test]
     async fn a_port_taken_by_something_else_says_how_to_find_out_what() {
-        let root = sysroot(&["/opt/brother/scanner/brscan4"]);
+        let root = sysroot(&[AIRSCAN_SO]);
         let squatter = tokio::net::UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
             .await
             .unwrap();
@@ -1912,24 +2152,32 @@ device 'airscan:escl:Brother MFC-L2710DW http://BRW001122334455.local:80/eSCL/' 
     #[tokio::test]
     async fn a_scanner_with_no_panel_presses_to_deliver_still_connects() {
         let usb = "device 'brother4:bus4;dev1:usb:001:002' is a Brother MFC-L2710DW\n";
-        for (case, scanimage, answer) in [
-            ("usb", usb, skey::snmp::ErrorStatus::NoError),
+        for (case, scanimage, answer, pairs) in [
+            // A `brother4:` USB device has no eSCL and so cannot be scanned from at all
+            // any more; it is here for the listener half, which still has to hand it an
+            // open, silent stream rather than an error.
+            ("usb", usb, skey::snmp::ErrorStatus::NoError, false),
             (
                 "refused the OID",
                 LOOPBACK_MFC,
                 skey::snmp::ErrorStatus::NoSuchName,
+                true,
             ),
         ] {
-            let root = sysroot(&["/opt/brother/scanner/brscan4", "/usr/bin/brscan-skey"]);
+            let root = sysroot(&[AIRSCAN_SO, "/usr/bin/brscan-skey"]);
             let port = free_port().await;
             let (mut backend, _) = listening_backend(&root, scanimage, port);
             backend.transport = FakeSnmp::answering(Some(answer));
 
             let scanner = backend.discover().await.unwrap().remove(0);
-            ensure_installed_progress(&backend, &scanner)
-                .await
-                .0
-                .unwrap_or_else(|error| panic!("{case} must still pair: {error}"));
+            if pairs {
+                ensure_installed_progress(&backend, &scanner)
+                    .await
+                    .0
+                    .unwrap_or_else(|error| panic!("{case} must still pair: {error}"));
+            } else {
+                backend.note_scan_to_pc(&scanner).await;
+            }
 
             let mut stream = backend
                 .start_listening(&scanner)
@@ -1957,7 +2205,7 @@ device 'airscan:escl:Brother MFC-L2710DW http://BRW001122334455.local:80/eSCL/' 
     /// `stop_listening` on something that never listened, and twice over.
     #[tokio::test]
     async fn stopping_a_listener_that_is_not_running_is_not_an_error() {
-        let root = sysroot(&["/opt/brother/scanner/brscan4"]);
+        let root = sysroot(&[AIRSCAN_SO]);
         let port = free_port().await;
         let (backend, _) = listening_backend(&root, LOOPBACK_MFC, port);
         let scanner = backend.discover().await.unwrap().remove(0);
@@ -1968,6 +2216,293 @@ device 'airscan:escl:Brother MFC-L2710DW http://BRW001122334455.local:80/eSCL/' 
         drop(stream);
         backend.stop_listening(&scanner.id).await.unwrap();
         assert_eq!(backend.listener.port(), None);
+    }
+
+
+    // ----------------------------------------------------------------- acquisition
+
+    /// A stand-in for the packaged `scanbus-scanimage`: records its argv and writes one
+    /// page.
+    ///
+    /// The argv is the assertion. Everything else about acquisition — the batching, the
+    /// partial-PNM detection, the end of feed — belongs to `scanbus-backend-common` and
+    /// is tested there; what this crate decides is *which device and which options*, and
+    /// that is exactly what lands in this file.
+    fn recording_scanimage(root: &TempDir) -> (PathBuf, PathBuf) {
+        let argv = root.path().join("scanimage-argv");
+        let script = root.path().join("scanimage-helper.sh");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+batch=\n\
+for arg in \"$@\"; do\n\
+  printf '%s\\n' \"$arg\" >> {argv}\n\
+  case \"$arg\" in\n\
+    --batch=*) batch=${{arg#--batch=}} ;;\n\
+  esac\n\
+done\n\
+printf 'P5\\n1 1\\n255\\n\\001' > \"$(printf \"$batch\" 1)\"\n",
+                argv = argv.display(),
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script, perms).unwrap();
+        (script, argv)
+    }
+
+    fn recorded_argv(path: &Path) -> Vec<String> {
+        fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    async fn next_page(
+        stream: &mut BoxStream<'static, Result<RawPage, BackendError>>,
+    ) -> Option<Result<RawPage, BackendError>> {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            std::future::poll_fn(|cx| {
+                futures_core::Stream::poll_next(std::pin::Pin::new(&mut *stream), cx)
+            }),
+        )
+        .await
+        .expect("acquisition should not hang")
+    }
+
+    /// A backend that will actually scan: a listener on a test port and a `scanimage`
+    /// helper that records what it was asked for.
+    async fn acquiring_backend(root: &TempDir) -> (BrotherBackend, ScannerInfo, PathBuf) {
+        let port = free_port().await;
+        let (mut backend, _) = listening_backend(root, LOOPBACK_MFC, port);
+        let (helper, argv) = recording_scanimage(root);
+        backend.scanimage_helper_path = helper;
+
+        let scanner = backend.discover().await.unwrap().remove(0);
+        ensure_installed_progress(&backend, &scanner)
+            .await
+            .0
+            .unwrap();
+        (backend, scanner, argv)
+    }
+
+    /// One press of a key assigned the `document` profile, from datagram to page.
+    ///
+    /// The assertion is the command line, because that is the whole of what this issue
+    /// decides: the eSCL device name discovery recorded, the feeder the profile implies,
+    /// and a resolution from the device's own list — with no vendor URI anywhere in it.
+    #[tokio::test]
+    async fn a_press_scans_over_escl_with_the_options_the_assigned_profile_implies() {
+        let root = sysroot(&[AIRSCAN_SO]);
+        let (backend, scanner, argv) = acquiring_backend(&root).await;
+
+        backend
+            .set_button_mapping(
+                &scanner.id,
+                Function::File.button_index(),
+                Some(ProfileKind::Document),
+                &BTreeMap::new(),
+            )
+            .await
+            .unwrap();
+
+        let mut stream = backend.start_listening(&scanner).await.unwrap();
+        press(
+            Ipv4Addr::new(127, 0, 0, 2),
+            backend.listener.port().unwrap(),
+            Function::File,
+        )
+        .await;
+        let trigger = next_trigger(&mut stream).await;
+
+        let mut pages = backend.fetch_pages(&scanner.id, &trigger.id).await.unwrap();
+        let page = next_page(&mut pages).await.unwrap().unwrap();
+        assert_eq!(page.index, 0);
+        assert_eq!(page.resolution_dpi, 300);
+        assert!(next_page(&mut pages).await.is_none());
+
+        let argv = recorded_argv(&argv);
+        assert!(
+            argv.contains(&"--device-name=escl:http://127.0.0.2:80".to_owned()),
+            "the eSCL device discovery recorded, and nothing else: {argv:?}",
+        );
+        assert!(argv.contains(&"--source=ADF".to_owned()), "{argv:?}");
+        assert!(argv.contains(&"--resolution=300".to_owned()), "{argv:?}");
+        assert!(
+            !argv.iter().any(|arg| arg.contains("brother4")
+                || arg.contains("brother5")
+                || arg.contains("brscan")),
+            "no vendor driver may appear on the command line: {argv:?}",
+        );
+    }
+
+    /// The glass, and the one thing that keeps a flatbed run from being an open-ended
+    /// batch.
+    #[tokio::test]
+    async fn an_image_profile_scans_one_sheet_from_the_glass() {
+        let root = sysroot(&[AIRSCAN_SO]);
+        let (backend, scanner, argv) = acquiring_backend(&root).await;
+
+        backend
+            .set_button_mapping(
+                &scanner.id,
+                Function::Image.button_index(),
+                Some(ProfileKind::Image),
+                &BTreeMap::new(),
+            )
+            .await
+            .unwrap();
+
+        let mut stream = backend.start_listening(&scanner).await.unwrap();
+        press(
+            Ipv4Addr::new(127, 0, 0, 2),
+            backend.listener.port().unwrap(),
+            Function::Image,
+        )
+        .await;
+        let trigger = next_trigger(&mut stream).await;
+        let mut pages = backend.fetch_pages(&scanner.id, &trigger.id).await.unwrap();
+        next_page(&mut pages).await.unwrap().unwrap();
+
+        let argv = recorded_argv(&argv);
+        assert!(argv.contains(&"--source=Flatbed".to_owned()), "{argv:?}");
+        assert!(argv.contains(&"--batch-count=1".to_owned()), "{argv:?}");
+    }
+
+    /// The trait's "callable exactly once per `trigger_id`", which here is what stops a
+    /// second `Job1` from pulling a second sheet through the feeder.
+    #[tokio::test]
+    async fn a_trigger_can_be_fetched_once_and_an_unknown_one_never() {
+        let root = sysroot(&[AIRSCAN_SO]);
+        let (backend, scanner, _) = acquiring_backend(&root).await;
+
+        let mut stream = backend.start_listening(&scanner).await.unwrap();
+        press(
+            Ipv4Addr::new(127, 0, 0, 2),
+            backend.listener.port().unwrap(),
+            Function::Ocr,
+        )
+        .await;
+        let trigger = next_trigger(&mut stream).await;
+
+        backend.fetch_pages(&scanner.id, &trigger.id).await.unwrap();
+
+        for (case, id) in [("already fetched", trigger.id.as_str()), ("never minted", "press-99")] {
+            match backend.fetch_pages(&scanner.id, id).await {
+                Err(BackendError::UnknownJob { scanner: reported, job }) => {
+                    assert_eq!(reported, scanner.id, "{case}");
+                    assert_eq!(job, id, "{case}");
+                }
+                Err(other) => panic!("{case} must be UnknownJob, got {other:?}"),
+                Ok(_) => panic!("{case} must not start a second scan"),
+            }
+        }
+    }
+
+    /// A press with nothing assigned to the key still scans: the paper is already in the
+    /// feeder, and the daemon is the one that decides what to do with the pages.
+    #[tokio::test]
+    async fn an_unassigned_key_still_acquires_at_the_devices_defaults() {
+        let root = sysroot(&[AIRSCAN_SO]);
+        let (backend, scanner, argv) = acquiring_backend(&root).await;
+
+        let mut stream = backend.start_listening(&scanner).await.unwrap();
+        press(
+            Ipv4Addr::new(127, 0, 0, 2),
+            backend.listener.port().unwrap(),
+            Function::Email,
+        )
+        .await;
+        let trigger = next_trigger(&mut stream).await;
+
+        let mut pages = backend.fetch_pages(&scanner.id, &trigger.id).await.unwrap();
+        next_page(&mut pages).await.unwrap().unwrap();
+
+        let argv = recorded_argv(&argv);
+        assert!(argv.contains(&"--source=Flatbed".to_owned()), "{argv:?}");
+    }
+
+    /// Clearing a key removes what it was mapped to, rather than leaving last week's
+    /// assignment driving the scan.
+    #[tokio::test]
+    async fn clearing_a_key_forgets_its_options() {
+        let root = sysroot(&[AIRSCAN_SO]);
+        let (backend, scanner, argv) = acquiring_backend(&root).await;
+        let index = Function::File.button_index();
+
+        backend
+            .set_button_mapping(&scanner.id, index, Some(ProfileKind::Document), &BTreeMap::new())
+            .await
+            .unwrap();
+        backend
+            .set_button_mapping(&scanner.id, index, None, &BTreeMap::new())
+            .await
+            .unwrap();
+
+        let mut stream = backend.start_listening(&scanner).await.unwrap();
+        press(
+            Ipv4Addr::new(127, 0, 0, 2),
+            backend.listener.port().unwrap(),
+            Function::File,
+        )
+        .await;
+        let trigger = next_trigger(&mut stream).await;
+        let mut pages = backend.fetch_pages(&scanner.id, &trigger.id).await.unwrap();
+        next_page(&mut pages).await.unwrap().unwrap();
+
+        let argv = recorded_argv(&argv);
+        assert!(
+            argv.contains(&"--source=Flatbed".to_owned()),
+            "a cleared key must not keep asking for the feeder: {argv:?}",
+        );
+    }
+
+    /// The panel has four entries and the API's indices are 0..=3, the same table
+    /// registration and event decoding are written against.
+    #[tokio::test]
+    async fn a_button_index_the_panel_does_not_have_is_refused() {
+        let backend = BrotherBackend::default();
+        let scanner = brother_mfc();
+
+        let error = backend
+            .set_button_mapping(&scanner.id, 4, Some(ProfileKind::Image), &BTreeMap::new())
+            .await
+            .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("button 4"), "{message}");
+        assert!(message.contains("0..=3"), "{message}");
+    }
+
+    /// A scanner nothing has been discovered for cannot be scanned from, and the message
+    /// has to say that rediscovering is the fix — not that something needs installing.
+    #[tokio::test]
+    async fn a_scanner_with_no_recorded_escl_device_is_not_reachable() {
+        let root = sysroot(&[AIRSCAN_SO]);
+        let (backend, scanner, _) = acquiring_backend(&root).await;
+
+        let mut stream = backend.start_listening(&scanner).await.unwrap();
+        press(
+            Ipv4Addr::new(127, 0, 0, 2),
+            backend.listener.port().unwrap(),
+            Function::File,
+        )
+        .await;
+        let trigger = next_trigger(&mut stream).await;
+        backend.escl.lock().unwrap().clear();
+
+        let Err(error) = backend.fetch_pages(&scanner.id, &trigger.id).await else {
+            panic!("a scanner with no eSCL device on record must not scan");
+        };
+
+        let BackendError::NotReachable { detail, .. } = &error else {
+            panic!("expected NotReachable, got {error:?}");
+        };
+        assert!(detail.contains("discovery"), "{detail}");
     }
 
     async fn ensure_installed_progress(
@@ -1984,12 +2519,15 @@ device 'airscan:escl:Brother MFC-L2710DW http://BRW001122334455.local:80/eSCL/' 
         (outcome, progress)
     }
 
-    /// The boring case this machine is in: both packages present, so pairing walks
-    /// straight through — but still through `installing_backend`, because that is the
-    /// state a client's progress UI is written against.
+    /// The boring case: `sane-airscan` present, so pairing walks straight through — but
+    /// still through `installing_backend`, because that is the state a client's progress
+    /// UI is written against and it must not change when a dependency set does.
+    ///
+    /// `brscan-skey` is on this sysroot deliberately: it must make no difference either
+    /// way, and a step naming it here would be a dependency that came back.
     #[tokio::test]
     async fn present_dependencies_still_pass_through_installing_backend() {
-        let root = sysroot(&["/opt/brother/scanner/brscan4", "/usr/bin/brscan-skey"]);
+        let root = sysroot(&[AIRSCAN_SO, "/usr/bin/brscan-skey"]);
         let runner = Arc::new(RecordingRunner::default());
         let backend = backend(&root, Arc::clone(&runner));
 
@@ -2000,14 +2538,10 @@ device 'airscan:escl:Brother MFC-L2710DW http://BRW001122334455.local:80/eSCL/' 
             progress,
             vec![
                 PairingProgress::Checking {
-                    message: "checking Brother dependencies for MFC-L2710DW".to_owned(),
+                    message: "checking Brother dependencies for MFC-J5335DW".to_owned(),
                 },
                 PairingProgress::Installing {
-                    package: "brscan4".to_owned(),
-                    percent: None,
-                },
-                PairingProgress::Installing {
-                    package: "brscan-skey".to_owned(),
+                    package: "sane-airscan".to_owned(),
                     percent: None,
                 },
                 PairingProgress::Ready,
@@ -2022,9 +2556,10 @@ device 'airscan:escl:Brother MFC-L2710DW http://BRW001122334455.local:80/eSCL/' 
         assert!(runner.programs().is_empty());
     }
 
-    /// `brscan4` masked from detection: named, sourced, and refused — nothing installed.
+    /// The acceptance criterion of 5.10, as a test: with `sane-airscan` gone the message
+    /// names it and a command that works, and says nothing about Brother's website.
     #[tokio::test]
-    async fn a_missing_driver_is_refused_by_name_and_by_where_it_comes_from() {
+    async fn a_missing_airscan_is_refused_by_name_and_by_the_command_that_fixes_it() {
         let root = sysroot(&["/usr/bin/brscan-skey"]);
         let runner = Arc::new(RecordingRunner::default());
         let backend = backend(&root, Arc::clone(&runner));
@@ -2035,10 +2570,13 @@ device 'airscan:escl:Brother MFC-L2710DW http://BRW001122334455.local:80/eSCL/' 
         let BackendError::InstallFailed { package, detail } = &error else {
             panic!("expected an install failure, got {error:?}");
         };
-        assert_eq!(package, "brscan4");
-        assert!(detail.contains("brscan4"), "{detail}");
-        assert!(detail.contains(BROTHER_SUPPORT_SITE), "{detail}");
+        assert_eq!(package, "sane-airscan");
+        assert!(detail.contains("apt install sane-airscan"), "{detail}");
         assert!(detail.contains("scanbus does not install it"), "{detail}");
+        assert!(
+            !detail.to_ascii_lowercase().contains("brother.com"),
+            "the user is sent to apt, not to a vendor download form: {detail}"
+        );
 
         // The client sees the same story on the property as the caller does on the Err.
         assert_eq!(
@@ -2051,13 +2589,33 @@ device 'airscan:escl:Brother MFC-L2710DW http://BRW001122334455.local:80/eSCL/' 
             progress.last().unwrap().pairing_state(),
             Some(PairingState::Failed(error.to_string()))
         );
-        // It gave up at the driver: `brscan-skey` was never announced as a step.
-        assert_eq!(
+    }
+
+    /// A Brother that only ever appeared as `brother4:`. Installing something is not the
+    /// fix, and the message must not pretend it is — but it still names the package the
+    /// user is most likely missing, because on this path it usually is.
+    #[tokio::test]
+    async fn a_device_with_no_escl_fails_pairing_and_says_why() {
+        let root = sysroot(&[AIRSCAN_SO]);
+        let runner = Arc::new(RecordingRunner::default());
+        let backend = backend(&root, Arc::clone(&runner));
+
+        let (outcome, progress) = ensure_installed_progress(&backend, &vendor_only_mfc()).await;
+
+        let BackendError::InstallFailed { package, detail } = outcome.unwrap_err() else {
+            panic!("expected an install failure");
+        };
+        assert_eq!(package, "sane-airscan");
+        assert!(detail.contains("not over eSCL"), "{detail}");
+        assert!(detail.contains("MFC-L2710DW"), "{detail}");
+        assert!(detail.contains("brscan4/brscan5"), "{detail}");
+        // The dependency step still ran and still passed: what failed is the device.
+        assert!(
             progress
                 .iter()
-                .filter(|step| matches!(step, PairingProgress::Installing { .. }))
-                .count(),
-            1
+                .any(|step| matches!(step, PairingProgress::Installing { package, .. }
+                    if package == "sane-airscan")),
+            "{progress:?}"
         );
     }
 
@@ -2066,12 +2624,12 @@ device 'airscan:escl:Brother MFC-L2710DW http://BRW001122334455.local:80/eSCL/' 
     /// it looks like a SANE problem.
     #[tokio::test]
     async fn a_registered_package_with_no_files_is_not_installed() {
-        let root = sysroot(&["/usr/bin/brscan-skey"]);
+        let root = sysroot(&[]);
         let runner = Arc::new(RecordingRunner {
-            registered: BTreeSet::from(["brscan4"]),
+            registered: BTreeSet::from(["sane-airscan"]),
             files: BTreeMap::from([(
-                "brscan4",
-                vec!["/opt/brother/scanner/brscan4/Brsane4.ini".to_owned()],
+                "sane-airscan",
+                vec!["/usr/share/doc/sane-airscan/copyright".to_owned()],
             )]),
             ..RecordingRunner::default()
         });
@@ -2082,7 +2640,7 @@ device 'airscan:escl:Brother MFC-L2710DW http://BRW001122334455.local:80/eSCL/' 
         let BackendError::InstallFailed { package, detail } = outcome.unwrap_err() else {
             panic!("expected an install failure");
         };
-        assert_eq!(package, "brscan4");
+        assert_eq!(package, "sane-airscan");
         assert!(detail.contains("none of its files are on disk"), "{detail}");
         assert!(detail.contains("reinstall"), "{detail}");
     }
@@ -2090,18 +2648,16 @@ device 'airscan:escl:Brother MFC-L2710DW http://BRW001122334455.local:80/eSCL/' 
     /// The SANE library path is architecture-dependent, so the hard-coded list is a
     /// fast path, not the answer. The package's own file list is what settles it.
     #[tokio::test]
-    async fn a_driver_installed_outside_the_known_paths_is_found_through_the_package() {
-        let root = sysroot(&[
-            "/usr/lib/aarch64-linux-gnu/sane/libsane-brother4.so",
-            "/usr/bin/brscan-skey",
-        ]);
+    async fn a_backend_installed_outside_the_known_paths_is_found_through_the_package() {
+        let elsewhere = "/usr/lib/riscv64-linux-gnu/sane/libsane-airscan.so.1";
+        let root = sysroot(&[elsewhere]);
         let runner = Arc::new(RecordingRunner {
-            registered: BTreeSet::from(["brscan4"]),
+            registered: BTreeSet::from(["sane-airscan"]),
             files: BTreeMap::from([(
-                "brscan4",
+                "sane-airscan",
                 vec![
-                    "/usr/share/doc/brscan4".to_owned(),
-                    "/usr/lib/aarch64-linux-gnu/sane/libsane-brother4.so".to_owned(),
+                    "/usr/share/doc/sane-airscan".to_owned(),
+                    elsewhere.to_owned(),
                 ],
             )]),
             ..RecordingRunner::default()
@@ -2122,16 +2678,10 @@ device 'airscan:escl:Brother MFC-L2710DW http://BRW001122334455.local:80/eSCL/' 
     /// reports exactly the sequence a first one would.
     #[tokio::test]
     async fn cancelling_the_check_leaves_nothing_behind() {
-        let root = sysroot(&["/usr/lib/aarch64-linux-gnu/sane/libsane-brother4.so"]);
+        let root = sysroot(&[]);
         let runner = Arc::new(RecordingRunner {
-            registered: BTreeSet::from(["brscan4", "brscan-skey"]),
-            files: BTreeMap::from([
-                (
-                    "brscan4",
-                    vec!["/usr/lib/aarch64-linux-gnu/sane/libsane-brother4.so".to_owned()],
-                ),
-                ("brscan-skey", vec!["/usr/bin/brscan-skey".to_owned()]),
-            ]),
+            registered: BTreeSet::from(["sane-airscan"]),
+            files: BTreeMap::from([("sane-airscan", vec![AIRSCAN_SO.to_owned()])]),
             delay: Duration::from_millis(200),
             ..RecordingRunner::default()
         });
@@ -2149,11 +2699,12 @@ device 'airscan:escl:Brother MFC-L2710DW http://BRW001122334455.local:80/eSCL/' 
             "the check should still have been running"
         );
 
-        // `brscan-skey`'s files were never there; the cancelled run cannot have created
-        // them, and the second run has to reach the same verdict from the same evidence.
-        assert!(!root.path().join("usr/bin/brscan-skey").exists());
-        fs::create_dir_all(root.path().join("usr/bin")).unwrap();
-        fs::write(root.path().join("usr/bin/brscan-skey"), b"stub").unwrap();
+        // The library was never there; the cancelled run cannot have created it, and the
+        // second run has to reach its verdict from the same evidence a first one would.
+        assert!(!root.path().join(AIRSCAN_SO.trim_start_matches('/')).exists());
+        let library = root.path().join(AIRSCAN_SO.trim_start_matches('/'));
+        fs::create_dir_all(library.parent().unwrap()).unwrap();
+        fs::write(&library, b"stub").unwrap();
 
         let (outcome, progress) = ensure_installed_progress(&backend, &scanner).await;
 
@@ -2162,14 +2713,10 @@ device 'airscan:escl:Brother MFC-L2710DW http://BRW001122334455.local:80/eSCL/' 
             progress,
             vec![
                 PairingProgress::Checking {
-                    message: "checking Brother dependencies for MFC-L2710DW".to_owned(),
+                    message: "checking Brother dependencies for MFC-J5335DW".to_owned(),
                 },
                 PairingProgress::Installing {
-                    package: "brscan4".to_owned(),
-                    percent: None,
-                },
-                PairingProgress::Installing {
-                    package: "brscan-skey".to_owned(),
+                    package: "sane-airscan".to_owned(),
                     percent: None,
                 },
                 PairingProgress::Ready,
@@ -2182,11 +2729,20 @@ device 'airscan:escl:Brother MFC-L2710DW http://BRW001122334455.local:80/eSCL/' 
     /// This is what [`ensure_installed`](ScannerBackend::ensure_installed) not being
     /// able to install anything means concretely. `dpkg-query` is not `dpkg`: `-W` and
     /// `-L` read the status database, and neither has a mode that unpacks a `.deb`.
+    ///
+    /// **Re-justified for 5.10.** The allowlist is unchanged and the argument for it is
+    /// stronger, not weaker: the crate now runs `scanimage` for two things instead of one
+    /// — `-L` to discover, and the packaged `scanbus-scanimage` helper to acquire — and
+    /// both are still read-only with respect to *this machine*. `scanimage` scans; it has
+    /// no mode that installs software, and the helper is four lines of `exec`. The
+    /// package query stayed `dpkg-query`, and what it is now asked about is one package
+    /// from the distribution archive rather than two from a vendor download form, so the
+    /// thing the user is told to run is `apt` and never this daemon.
     #[tokio::test]
     async fn the_install_path_only_ever_runs_read_only_queries() {
         let root = sysroot(&[]);
         let runner = Arc::new(RecordingRunner {
-            registered: BTreeSet::from(["brscan4"]),
+            registered: BTreeSet::from(["sane-airscan"]),
             ..RecordingRunner::default()
         });
         let backend = backend(&root, Arc::clone(&runner));
@@ -2226,6 +2782,15 @@ device 'airscan:escl:Brother MFC-L2710DW http://BRW001122334455.local:80/eSCL/' 
     /// Comment lines are excluded on purpose — the crate documentation has to be able
     /// to name what it refuses to do — and so is each file's test module, which names
     /// them in order to forbid them.
+    ///
+    /// **`&str` constants are excluded for the same reason, and 5.10 is why.** The one
+    /// dependency left is in the distribution archive, so the message a user gets when it
+    /// is missing is `apt install sane-airscan` — a sentence telling a human what to run,
+    /// which is the *opposite* of this daemon running it. A guard that could not tell a
+    /// message from an invocation would have forced that sentence to be spelled around,
+    /// making the error worse to read in order to keep a grep happy. Nothing is lost:
+    /// running a package manager needs a `Command::new`, and the count below is pinned at
+    /// one — inside [`SystemCommandRunner`], whose whole argv the allowlist test asserts.
     #[test]
     fn the_backend_has_no_way_to_install_anything() {
         // Every non-test source file in the crate, not just this one: `skey` is where
@@ -2233,6 +2798,7 @@ device 'airscan:escl:Brother MFC-L2710DW http://BRW001122334455.local:80/eSCL/' 
         // lib.rs would have stopped meaning anything the moment it was added.
         let sources = [
             ("lib.rs", include_str!("lib.rs")),
+            ("acquisition.rs", include_str!("acquisition.rs")),
             ("listener.rs", include_str!("listener.rs")),
             ("registrar.rs", include_str!("registrar.rs")),
             ("skey/mod.rs", include_str!("skey/mod.rs")),
@@ -2249,6 +2815,7 @@ device 'airscan:escl:Brother MFC-L2710DW http://BRW001122334455.local:80/eSCL/' 
                 .expect("the test module marker splits the file")
                 .lines()
                 .filter(|line| !line.trim_start().starts_with("//"))
+                .filter(|line| !line.trim_start().starts_with("const ") || !line.contains("&str"))
                 .collect::<Vec<_>>()
                 .join("\n")
         };
