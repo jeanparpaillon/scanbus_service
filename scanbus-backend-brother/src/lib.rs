@@ -2825,7 +2825,8 @@ printf 'P5\\n1 1\\n255\\n\\001' > \"$(printf \"$batch\" 1)\"\n",
         .await;
         let trigger = next_trigger(&mut stream).await;
 
-        backend.fetch_pages(&scanner.id, &trigger.id).await.unwrap();
+        // The first fetch is what consumes the trigger; the pages are not the point here.
+        drop(backend.fetch_pages(&scanner.id, &trigger.id).await.unwrap());
 
         for (case, id) in [
             ("already fetched", trigger.id.as_str()),
