@@ -289,10 +289,7 @@ mod tests {
             ..mfc_j5335dw()
         };
 
-        let acquisition = scanimage_args(
-            Some(&mapping(ProfileKind::Document, &[])),
-            &flatbed_only,
-        );
+        let acquisition = scanimage_args(Some(&mapping(ProfileKind::Document, &[])), &flatbed_only);
 
         assert!(acquisition.args.contains(&"--source=Flatbed".to_owned()));
         assert!(acquisition.args.contains(&"--batch-count=1".to_owned()));

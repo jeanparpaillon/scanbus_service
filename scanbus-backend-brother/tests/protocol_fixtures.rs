@@ -9,7 +9,8 @@ use std::net::Ipv4Addr;
 use std::time::Duration;
 
 use scanbus_backend_brother::skey::event::{Event, Frame, HEADER_LEN};
-use scanbus_backend_brother::skey::register::{Function, Registration, UserName};
+use scanbus_backend_brother::skey::function::Function;
+use scanbus_backend_brother::skey::register::{Registration, UserName};
 
 const KEYPRESS_HEADER: &[u8] = include_bytes!("fixtures/keypress-image.header");
 const KEYPRESS_PAYLOAD: &[u8] = include_bytes!("fixtures/keypress-image.payload");

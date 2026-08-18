@@ -10,19 +10,22 @@
 //! [`MockHandle::fail_button_mapping`], which is a statement a test makes between two
 //! `await`s rather than a read-only `/opt` it has to arrange.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::StreamExt as _;
 use scanbus_core::backend::mock::{MockBackend, MockCall, MockHandle};
 use scanbus_core::{
-    BackendError, ButtonsCapability, Capabilities, ProfileKind, ScannerBackend, ScannerId,
-    ScannerInfo, Status,
+    BackendError, ButtonInfo, ButtonsCapability, Capabilities, PairingStore, ProfileKind,
+    ScannerBackend, ScannerId, ScannerInfo, Status,
 };
 use scanbus_daemon::backends::RankedBackend;
 use scanbus_daemon::dbus::{self, BUS_NAME, Manager1, ObjectRegistry, Profile1, path};
-use scanbus_daemon::{Backends, Discovery, MemoryPairingStore, ProfileRegistry, ScannerRegistry};
+use scanbus_daemon::{
+    Backends, Discovery, JsonPairingStore, MemoryPairingStore, ProfileRegistry, ScannerRegistry,
+};
+use tempfile::TempDir;
 use zbus::fdo::{ObjectManagerProxy, PropertiesChangedStream, PropertiesProxy};
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value as ZValue};
 
@@ -32,6 +35,10 @@ use common::{PrivateBus, skipped};
 
 /// How long a signal that should already be on its way is waited for.
 const SIGNAL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// What the startup restore gives one scanner's backend before it moves on — `main.rs`'s
+/// `RESTORE_TIMEOUT`. Nothing here reaches it: the mock answers immediately.
+const RESTORE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// `org.scanbus.Button1` as §5 defines it, from the client side.
 ///
@@ -82,16 +89,61 @@ struct Daemon {
 
 impl Daemon {
     async fn start(bus: &PrivateBus, scanners: impl IntoIterator<Item = ScannerInfo>) -> Self {
+        let (daemon, connection) =
+            Self::wire(bus, Arc::new(MemoryPairingStore::new()), scanners).await;
+        dbus::request_name(&connection).await.unwrap();
+        daemon
+    }
+
+    /// `main.rs`'s own startup order, with `store` behind it: objects exported, then the
+    /// restore of 4.2, and only then the name.
+    ///
+    /// The order is the point rather than a detail of the harness — a client that
+    /// resolves `org.scanbus` the instant it appears has to find every persisted
+    /// assignment already on its key and already on the device (5.11), which it cannot if
+    /// the replay is something that happens after the name is up.
+    async fn start_restoring(
+        bus: &PrivateBus,
+        store: Arc<dyn PairingStore>,
+        scanners: impl IntoIterator<Item = ScannerInfo>,
+    ) -> Self {
+        Self::start_restoring_with(bus, store, scanners, |_| {}).await
+    }
+
+    /// [`start_restoring`](Self::start_restoring) with `arm` run against the backend
+    /// between the wiring and the restore — the only moment at which a test can make the
+    /// device refuse *during* startup rather than after it.
+    async fn start_restoring_with(
+        bus: &PrivateBus,
+        store: Arc<dyn PairingStore>,
+        scanners: impl IntoIterator<Item = ScannerInfo>,
+        arm: impl FnOnce(&MockHandle),
+    ) -> Self {
+        let (daemon, connection) = Self::wire(bus, store, scanners).await;
+        arm(&daemon.handle());
+        daemon
+            .scanners
+            .restore(
+                &Backends::new([Arc::clone(&daemon.backend) as Arc<dyn ScannerBackend>]),
+                RESTORE_TIMEOUT,
+            )
+            .await;
+        dbus::request_name(&connection).await.unwrap();
+        daemon
+    }
+
+    /// Everything `main.rs` does before it takes the name, and nothing after it.
+    async fn wire(
+        bus: &PrivateBus,
+        store: Arc<dyn PairingStore>,
+        scanners: impl IntoIterator<Item = ScannerInfo>,
+    ) -> (Self, zbus::Connection) {
         let connection = bus.connect().await;
         let objects = Arc::new(ObjectRegistry::new(connection.clone()).await.unwrap());
         let backend = Arc::new(MockBackend::with_scanners(scanners));
         let profiles = Arc::new(ProfileRegistry::ephemeral());
 
-        let registry = ScannerRegistry::new(
-            Arc::clone(&objects),
-            Arc::new(MemoryPairingStore::new()),
-            Arc::clone(&profiles),
-        );
+        let registry = ScannerRegistry::new(Arc::clone(&objects), store, Arc::clone(&profiles));
         let discovery = Arc::new(Discovery::new(
             Backends::new([Arc::clone(&backend) as Arc<dyn ScannerBackend>]),
             Arc::clone(&registry),
@@ -114,14 +166,16 @@ impl Daemon {
             )
             .await
             .unwrap();
-        dbus::request_name(&connection).await.unwrap();
 
-        Self {
-            scanners: registry,
-            discovery,
-            objects,
-            backend,
-        }
+        (
+            Self {
+                scanners: registry,
+                discovery,
+                objects,
+                backend,
+            },
+            connection,
+        )
     }
 
     fn handle(&self) -> MockHandle {
@@ -575,6 +629,175 @@ async fn a_menu_that_changes_size_moves_the_tree() {
             .await
             .unwrap(),
         "image"
+    );
+
+    daemon.shutdown().await;
+}
+
+/// A scanner as the store holds it, naming the backend this daemon was built with.
+///
+/// The restore path resolves `ScannerInfo::backend` against the compiled backends, so a
+/// persisted `proprietary:brother` would be skipped here as a backend this binary does
+/// not have — a different case from the one these tests are about.
+fn persisted_scanner(address: &str, count: u32) -> ScannerInfo {
+    ScannerInfo {
+        backend: MockBackend::ID.to_owned(),
+        ..scanner_with_buttons(address, count)
+    }
+}
+
+/// The store a previous run would have left behind: `info` paired, and key `index`
+/// assigned `profile` with the per-key option §5 gives as its example.
+async fn store_with_assignment(
+    dir: &TempDir,
+    info: &ScannerInfo,
+    index: u32,
+    profile: ProfileKind,
+) -> Arc<JsonPairingStore> {
+    let store = Arc::new(JsonPairingStore::with_path(
+        dir.path().join("pairings.json"),
+    ));
+    store.save_paired(info).await.unwrap();
+
+    let mut button = ButtonInfo::new(index, "", false);
+    button.profile = Some(profile);
+    button.profile_options = BTreeMap::from([(
+        "output_folder".to_owned(),
+        scanbus_core::Value::Str("~/Scans/invoices".to_owned()),
+    )]);
+    store.save_button(&info.id, &button).await.unwrap();
+
+    store
+}
+
+/// Every `SetButtonMapping` the backend was asked for, in order.
+fn registrations(handle: &MockHandle) -> Vec<MockCall> {
+    handle
+        .calls()
+        .into_iter()
+        .filter(|call| matches!(call, MockCall::SetButtonMapping { .. }))
+        .collect()
+}
+
+/// Acceptance (5.11): restarting the daemon restores every previously assigned entry with
+/// no user action, and no entry the user had cleared.
+///
+/// Nothing is discovered here — the store is the whole of what this daemon knows, which
+/// is exactly the state a restart starts from. On a backend where the mapping *is* the
+/// panel entry, the `SetButtonMapping` asserted below is the entry coming back onto the
+/// device's menu.
+#[tokio::test]
+async fn a_restart_puts_the_assignments_back_on_the_keys_and_on_the_device() {
+    let Some(bus) = PrivateBus::start().await else {
+        return skipped("a_restart_puts_the_assignments_back_on_the_keys_and_on_the_device");
+    };
+    let info = persisted_scanner("usb:001:002", 4);
+    let dir = TempDir::new().unwrap();
+    let store = store_with_assignment(&dir, &info, 1, ProfileKind::Image).await;
+
+    let daemon = Daemon::start_restoring(&bus, store, [info.clone()]).await;
+    let client = bus.connect().await;
+
+    let key = button_proxy(&client, &info.id, 1).await;
+    assert_eq!(key.profile().await.unwrap(), "image");
+    assert_eq!(
+        String::try_from(key.profile_options().await.unwrap()["output_folder"].clone()).unwrap(),
+        "~/Scans/invoices",
+        "the options are restored with the profile, not left behind by it"
+    );
+
+    assert_eq!(
+        registrations(&daemon.handle()),
+        vec![MockCall::SetButtonMapping {
+            scanner: info.id.clone(),
+            button_index: 1,
+            profile: Some(ProfileKind::Image),
+        }],
+        "only the assigned key is registered: the three nobody wrote to stay off the panel"
+    );
+    assert_eq!(
+        daemon.handle().button_mapping(&info.id, 1).unwrap().options["output_folder"],
+        scanbus_core::Value::Str("~/Scans/invoices".to_owned())
+    );
+
+    for index in [0, 2, 3] {
+        let key = button_proxy(&client, &info.id, index).await;
+        assert_eq!(key.profile().await.unwrap(), "");
+        assert!(key.profile_options().await.unwrap().is_empty());
+    }
+
+    daemon.shutdown().await;
+}
+
+/// Checklist: the printer was switched off when the daemon started. The registration
+/// fails and the assignment is still there — it is the user's configuration, in the
+/// store, and a device that could not be reached is not a reason to delete it.
+#[tokio::test]
+async fn a_device_that_refuses_at_startup_keeps_its_assignment() {
+    let Some(bus) = PrivateBus::start().await else {
+        return skipped("a_device_that_refuses_at_startup_keeps_its_assignment");
+    };
+    let info = persisted_scanner("usb:001:002", 4);
+    let dir = TempDir::new().unwrap();
+    let store = store_with_assignment(&dir, &info, 1, ProfileKind::Image).await;
+
+    let daemon = Daemon::start_restoring_with(&bus, Arc::clone(&store), [info.clone()], |handle| {
+        handle.fail_button_mapping(BackendError::NotReachable {
+            scanner: ScannerId::from_backend(MockBackend::ID, "usb:001:002")
+                .expect("a legal mock id"),
+            detail: "the printer did not answer".to_owned(),
+        });
+    })
+    .await;
+    let client = bus.connect().await;
+
+    // The daemon came up regardless: the name is taken and the keys are exported.
+    assert_eq!(button_paths(&client).await.len(), 4);
+
+    let key = button_proxy(&client, &info.id, 1).await;
+    assert_eq!(
+        key.profile().await.unwrap(),
+        "image",
+        "the property reads what was persisted, although the device refused it"
+    );
+    assert_eq!(
+        daemon.handle().button_mapping(&info.id, 1),
+        None,
+        "and the device really did not take it"
+    );
+    assert_eq!(
+        store.restorable().await.unwrap()[0].buttons[0].profile,
+        Some(ProfileKind::Image),
+        "the store still has it, for the next start with the device answering"
+    );
+
+    daemon.shutdown().await;
+}
+
+/// Checklist: the store remembers a key the device no longer reports — a backend that
+/// could not read the panel this time round. The startup skips it and leaves the
+/// assignment where it is, rather than failing or dropping it.
+#[tokio::test]
+async fn an_assignment_for_a_key_that_is_gone_is_left_in_the_store() {
+    let Some(bus) = PrivateBus::start().await else {
+        return skipped("an_assignment_for_a_key_that_is_gone_is_left_in_the_store");
+    };
+    let info = persisted_scanner("usb:001:002", 2);
+    let dir = TempDir::new().unwrap();
+    let store = store_with_assignment(&dir, &info, 3, ProfileKind::Document).await;
+
+    let daemon = Daemon::start_restoring(&bus, Arc::clone(&store), [info.clone()]).await;
+    let client = bus.connect().await;
+
+    assert_eq!(button_paths(&client).await.len(), 2);
+    assert!(
+        registrations(&daemon.handle()).is_empty(),
+        "a key with no object is not registered on a device that no longer offers it"
+    );
+    assert_eq!(
+        store.restorable().await.unwrap()[0].buttons[0].profile,
+        Some(ProfileKind::Document),
+        "the assignment survives, for a probe that reports the key again"
     );
 
     daemon.shutdown().await;

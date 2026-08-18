@@ -197,6 +197,24 @@ pub trait ScannerBackend: Send + Sync {
     /// [`BackendError::UnsupportedProfile`] when the device offers nothing this profile
     /// can be mapped onto, [`BackendError::UnknownScanner`] for a scanner the backend
     /// has no configuration for.
+    ///
+    /// A backend that has keys, handed a `button_index` that is not one of them, answers
+    /// [`BackendError::Other`] carrying what the device *does* offer — HPLIP's single
+    /// walk-up trigger, Brother's four panel entries — and must change nothing, neither
+    /// the device nor any record of what a key means. (A backend with no keys at all is
+    /// the other case and says [`BackendError::Unsupported`] for every index: the mobile
+    /// backend has no panel to be wrong about.)
+    ///
+    /// `Other` rather than one of §8's named errors because none of them is true — the
+    /// scanner is known, the operation is supported, the device has said nothing. It maps
+    /// to `org.freedesktop.DBus.Error.Failed`, and that is the right answer for a
+    /// condition no client can provoke: `Button1` objects are exported from
+    /// `Capabilities.buttons.count`, so the range a client can address is the range the
+    /// backend has. What can produce a bad index is our own code — a restore replaying an
+    /// assignment older than the key set (4.2), a backend whose count and whose table
+    /// have drifted — and those are bugs to surface, not to half-apply. Clearing is no
+    /// exception: `None` for an index that does not exist is not "nothing to remove", it
+    /// is the same bug arriving by the other setter.
     async fn set_button_mapping(
         &self,
         scanner_id: &ScannerId,

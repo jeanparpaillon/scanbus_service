@@ -60,13 +60,24 @@
 //! This is in addition to rewriting the vendor configuration, which remains the source of
 //! truth for what the firmware itself will trigger.
 //!
+//! Read back at startup by [`Button1::restore`], which is the same pair of writes **in
+//! the other order** — the property first, the backend second, and the backend's failure
+//! not undoing anything. The runtime order exists so a property cannot claim a mapping
+//! the device never got; at startup the assignment is already durable, and dropping it
+//! because the printer happens to be switched off would delete the user's configuration
+//! on their behalf. A backend that refuses at restore leaves a key that reads its profile
+//! and is not yet on the device; the next write to it, or the next start with the device
+//! reachable, is what puts the two back together.
+//!
 //! [4.1]: https://github.com/jeanparpaillon/scanbus_service/issues/16
 //! [`scanbus-dbus-api.md`]: https://github.com/jeanparpaillon/scanbus_service/blob/master/docs/scanbus-dbus-api.md
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use scanbus_core::{ButtonInfo, PairingStore, ProfileKind, ScannerBackend, ScannerId, Value};
+use scanbus_core::{
+    BackendError, ButtonInfo, PairingStore, ProfileKind, ScannerBackend, ScannerId, Value,
+};
 use tokio::sync::Mutex;
 use tracing::{debug, info, instrument};
 use zbus::fdo;
@@ -145,6 +156,57 @@ impl Button1 {
     /// Named apart from the `Index` getter below, which the interface macro owns.
     pub async fn position(&self) -> u32 {
         self.info.lock().await.index
+    }
+
+    /// Puts a persisted assignment back on this key, and re-applies it to the backend —
+    /// the restore path (4.2), before `org.scanbus` is on the bus.
+    ///
+    /// Only the host's three fields are taken from `persisted`: `Label`, `Profile` and
+    /// `ProfileOptions`. `Index`, `DeviceLabel` and `LabelConfigurable` stay as this
+    /// object was exported with them, because they are what the backend reports *now* —
+    /// a device whose labels a re-probe corrected must not have last week's copy written
+    /// back over them.
+    ///
+    /// Nothing is persisted here. This is the store's own content going back where it
+    /// came from, and writing it again would only be a chance to lose it.
+    ///
+    /// A key with no profile is not sent to the backend at all: a backend that has just
+    /// started has no mapping to clear, so a `None` write would be one round trip per
+    /// unassigned key to tell a device something it already believes. It is also what
+    /// makes "no entry the user had cleared" true on a backend where a mapping *is* the
+    /// panel entry (5.11): a cleared key was never registered, so it never appears.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the backend refused the mapping with. The property has already moved by
+    /// then and stays moved — see the module documentation on why this order is the
+    /// reverse of a live `Profile` write.
+    #[instrument(level = "debug", skip_all, fields(id = %self.scanner, index = persisted.index))]
+    pub async fn restore(&self, persisted: &ButtonInfo) -> Result<(), BackendError> {
+        let mut info = self.info.lock().await;
+        info.label = persisted.label.clone();
+        info.profile = persisted.profile;
+        info.profile_options = persisted.profile_options.clone();
+
+        let Some(profile) = info.profile else {
+            debug!(id = %self.scanner, index = info.index, "key restored unassigned");
+            return Ok(());
+        };
+
+        // Held across the call, as the setters hold it: the options the backend is given
+        // are the ones this key has, and a client writing `Profile` the instant the name
+        // appears queues behind the restore rather than interleaving with it.
+        self.backend
+            .set_button_mapping(
+                &self.scanner,
+                info.index,
+                Some(profile),
+                &info.profile_options,
+            )
+            .await?;
+
+        info!(index = info.index, %profile, "key assignment restored");
+        Ok(())
     }
 }
 

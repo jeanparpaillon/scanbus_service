@@ -45,6 +45,7 @@
 //!   rather than as silence.
 
 pub mod event;
+pub mod function;
 pub mod register;
 pub mod snmp;
 

@@ -37,6 +37,7 @@ use std::net::Ipv4Addr;
 use std::time::Duration;
 
 use super::fields::field;
+use super::function::Function;
 use super::snmp::{Message, Oid};
 
 /// Brother's private-enterprise OID for scan-key registration.
@@ -55,86 +56,6 @@ pub const DEFAULT_DURATION: Duration = Duration::from_secs(360);
 
 /// Brother documents a scan-destination name of "up to 15 alphanumeric characters".
 pub const MAX_USER_LEN: usize = 15;
-
-/// What a panel entry does when it is chosen.
-///
-/// The three numbers attached to each are all different and all load-bearing, which is
-/// why they are methods here rather than something a call site works out:
-/// [`Function::appnum`] goes on the wire, [`Function::button_index`] is the scanbus API's
-/// `Button1` index (§5), and the vendor's own `decode_key_data` uses a *third* order
-/// (IMAGE 0, OCR 1, EMAIL 2, FILE 3) internally, which this crate does not adopt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Function {
-    File,
-    Image,
-    Ocr,
-    Email,
-}
-
-impl Function {
-    /// Every function, in `button_index` order.
-    pub const ALL: [Self; 4] = [Self::File, Self::Image, Self::Ocr, Self::Email];
-
-    /// The `FUNC=` token.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::File => "FILE",
-            Self::Image => "IMAGE",
-            Self::Ocr => "OCR",
-            Self::Email => "EMAIL",
-        }
-    }
-
-    /// The `APPNUM=` token. Not an index — the values are 1, 3, 2, 5 and skip 4.
-    pub const fn appnum(self) -> u8 {
-        match self {
-            Self::Image => 1,
-            Self::Email => 2,
-            Self::Ocr => 3,
-            Self::File => 5,
-        }
-    }
-
-    /// The scanbus `Button1` index, per the table in `brother-skeyless-backend.md` §3.
-    pub const fn button_index(self) -> u32 {
-        match self {
-            Self::File => 0,
-            Self::Image => 1,
-            Self::Ocr => 2,
-            Self::Email => 3,
-        }
-    }
-
-    /// What the panel calls this entry. The firmware's wording, from the strings the
-    /// daemon prints for the same four codes; `LabelConfigurable` stays `false` because
-    /// nothing we send changes it.
-    pub const fn device_label(self) -> &'static str {
-        match self {
-            Self::File => "Scan to File",
-            Self::Image => "Scan to Image",
-            Self::Ocr => "Scan to OCR",
-            Self::Email => "Scan to E-Mail",
-        }
-    }
-
-    pub fn from_button_index(index: u32) -> Option<Self> {
-        Self::ALL.into_iter().find(|f| f.button_index() == index)
-    }
-
-    pub fn from_appnum(appnum: u8) -> Option<Self> {
-        Self::ALL.into_iter().find(|f| f.appnum() == appnum)
-    }
-
-    pub fn from_token(token: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|f| f.as_str() == token)
-    }
-}
-
-impl fmt::Display for Function {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
 
 /// Everything that can be wrong about a registration, before it reaches the network.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -372,7 +293,7 @@ mod tests {
             (Function::File, "FILE", 5, 0, "Scan to File"),
             (Function::Image, "IMAGE", 1, 1, "Scan to Image"),
             (Function::Ocr, "OCR", 3, 2, "Scan to OCR"),
-            (Function::Email, "EMAIL", 2, 3, "Scan to E-Mail"),
+            (Function::Email, "EMAIL", 2, 3, "Scan to E-mail"),
         ];
         for (function, token, appnum, index, label) in expected {
             assert_eq!(function.as_str(), token);

@@ -146,6 +146,20 @@ pub struct Restorable {
     pub scanner: ScannerInfo,
     /// Whether a listener was running for it when the daemon last recorded `Connected`.
     pub connected: bool,
+    /// The host-owned half of each key (§5) as it was last persisted — `Label`,
+    /// `Profile` and `ProfileOptions` — in index order.
+    ///
+    /// Only keys something was written to are in here: a store records a [`ButtonInfo`]
+    /// when one of the three is set, never a default row per index. An empty vector is
+    /// therefore a scanner nobody configured, and a store that keeps no assignments
+    /// restores none — the same "nothing durable behind it" this trait's defaults allow
+    /// for [`connected`](Self::connected).
+    ///
+    /// The *device's* half is deliberately not taken from here. `index`, `device_label`
+    /// and `label_configurable` are what the backend reports now; the persisted copy
+    /// describes the firmware as it was at the last write, and replaying it wholesale
+    /// would let a stale label overwrite one a re-probe has since corrected.
+    pub buttons: Vec<ButtonInfo>,
 }
 
 /// A [`PairingStore::save_paired`] failure.

@@ -51,7 +51,7 @@ use std::fmt;
 use std::net::Ipv4Addr;
 
 use super::fields::field;
-use super::register::Function;
+use super::function::Function;
 
 /// The four binary bytes in front of every payload.
 pub const HEADER_LEN: usize = 4;

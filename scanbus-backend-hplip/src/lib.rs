@@ -1539,10 +1539,13 @@ printf 'installed\\n'\n",
             )
             .await
             .unwrap_err();
+        // The variant, not only the wording: an index off the table is `Failed`, the
+        // unclassified error, because the scanner is known and the operation supported.
+        // Brother's four-entry panel refuses the same mistake the same way (5.11).
         assert!(
-            error
-                .to_string()
-                .contains("one generic HPLIP walk-up trigger")
+            matches!(&error, BackendError::Other(message)
+                if message.contains("one generic HPLIP walk-up trigger")),
+            "{error:?}",
         );
     }
 

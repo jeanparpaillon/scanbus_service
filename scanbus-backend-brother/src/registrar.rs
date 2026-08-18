@@ -84,8 +84,9 @@ use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 use tracing::{debug, info, warn};
 
+use crate::skey::function::Function;
 use crate::skey::register::{
-    DEFAULT_DURATION, Function, LISTENER_PORT, RegisterError, Registration, UserName, probe_request,
+    DEFAULT_DURATION, LISTENER_PORT, RegisterError, Registration, UserName, probe_request,
 };
 use crate::skey::snmp::{self, ErrorStatus, Message, PduKind, SnmpError};
 

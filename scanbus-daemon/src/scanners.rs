@@ -374,7 +374,14 @@ impl ScannerRegistry {
     /// [`register_persistent`](Self::register_persistent) does), then, if it was
     /// `Connected` when the daemon last recorded it, restart its listener through
     /// [`ensure_listening`](Self::ensure_listening) — the same call `Connect()` uses, so
-    /// this is not a parallel path with its own bugs.
+    /// this is not a parallel path with its own bugs — and finally replay its persisted
+    /// `Button1` assignments ([`restore_assignments`](Self::restore_assignments)).
+    ///
+    /// The assignments are replayed here rather than left to the first client that reads
+    /// a property because on some backends the mapping is not a record, it is the state
+    /// of the device: a Brother panel entry exists only while the daemon keeps
+    /// registering it (5.11), so a restart that published objects and stopped would leave
+    /// a printer with an empty menu and a `Profile` claiming otherwise.
     ///
     /// Bounded per scanner by `per_scanner_timeout`, so one scanner whose backend hangs
     /// on `start_listening` — the switched-off case is exactly this, for a backend that
@@ -455,24 +462,85 @@ impl ScannerRegistry {
             return;
         }
 
-        if !entry.connected {
+        if entry.connected {
+            match tokio::time::timeout(timeout, self.ensure_listening(&id)).await {
+                Ok(Ok(())) => info!(%id, "restored: listening for button presses"),
+                Ok(Err(error)) => {
+                    self.mark_restore_offline(&id).await;
+                    warn!(%id, %error, "restored offline: the backend refused to listen");
+                }
+                Err(_) => {
+                    self.mark_restore_offline(&id).await;
+                    warn!(
+                        %id,
+                        timeout = ?timeout,
+                        "restored offline: the backend did not respond in time"
+                    );
+                }
+            }
+        } else {
             info!(%id, "restored: was not connected, listener left stopped");
-            return;
         }
 
-        match tokio::time::timeout(timeout, self.ensure_listening(&id)).await {
-            Ok(Ok(())) => info!(%id, "restored: listening for button presses"),
-            Ok(Err(error)) => {
-                self.mark_restore_offline(&id).await;
-                warn!(%id, %error, "restored offline: the backend refused to listen");
-            }
-            Err(_) => {
-                self.mark_restore_offline(&id).await;
-                warn!(
+        // After the listener, not before: on a backend where the mapping *is* the panel
+        // entry (5.11), the key becomes pressable the moment this returns, and a press
+        // that arrives before `start_listening` has run is a press nothing is subscribed
+        // to hear. A scanner that was not connected still gets its assignments back —
+        // registration follows the assignment and listening follows `Connected`, which is
+        // the same split `forget` and `stop_listening` have in `ScannerBackend`.
+        self.restore_assignments(&id, &entry.buttons, timeout).await;
+    }
+
+    /// Replays one scanner's persisted `Button1` assignments (4.1) onto its objects and
+    /// its backend, before the bus name appears.
+    ///
+    /// Each key is [`Button1::restore`], through the object the registry has just
+    /// exported rather than through a second copy of the write path: the property and the
+    /// backend call stay one step, under the same lock a live `Profile` write takes.
+    ///
+    /// Nothing here is fatal. Every failure leaves a key whose `Profile` reads what the
+    /// user assigned and whose device does not have it yet, which is worse than a working
+    /// panel and much better than a daemon that refuses to start, or one that quietly
+    /// drops an assignment because a printer was off. The two that happen in practice:
+    ///
+    /// - **the backend refuses or hangs** — the printer is switched off, or moved and not
+    ///   rediscovered. Bounded by `per_scanner_timeout` for the reason the listener is:
+    ///   a backend blocking on a device must not hold `org.scanbus` off the bus.
+    /// - **there is no object at that index** — the store remembers a key on a device
+    ///   that now reports fewer, e.g. a backend that could not read the panel this time.
+    ///   The assignment stays in the store, so a device that reports its keys again gets
+    ///   it back on the next restart.
+    async fn restore_assignments(&self, id: &ScannerId, buttons: &[ButtonInfo], timeout: Duration) {
+        for button in buttons {
+            let path = path::button(id, button.index);
+            let iface = match self.objects.interface::<Button1>(&path).await {
+                Ok(iface) => iface,
+                Err(error) => {
+                    warn!(
+                        %id,
+                        index = button.index,
+                        %error,
+                        "a persisted assignment names a key this device no longer reports; \
+                         leaving it in the store"
+                    );
+                    continue;
+                }
+            };
+
+            match tokio::time::timeout(timeout, iface.get().await.restore(button)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => warn!(
                     %id,
+                    index = button.index,
+                    %error,
+                    "restored an assignment the backend would not take; the key keeps it"
+                ),
+                Err(_) => warn!(
+                    %id,
+                    index = button.index,
                     timeout = ?timeout,
-                    "restored offline: the backend did not respond in time"
-                );
+                    "the backend did not take an assignment in time; the key keeps it"
+                ),
             }
         }
     }

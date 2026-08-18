@@ -60,12 +60,15 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use futures_core::stream::BoxStream;
-use scanbus_backend_common::{DEFAULT_SCANIMAGE_HELPER, ScanimageConfig, fetch_pages_via_scanimage};
+use scanbus_backend_common::{
+    DEFAULT_SCANIMAGE_HELPER, ScanimageConfig, fetch_pages_via_scanimage,
+};
 use scanbus_core::{
     BackendError, ButtonsCapability, Capabilities, ColorMode, PairingProgress, ProfileKind,
     RawPage, RestoreDisposition, ScanTrigger, ScannerBackend, ScannerId, ScannerInfo, Source,
     Status, Value,
 };
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -76,8 +79,12 @@ pub mod skey;
 
 use acquisition::{ButtonMapping, EsclDevice};
 use listener::{BindError, Inert, Listener};
-use registrar::{SnmpTransport, UdpSnmp, probe_scan_to_pc};
-use skey::register::{Function, LISTENER_PORT};
+use registrar::{
+    HostAddress, Registrar, RegistrarError, RoutedHost, SnmpTransport, UdpSnmp, panel_name,
+    probe_scan_to_pc,
+};
+use skey::function::Function;
+use skey::register::LISTENER_PORT;
 use skey::snmp::DEFAULT_COMMUNITY;
 
 /// Backend identifier, as it will be reported by [`ScannerBackend::id`].
@@ -171,7 +178,9 @@ pub struct BrotherBackend {
     /// Shared with every clone of the backend, because [`discover`](ScannerBackend::discover)
     /// runs on a clone and is where the answer has to surface. Written at pairing time
     /// and read at discovery time — see [`BrotherBackend::note_scan_to_pc`] for why the
-    /// question is not asked on every discovery instead.
+    /// question is not asked on every discovery instead — and rewritten by every
+    /// registration round, which is a stronger answer to the same question than the
+    /// pairing probe's read ([`note_panel_answer`](BrotherBackend::note_panel_answer)).
     scan_to_pc: Arc<Mutex<BTreeMap<ScannerId, ScanToPc>>>,
     /// The one UDP/54925 socket every paired Brother sends its panel presses to.
     ///
@@ -190,11 +199,36 @@ pub struct BrotherBackend {
     /// What the daemon has assigned to each panel key, per scanner.
     ///
     /// Written by [`set_button_mapping`](ScannerBackend::set_button_mapping) and read by
-    /// [`fetch_pages`](ScannerBackend::fetch_pages), which is the only reason the backend
-    /// keeps it: a press carries an index, and the profile that decides how to scan lives
-    /// on the daemon's side of the seam (1.3). Not durable — the daemon's own button
-    /// store is (4.1), and it replays the assignments on startup (4.2).
+    /// [`fetch_pages`](ScannerBackend::fetch_pages): a press carries an index, and the
+    /// profile that decides how to scan lives on the daemon's side of the seam (1.3). It
+    /// is also what the *panel* is derived from — the set of keys with an entry here is
+    /// the set of functions [`registrars`](Self::registrars) keeps registered — so the
+    /// two are written together, under the registrar lock. Not durable: the daemon's own
+    /// button store is (4.1), and it replays the assignments on startup (4.2).
     buttons: Arc<Mutex<BTreeMap<(ScannerId, u32), ButtonMapping>>>,
+    /// Where each scanner's registrations are sent, as discovery last saw it.
+    ///
+    /// [`set_button_mapping`](ScannerBackend::set_button_mapping) is handed a
+    /// [`ScannerId`] and nothing else, and a registration needs an address — the same
+    /// reason [`escl`](Self::escl) exists, for the other half of the protocol. Kept
+    /// separately from the eSCL note because a device that answers SNMP but offers no
+    /// eSCL still has panel keys worth registering.
+    devices: Arc<Mutex<BTreeMap<ScannerId, Ipv4Addr>>>,
+    /// The refresh task keeping each scanner's panel entries alive, one per device.
+    ///
+    /// An **async** mutex, unlike every other map here, because it is held across
+    /// [`Registrar::start`] — which is a round of SNMP exchanges. That is deliberate and
+    /// not an accident of the types: holding it makes "work out which functions this
+    /// scanner should offer, register exactly those, then record the assignment" one
+    /// step, so two `Profile` writes landing at once cannot interleave into a panel that
+    /// shows one of them and a [`buttons`](Self::buttons) map that records the other.
+    registrars: Arc<AsyncMutex<BTreeMap<ScannerId, Registrar>>>,
+    /// Which of this machine's addresses a device is told to send its presses to.
+    ///
+    /// A seam for the same reason [`transport`](Self::transport) is one: the real
+    /// implementation asks the kernel's routing table, which a test can neither arrange
+    /// nor predict.
+    host: Arc<dyn HostAddress>,
 }
 
 impl Default for BrotherBackend {
@@ -210,6 +244,9 @@ impl Default for BrotherBackend {
             listener: Arc::new(Listener::new(LISTENER_PORT)),
             escl: Arc::new(Mutex::new(BTreeMap::new())),
             buttons: Arc::new(Mutex::new(BTreeMap::new())),
+            devices: Arc::new(Mutex::new(BTreeMap::new())),
+            registrars: Arc::new(AsyncMutex::new(BTreeMap::new())),
+            host: Arc::new(RoutedHost),
         }
     }
 }
@@ -370,6 +407,10 @@ impl BrotherBackend {
             }
         }
 
+        for scanner in &scanners {
+            self.note_device(scanner);
+        }
+
         Ok(scanners)
     }
 
@@ -393,6 +434,8 @@ impl BrotherBackend {
     ///
     /// [`brother-skeyless-backend.md`]: https://github.com/jeanparpaillon/scanbus_service/blob/master/docs/brother-skeyless-backend.md
     async fn note_scan_to_pc(&self, scanner: &ScannerInfo) {
+        self.note_device(scanner);
+
         let note = match device_ipv4(scanner) {
             Some(device) => {
                 match probe_scan_to_pc(&*self.transport, device, DEFAULT_COMMUNITY).await {
@@ -474,6 +517,170 @@ impl BrotherBackend {
             Some(ScanToPc::Unavailable { reason }) => Err(reason.clone()),
             Some(ScanToPc::Available) | None => Ok(device),
         }
+    }
+
+    /// Remember where this scanner's registrations have to be sent.
+    ///
+    /// Called from discovery, from pairing and from the restore path
+    /// ([`restore_disposition`](ScannerBackend::restore_disposition)), i.e. everywhere
+    /// the backend is handed a [`ScannerInfo`], because
+    /// [`set_button_mapping`](ScannerBackend::set_button_mapping) is handed an id and has
+    /// to find an address behind it. *Replaced* on every discovery and removed when the
+    /// address is gone: a printer that moved under DHCP must be registered at the address
+    /// it has now, and one whose address discovery can no longer see must not go on being
+    /// registered at the address it used to have.
+    fn note_device(&self, scanner: &ScannerInfo) {
+        let mut devices = self.devices.lock().expect("brother device addresses");
+        match device_ipv4(scanner) {
+            Some(device) => {
+                devices.insert(scanner.id.clone(), device);
+            }
+            None => {
+                devices.remove(&scanner.id);
+            }
+        }
+    }
+
+    /// A registrar for one device, with this backend's transport and host resolver.
+    fn registrar(&self, device: Ipv4Addr) -> Registrar {
+        Registrar::new(device, panel_name(), Arc::clone(&self.transport))
+            .with_host_address(Arc::clone(&self.host))
+    }
+
+    /// Put exactly `functions` on this scanner's panel, and keep them there.
+    ///
+    /// The whole of what a button assignment does on Brother
+    /// ([`brother-skeyless-backend.md`] §3). There is no configuration file to rewrite and
+    /// nothing to reload: a function is on the panel for as long as something refreshes
+    /// its lease, so assigning is [`Registrar::start`] and clearing is dropping the
+    /// registrar — which aborts the refresh and lets the entry lapse within one
+    /// `DURATION`, with no teardown datagram to send or to lose.
+    ///
+    /// Called with the *complete* set every time rather than with a delta, because that
+    /// is what the registrar takes and because the panel is a set: re-registering a
+    /// function that is already there refreshes its lease, which is what the task would
+    /// have done a moment later anyway. Assigning a second key therefore costs one extra
+    /// round-trip per already-registered key and produces one refresh cadence, not two —
+    /// there is one task per *device*, not per function.
+    ///
+    /// # A failure here can take entries off the panel
+    ///
+    /// [`Registrar::start`] stops the previous refresh before it registers the new set,
+    /// so a device that stops answering half way through loses the entries that had been
+    /// registered before it. That is honest rather than unfortunate: the device is not
+    /// answering, so its leases were lapsing regardless, and the alternative — keeping a
+    /// task alive for a set the device never accepted — is a panel this host believes in
+    /// and the printer does not.
+    ///
+    /// [`brother-skeyless-backend.md`]: https://github.com/jeanparpaillon/scanbus_service/blob/master/docs/brother-skeyless-backend.md
+    async fn register_functions(
+        &self,
+        registrars: &mut BTreeMap<ScannerId, Registrar>,
+        scanner_id: &ScannerId,
+        functions: BTreeSet<Function>,
+    ) -> Result<(), BackendError> {
+        if functions.is_empty() {
+            // Dropping it is stopping it, and stopping it sends nothing. A scanner with
+            // no keys assigned holds no task and no address.
+            if registrars.remove(scanner_id).is_some() {
+                info!(
+                    scanner = %scanner_id,
+                    "no panel key is assigned; the entries lapse within one lease",
+                );
+            }
+            return Ok(());
+        }
+
+        let device = self.registration_target(scanner_id)?;
+        // An address that changed under DHCP makes the existing registrar's device wrong,
+        // and its lease is being refreshed at a printer that may now be a different one.
+        if registrars
+            .get(scanner_id)
+            .is_some_and(|registrar| registrar.device() != device)
+        {
+            registrars.remove(scanner_id);
+        }
+
+        let registrar = registrars
+            .entry(scanner_id.clone())
+            .or_insert_with(|| self.registrar(device));
+
+        let answer = registrar.start(functions).await;
+        self.note_panel_answer(scanner_id, &answer);
+        answer.map_err(|error| error.into_backend_error(scanner_id))
+    }
+
+    /// Record what a registration round proved about this device's panel.
+    ///
+    /// This is what makes `buttons.count` the count of entries the device *accepted*
+    /// rather than the count the protocol defines. The pairing probe is a `GetRequest`
+    /// ([`note_scan_to_pc`](Self::note_scan_to_pc)) — the cheapest question that can be
+    /// asked without writing to the panel, and a weaker one than the write it predicts.
+    /// A model that lets the OID be read and then refuses the `SetRequest` has answered
+    /// the question properly, and the answer outranks the probe's.
+    ///
+    /// All four entries or none: the count does not drop to three when one `FUNC` is
+    /// refused. The firmware builds its *Scan to PC* menu from `FUNC`, so a device that
+    /// speaks the registration OID has exactly these four ([`Function::ALL`]); a refusal
+    /// is the device saying it does not speak it, which [`RegistrarError::is_refusal`]
+    /// documents as a statement about the model. Dropping one index would also shift the
+    /// labels under the remaining ones, and index ↔ `FUNC` is fixed by the API (§5).
+    ///
+    /// Silence records nothing, exactly as at pairing: a printer switched off mid-lease
+    /// must not lose its keys permanently. The new count surfaces at the next
+    /// [`discover`](ScannerBackend::discover), which is the only place capabilities are
+    /// rebuilt; the assignment that provoked the refusal has already failed by then, so
+    /// nothing is left claiming a key the device rejected.
+    fn note_panel_answer(&self, scanner_id: &ScannerId, answer: &Result<(), RegistrarError>) {
+        let note = match answer {
+            // The device took a write. Stronger evidence than any probe, and worth
+            // recording even for a scanner already known good: it is what lets a device
+            // wrongly noted as key-less — an older firmware since updated, say — come
+            // back with its panel, without a re-pair.
+            Ok(()) => ScanToPc::Available,
+            Err(error) if error.is_refusal() => {
+                info!(
+                    scanner = %scanner_id,
+                    %error,
+                    "this device refuses panel registrations; its keys will be withdrawn at the \
+                     next discovery",
+                );
+                ScanToPc::Unavailable {
+                    reason: error.to_string(),
+                }
+            }
+            Err(_) => return,
+        };
+
+        self.scan_to_pc
+            .lock()
+            .expect("scan-to-PC notes")
+            .insert(scanner_id.clone(), note);
+    }
+
+    /// The address this scanner's registrations go to, or why there is none.
+    ///
+    /// [`BackendError::NotReachable`] rather than
+    /// [`UnknownScanner`](BackendError::UnknownScanner) for the same reason
+    /// [`fetch_pages`](ScannerBackend::fetch_pages) uses it for a scanner with no eSCL
+    /// device on record: the scanner exists and is paired, what is missing is what
+    /// discovery last said about it, and running a discovery is the fix. A USB device
+    /// lands here too — it never had an address — and is told so by name rather than by
+    /// silence.
+    fn registration_target(&self, scanner_id: &ScannerId) -> Result<Ipv4Addr, BackendError> {
+        self.devices
+            .lock()
+            .expect("brother device addresses")
+            .get(scanner_id)
+            .copied()
+            .ok_or_else(|| BackendError::NotReachable {
+                scanner: scanner_id.clone(),
+                detail: format!(
+                    "no address is on record for {scanner_id}, and a panel entry is \
+                     registered over the network: run a discovery so the scanner is seen \
+                     again, or connect it to the network if it is on USB"
+                ),
+            })
     }
 
     /// What to tell the user when UDP/54925 already has an owner.
@@ -815,25 +1022,137 @@ impl ScannerBackend for BrotherBackend {
         Ok(())
     }
 
-    async fn restore_disposition(&self, _scanner: &ScannerInfo) -> RestoreDisposition {
+    /// Always [`Paired`](RestoreDisposition::Paired): there is no backend-side pairing
+    /// that can have gone stale.
+    ///
+    /// Pairing writes nothing to the printer. It reads the scan-key OID
+    /// ([`note_scan_to_pc`](Self::note_scan_to_pc)) and checks host-side packages; the
+    /// device keeps no notion of a paired host to lose. What it does keep is the panel
+    /// entry, and that is a **lease** ([`brother-skeyless-backend.md`] §3) — it lapsed
+    /// while the daemon was down, which is the protocol working exactly as designed.
+    /// Answering [`Failed`](RestoreDisposition::Failed) would unpair a scanner over an
+    /// expiry that was expected, and the case that variant exists for — the mobile
+    /// backend's missing pairing secret — has no analogue in a protocol whose only
+    /// durable state is on our side.
+    ///
+    /// The panel comes back because the assignments do: the durable record is the
+    /// daemon's own button store (4.1), and its restore path replays it through
+    /// [`set_button_mapping`](ScannerBackend::set_button_mapping) (4.2), which *is* the
+    /// registration.
+    ///
+    /// Which is why this is also where the address is learnt.
+    /// [`note_device`](Self::note_device) is called from discovery and from pairing —
+    /// "everywhere the backend is handed a [`ScannerInfo`]" — and a restarted daemon
+    /// reaches neither before it replays the assignments: it publishes what the store
+    /// holds, and the store holds the `ScannerInfo` this method is given. Without this
+    /// line every restored registration would be refused
+    /// ([`registration_target`](Self::registration_target)) with *no address is on
+    /// record*, and a paired printer would come back with an empty panel until the user
+    /// ran a discovery. The address is discovery's answer as of the last run, which is
+    /// exactly what a DHCP lease that moved will correct on the next one.
+    ///
+    /// [`brother-skeyless-backend.md`]: https://github.com/jeanparpaillon/scanbus_service/blob/master/docs/brother-skeyless-backend.md
+    async fn restore_disposition(&self, scanner: &ScannerInfo) -> RestoreDisposition {
+        self.note_device(scanner);
         RestoreDisposition::Paired
     }
 
-    /// Records what the daemon assigned to a panel key, so acquisition knows how to scan.
+    /// Takes this host off the printer's panel: stops every refresh for this scanner and
+    /// drops the assignments they were derived from.
     ///
-    /// **This does not yet put the entry on the printer's panel.** Registering a function
-    /// with the device — and stopping the refresh when a key is cleared, which is how an
-    /// entry disappears from the LCD — is the registration half of the design
-    /// ([`brother-skeyless-backend.md`] §3) and lands with 5.11. What is here is the half
-    /// 5.10 needs: [`fetch_pages`](Self::fetch_pages) receives a trigger id, resolves it
-    /// to the key that was pressed, and has to turn that key into a `--source` and a
-    /// `--resolution`. The profile that decides those is the daemon's
-    /// ([`ScanTrigger`] carries an index and never a profile, per 1.3), so the only way
-    /// it can reach acquisition is for the assignment to be handed down and kept.
+    /// The whole of what a Brother pairing leaves behind is that refresh task — no
+    /// token, no `brscan-skey.config` entry, nothing on the device — so stopping it is
+    /// the whole revocation. Nothing is sent: dropping the registrar aborts the refresh
+    /// and the entries lapse within one `DURATION`, which is what makes `scanbus unpair`
+    /// leave the panel with no entry for this host within one lease. A printer that was
+    /// switched off when the user unpaired is covered by the same mechanism rather than
+    /// by a retry — it cannot be told anything, and its leases are expiring regardless.
     ///
-    /// `None` removes the assignment, per the trait: a cleared key is not the same as an
-    /// unchanged one, and a scan started from a key nobody has assigned falls back to the
-    /// device's own defaults rather than to whatever was mapped there last week.
+    /// The assignments go with the task, and not merely because the daemon has dropped
+    /// its own copy. [`set_button_mapping`](ScannerBackend::set_button_mapping) derives
+    /// the set it registers from [`buttons`](Self::buttons), so an entry left behind for
+    /// a forgotten scanner would climb back onto the panel the moment that device was
+    /// paired again and *any* key assigned — the unpaired user's old keys riding along
+    /// with the new one.
+    ///
+    /// What is kept is what discovery put there rather than pairing: the address, the
+    /// eSCL device, and the scan-to-PC note. Those describe the hardware, which unpairing
+    /// does not change, so an unpaired scanner stays visible with its four keys and can
+    /// be paired again without a rediscovery.
+    ///
+    /// # Errors
+    ///
+    /// None. There is no datagram to lose and no file to write, which is the point of
+    /// leases.
+    async fn forget(&self, scanner_id: &ScannerId) -> Result<(), BackendError> {
+        // Held across both maps, for the reason set_button_mapping holds it: the panel
+        // and the assignments are two halves of one fact, and a `Profile` write racing
+        // an `Unpair()` must not be able to leave the halves describing different keys.
+        let mut registrars = self.registrars.lock().await;
+        let was_refreshing = registrars.remove(scanner_id).is_some();
+
+        let mut buttons = self.buttons.lock().expect("brother button assignments");
+        let before = buttons.len();
+        buttons.retain(|(id, _), _| id != scanner_id);
+        let cleared = before - buttons.len();
+        drop(buttons);
+
+        if was_refreshing || cleared > 0 {
+            info!(
+                scanner = %scanner_id,
+                keys = cleared,
+                "unpaired; this host stops refreshing, and its panel entries lapse within \
+                 one lease",
+            );
+        }
+        Ok(())
+    }
+
+    /// Puts the key on the printer's panel, or takes it off, and records what it means.
+    ///
+    /// There is **no configuration file** in this backend — that was the `brscan-skey`
+    /// design and it is gone with the vendor package ([`brother-skeyless-backend.md`] §3)
+    /// — so the "rewrite the backend's configuration and reload it" the trait describes
+    /// is here the protocol's own operation: a function is under *Scan to PC* on the LCD
+    /// for exactly as long as this host keeps refreshing its lease. Assigning a profile
+    /// starts that refresh ([`register_functions`](Self::register_functions)); clearing
+    /// the key stops it, and the entry **disappears from the panel** within one
+    /// `DURATION` instead of staying there running a script that does nothing.
+    ///
+    /// The mapping is kept as well as registered, because a press carries an index and
+    /// never a profile (1.3): [`fetch_pages`](Self::fetch_pages) resolves the key that was
+    /// pressed and has to turn it into a `--source` and a `--resolution`, which only the
+    /// assigned profile decides.
+    ///
+    /// # The device is asked first
+    ///
+    /// The registration is sent **before** the assignment is recorded, and a device that
+    /// refuses leaves the map untouched. That is the order the daemon needs: it only
+    /// moves `Button1.Profile` once this returns `Ok`, so recording first would leave a
+    /// key that the daemon believes is unassigned and this backend would happily scan
+    /// from. It costs a round-trip on the writing path, which is a call a user is already
+    /// waiting on.
+    ///
+    /// # Errors
+    ///
+    /// [`BackendError::Other`] for a `button_index` this panel does not have — the table
+    /// is [`Function::ALL`], indices 0..=3, and nothing else is a Brother key. Refused
+    /// first, before the registrar lock is taken, so the call sends nothing and records
+    /// nothing. The variant is the one HPLIP already uses to refuse every index but its
+    /// single walk-up trigger, and the trait asks for that shape: no client can reach
+    /// this, since `Button1` objects are exported from `buttons.count`, so the only
+    /// callers who can produce a bad index are ours and the error is a bug surfacing
+    /// rather than a device condition. Clearing is refused on the same terms: `None` for
+    /// index 7 is not "nothing to remove", it is the same bug through the other setter.
+    ///
+    /// Then the device's own answers: [`BackendError::NotReachable`] for a printer that
+    /// does not answer, or a scanner with no address on record
+    /// ([`registration_target`](Self::registration_target));
+    /// [`BackendError::Unsupported`] for a model that answers and refuses the scan-key
+    /// OID — the degraded path of §4, where nothing is wrong and nothing will fix it.
+    /// Clearing a *valid* key escapes both only when it was the last one assigned: an
+    /// empty set is a dropped registrar and no datagram at all, while clearing one key of
+    /// two re-registers the other and can fail the way any registration can.
     ///
     /// [`brother-skeyless-backend.md`]: https://github.com/jeanparpaillon/scanbus_service/blob/master/docs/brother-skeyless-backend.md
     async fn set_button_mapping(
@@ -843,27 +1162,60 @@ impl ScannerBackend for BrotherBackend {
         profile: Option<ProfileKind>,
         options: &BTreeMap<String, Value>,
     ) -> Result<(), BackendError> {
-        if Function::from_button_index(button_index).is_none() {
+        // Before anything else, and before the lock: an index off the table names no
+        // function, so there is no set to register and nothing this call could half-do.
+        // Wording follows HPLIP's refusal of the same mistake — what the device offers,
+        // then what was asked for — so a `Failed` from either backend reads the same.
+        let Some(function) = Function::from_button_index(button_index) else {
             return Err(BackendError::Other(format!(
                 "scanner {scanner_id} has {} panel entries, indices 0..={}; asked to map \
                  button {button_index}",
                 Function::ALL.len(),
                 Function::ALL.len() - 1,
             )));
-        }
+        };
+
+        // Held across the registration, so that the panel and the assignments cannot end
+        // up describing two different writes — see [`Self::registrars`].
+        let mut registrars = self.registrars.lock().await;
+
+        let assignment = profile.map(|profile| ButtonMapping {
+            profile,
+            options: options.clone(),
+        });
+        let functions = {
+            let buttons = self.buttons.lock().expect("brother button assignments");
+            let mut functions = assigned_functions(&buttons, scanner_id);
+            if assignment.is_some() {
+                functions.insert(function);
+            } else {
+                functions.remove(&function);
+            }
+            functions
+        };
+
+        self.register_functions(&mut registrars, scanner_id, functions)
+            .await?;
 
         let mut buttons = self.buttons.lock().expect("brother button assignments");
-        match profile {
-            Some(profile) => {
-                buttons.insert(
-                    (scanner_id.clone(), button_index),
-                    ButtonMapping {
-                        profile,
-                        options: options.clone(),
-                    },
+        match assignment {
+            Some(assignment) => {
+                info!(
+                    scanner = %scanner_id,
+                    index = button_index,
+                    %function,
+                    profile = %assignment.profile,
+                    "key assigned and registered with the device",
                 );
+                buttons.insert((scanner_id.clone(), button_index), assignment);
             }
             None => {
+                info!(
+                    scanner = %scanner_id,
+                    index = button_index,
+                    %function,
+                    "key cleared; the entry leaves the panel within one lease",
+                );
                 buttons.remove(&(scanner_id.clone(), button_index));
             }
         }
@@ -1190,6 +1542,25 @@ fn capabilities_for_sighting(
     capabilities
 }
 
+/// The functions one scanner currently has assigned, from the button map.
+///
+/// The panel is derived from the assignments rather than tracked beside them: two records
+/// of "what is on the LCD" would drift the first time a registration failed, and the one
+/// that matters is the one [`fetch_pages`](BrotherBackend::fetch_pages) reads. An index
+/// the table does not hold is skipped rather than panicked on — nothing can put one in
+/// the map, since `set_button_mapping` rejects it, and a panic in a scan path is a worse
+/// answer than a key that does not appear.
+fn assigned_functions(
+    buttons: &BTreeMap<(ScannerId, u32), ButtonMapping>,
+    scanner_id: &ScannerId,
+) -> BTreeSet<Function> {
+    buttons
+        .keys()
+        .filter(|(id, _)| id == scanner_id)
+        .filter_map(|(_, index)| Function::from_button_index(*index))
+        .collect()
+}
+
 /// The device's IPv4 address, if discovery found one.
 ///
 /// `physical_address` first because it is the field discovery put the device's own
@@ -1232,7 +1603,7 @@ const ESCL_BASELINE_RESOLUTIONS: &[u32] = &[100, 200, 300, 600];
 ///
 /// Buttons are the *protocol's* four entries, not a per-model claim: the firmware builds
 /// its *Scan to PC* menu from `FUNC`, so a Brother that speaks the registration OID has
-/// exactly these four and no others ([`skey::register::Function`]). A device that refuses
+/// exactly these four and no others ([`skey::function::Function`]). A device that refuses
 /// the OID has this reduced to zero by its caller, from the device's own answer.
 fn escl_capabilities(sighting: &Sighting) -> Capabilities {
     if !sighting.transport.is_escl() {
@@ -1258,6 +1629,16 @@ fn escl_capabilities(sighting: &Sighting) -> Capabilities {
 }
 
 /// The device's physical menu: the four `FUNC` entries, with the firmware's own labels.
+///
+/// `labels` is read *positionally* — `ButtonInfo::from_capabilities` gives `Button1`
+/// index *i* the label at `labels[i]` — so this relies on [`Function::ALL`] being in
+/// `button_index` order, and `every_index_carries_its_firmware_label` is what holds it
+/// to that.
+///
+/// `label_configurable` is `false` and has no case where it is not: the labels are the
+/// firmware's own menu entries, built from `FUNC`, and nothing scanbus sends changes
+/// what the LCD prints (§3). A client that wants its own wording writes `Label`, which
+/// the daemon keeps on its side.
 fn panel_buttons() -> ButtonsCapability {
     ButtonsCapability {
         count: u32::try_from(Function::ALL.len()).expect("four panel entries fit in a u32"),
@@ -1523,7 +1904,10 @@ device 'airscan:escl:Brother MFC-L2710DW http://BRW001122334455.local:80/eSCL/' 
         assert_eq!(scanners.len(), 1);
         let capabilities = &scanners[0].capabilities;
         assert_eq!(capabilities.resolutions, vec![100, 200, 300, 600]);
-        assert_eq!(capabilities.color_modes, vec![ColorMode::Color, ColorMode::Gray]);
+        assert_eq!(
+            capabilities.color_modes,
+            vec![ColorMode::Color, ColorMode::Gray]
+        );
         // Read off `adf,platen` in the description, not out of a model name.
         assert_eq!(capabilities.sources, vec![Source::Flatbed, Source::Adf]);
         assert!(!capabilities.duplex);
@@ -1668,6 +2052,10 @@ device 'airscan:escl:Brother MFC-L2710DW http://BRW001122334455.local:80/eSCL/' 
             dpkg_query_path: dpkg_query,
             sysroot: root.path().to_path_buf(),
             runner,
+            // Never the routing table: what a registration advertises is decided by the
+            // machine the suite happens to run on otherwise, and a test that asserts the
+            // `HOST=` field would then only pass here.
+            host: Arc::new(registrar::FixedHost(Ipv4Addr::LOCALHOST)),
             ..BrotherBackend::default()
         }
     }
@@ -1719,19 +2107,63 @@ device 'airscan:escl:Brother MFC-L2710DW http://BRW001122334455.local:80/eSCL/' 
     struct FakeSnmp {
         /// `None` is a printer that is switched off.
         answer: Option<skey::snmp::ErrorStatus>,
+        /// What a `SetRequest` gets, when that is not what a read gets. The two are
+        /// separable because the interesting device is the one that lets its scan-key OID
+        /// be *read* — so pairing succeeds and the keys are published — and then refuses
+        /// the write that would put an entry on the panel.
+        set_answer: Option<skey::snmp::ErrorStatus>,
         asked: Mutex<Vec<SocketAddrV4>>,
+        sent: Mutex<Vec<skey::snmp::Message>>,
     }
 
     impl FakeSnmp {
         fn answering(answer: Option<skey::snmp::ErrorStatus>) -> Arc<Self> {
             Arc::new(Self {
                 answer,
+                set_answer: None,
                 asked: Mutex::new(Vec::new()),
+                sent: Mutex::new(Vec::new()),
+            })
+        }
+
+        /// Answers reads, refuses registrations: the MFC that does not do scan-to-PC the
+        /// way this backend speaks it.
+        fn refusing_registrations(status: skey::snmp::ErrorStatus) -> Arc<Self> {
+            Arc::new(Self {
+                answer: Some(skey::snmp::ErrorStatus::NoError),
+                set_answer: Some(status),
+                asked: Mutex::new(Vec::new()),
+                sent: Mutex::new(Vec::new()),
             })
         }
 
         fn asked(&self) -> Vec<SocketAddrV4> {
             self.asked.lock().unwrap().clone()
+        }
+
+        /// Every registration this device was sent, in order, parsed back.
+        fn registrations(&self) -> Vec<skey::register::Registration> {
+            self.sent
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|message| message.pdu.kind == skey::snmp::PduKind::SetRequest)
+                .map(|message| {
+                    let value = message.pdu.varbinds[0]
+                        .value
+                        .as_str()
+                        .expect("a registration is an octet string");
+                    skey::register::Registration::parse(value).expect("what we send parses back")
+                })
+                .collect()
+        }
+
+        /// The functions it has been asked to register, in order, duplicates and all.
+        fn registered(&self) -> Vec<Function> {
+            self.registrations()
+                .into_iter()
+                .map(|registration| registration.function)
+                .collect()
         }
     }
 
@@ -1745,7 +2177,12 @@ device 'airscan:escl:Brother MFC-L2710DW http://BRW001122334455.local:80/eSCL/' 
             use skey::snmp::{Message, Pdu, PduKind, Value as SnmpValue, VarBind, Version};
 
             self.asked.lock().unwrap().push(device);
-            let Some(error_status) = self.answer else {
+            self.sent.lock().unwrap().push(request.clone());
+            let answer = match request.pdu.kind {
+                PduKind::SetRequest => self.set_answer.or(self.answer),
+                _ => self.answer,
+            };
+            let Some(error_status) = answer else {
                 return Err(registrar::TransportError::Timeout(
                     registrar::RESPONSE_TIMEOUT,
                 ));
@@ -2013,7 +2450,7 @@ device 'airscan:escl:Brother MFC-L2710DW http://BRW001122334455.local:80/eSCL/' 
         panic!("no free port for this test in 64 tries");
     }
 
-    async fn press(from: Ipv4Addr, port: u16, function: skey::register::Function) {
+    async fn press(from: Ipv4Addr, port: u16, function: skey::function::Function) {
         let payload = format!(
             "TYPE=BR;BUTTON=SCAN;USER=\"desktop\";FUNC={};HOST=127.0.0.1:{port};APPNUM={};\
              CLIENT={from}",
@@ -2069,7 +2506,7 @@ device 'airscan:escl:Brother MFC-L2710DW http://BRW001122334455.local:80/eSCL/' 
         press(
             Ipv4Addr::new(127, 0, 0, 2),
             port,
-            skey::register::Function::Ocr,
+            skey::function::Function::Ocr,
         )
         .await;
 
@@ -2217,7 +2654,6 @@ device 'airscan:escl:Brother MFC-L2710DW http://BRW001122334455.local:80/eSCL/' 
         backend.stop_listening(&scanner.id).await.unwrap();
         assert_eq!(backend.listener.port(), None);
     }
-
 
     // ----------------------------------------------------------------- acquisition
 
@@ -2391,9 +2827,15 @@ printf 'P5\\n1 1\\n255\\n\\001' > \"$(printf \"$batch\" 1)\"\n",
 
         backend.fetch_pages(&scanner.id, &trigger.id).await.unwrap();
 
-        for (case, id) in [("already fetched", trigger.id.as_str()), ("never minted", "press-99")] {
+        for (case, id) in [
+            ("already fetched", trigger.id.as_str()),
+            ("never minted", "press-99"),
+        ] {
             match backend.fetch_pages(&scanner.id, id).await {
-                Err(BackendError::UnknownJob { scanner: reported, job }) => {
+                Err(BackendError::UnknownJob {
+                    scanner: reported,
+                    job,
+                }) => {
                     assert_eq!(reported, scanner.id, "{case}");
                     assert_eq!(job, id, "{case}");
                 }
@@ -2435,7 +2877,12 @@ printf 'P5\\n1 1\\n255\\n\\001' > \"$(printf \"$batch\" 1)\"\n",
         let index = Function::File.button_index();
 
         backend
-            .set_button_mapping(&scanner.id, index, Some(ProfileKind::Document), &BTreeMap::new())
+            .set_button_mapping(
+                &scanner.id,
+                index,
+                Some(ProfileKind::Document),
+                &BTreeMap::new(),
+            )
             .await
             .unwrap();
         backend
@@ -2476,6 +2923,766 @@ printf 'P5\\n1 1\\n255\\n\\001' > \"$(printf \"$batch\" 1)\"\n",
         let message = error.to_string();
         assert!(message.contains("button 4"), "{message}");
         assert!(message.contains("0..=3"), "{message}");
+    }
+
+    // ------------------------------------------- the panel: assigning is registering
+
+    /// A paired scanner on the network, and the device that answers for it.
+    ///
+    /// No listener: what is under test here is what goes *to* the printer, and binding a
+    /// UDP port to assert an SNMP exchange would only make the test collide with its
+    /// neighbours.
+    async fn registering_backend(
+        root: &TempDir,
+        device: Arc<FakeSnmp>,
+    ) -> (BrotherBackend, ScannerInfo) {
+        let (backend, _) = networked_backend(root, device);
+        let scanner = backend.discover().await.unwrap().remove(0);
+        ensure_installed_progress(&backend, &scanner)
+            .await
+            .0
+            .unwrap();
+        (backend, scanner)
+    }
+
+    /// What this host is currently keeping on that scanner's panel.
+    async fn panel(backend: &BrotherBackend, scanner: &ScannerId) -> BTreeSet<Function> {
+        backend
+            .registrars
+            .lock()
+            .await
+            .get(scanner)
+            .map(|registrar| registrar.functions().clone())
+            .unwrap_or_default()
+    }
+
+    /// The core of 5.11: a profile on a key is an entry on the LCD, sent then and there.
+    #[tokio::test]
+    async fn assigning_a_profile_registers_that_function_with_the_device() {
+        let root = sysroot(&[AIRSCAN_SO]);
+        let device = FakeSnmp::answering(Some(skey::snmp::ErrorStatus::NoError));
+        let (backend, scanner) = registering_backend(&root, device.clone()).await;
+
+        backend
+            .set_button_mapping(
+                &scanner.id,
+                Function::Ocr.button_index(),
+                Some(ProfileKind::Document),
+                &BTreeMap::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(device.registered(), vec![Function::Ocr]);
+        let registration = device.registrations().remove(0);
+        assert_eq!(
+            registration.host,
+            Ipv4Addr::LOCALHOST,
+            "the address the backend was told routes to this device",
+        );
+        assert_eq!(
+            registration.port, LISTENER_PORT,
+            "presses are answered on the one well-known port",
+        );
+        assert_eq!(registration.user, registrar::panel_name());
+
+        assert_eq!(
+            panel(&backend, &scanner.id).await,
+            BTreeSet::from([Function::Ocr])
+        );
+        assert!(
+            backend
+                .registrars
+                .lock()
+                .await
+                .get(&scanner.id)
+                .unwrap()
+                .is_running(),
+            "the lease is being refreshed, or the entry lapses in six minutes",
+        );
+    }
+
+    /// Two assigned keys are two entries kept alive by **one** task, not two.
+    ///
+    /// The acceptance criterion asks for that in `tcpdump`; here it is the registrar map,
+    /// which is what the cadence comes from. Registering the first function a second time
+    /// is what the refresh would have done anyway — it is a lease, and re-sending it is
+    /// how a lease stays alive.
+    #[tokio::test]
+    async fn a_second_key_joins_the_first_on_the_panel() {
+        let root = sysroot(&[AIRSCAN_SO]);
+        let device = FakeSnmp::answering(Some(skey::snmp::ErrorStatus::NoError));
+        let (backend, scanner) = registering_backend(&root, device.clone()).await;
+
+        for (function, profile) in [
+            (Function::File, ProfileKind::Document),
+            (Function::Image, ProfileKind::Image),
+        ] {
+            backend
+                .set_button_mapping(
+                    &scanner.id,
+                    function.button_index(),
+                    Some(profile),
+                    &BTreeMap::new(),
+                )
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            device.registered(),
+            vec![Function::File, Function::File, Function::Image],
+            "the second write re-registers the whole set, in index order",
+        );
+        assert_eq!(
+            panel(&backend, &scanner.id).await,
+            BTreeSet::from([Function::File, Function::Image]),
+        );
+        assert_eq!(
+            backend.registrars.lock().await.len(),
+            1,
+            "one registrar per device, whatever the number of keys",
+        );
+    }
+
+    /// Reassigning a key changes what it does here and leaves the panel with one entry.
+    #[tokio::test]
+    async fn assigning_the_same_key_twice_leaves_one_entry_on_the_panel() {
+        let root = sysroot(&[AIRSCAN_SO]);
+        let device = FakeSnmp::answering(Some(skey::snmp::ErrorStatus::NoError));
+        let (backend, scanner) = registering_backend(&root, device.clone()).await;
+        let index = Function::File.button_index();
+
+        for profile in [ProfileKind::Document, ProfileKind::Image] {
+            backend
+                .set_button_mapping(&scanner.id, index, Some(profile), &BTreeMap::new())
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(device.registered(), vec![Function::File, Function::File]);
+        assert_eq!(
+            panel(&backend, &scanner.id).await,
+            BTreeSet::from([Function::File]),
+            "one function, registered twice — not two panel entries",
+        );
+        assert_eq!(
+            backend
+                .buttons
+                .lock()
+                .unwrap()
+                .get(&(scanner.id.clone(), index))
+                .map(|mapping| mapping.profile),
+            Some(ProfileKind::Image),
+            "the second write is what the key now does",
+        );
+    }
+
+    /// Clearing a key stops the refresh and sends nothing — that is the deregistration.
+    #[tokio::test]
+    async fn clearing_the_last_key_stops_refreshing_and_sends_nothing() {
+        let root = sysroot(&[AIRSCAN_SO]);
+        let device = FakeSnmp::answering(Some(skey::snmp::ErrorStatus::NoError));
+        let (backend, scanner) = registering_backend(&root, device.clone()).await;
+        let index = Function::Email.button_index();
+
+        backend
+            .set_button_mapping(
+                &scanner.id,
+                index,
+                Some(ProfileKind::Email),
+                &BTreeMap::new(),
+            )
+            .await
+            .unwrap();
+        let after_assigning = device.registered();
+
+        backend
+            .set_button_mapping(&scanner.id, index, None, &BTreeMap::new())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            device.registered(),
+            after_assigning,
+            "there is no teardown datagram: the lease simply stops being renewed",
+        );
+        assert!(
+            panel(&backend, &scanner.id).await.is_empty(),
+            "nothing is being kept on the panel any more",
+        );
+        assert!(
+            backend.buttons.lock().unwrap().is_empty(),
+            "and the assignment is gone with it",
+        );
+    }
+
+    /// §4's degraded path on the writing side: the device answers, and says no.
+    ///
+    /// The key must stay unassigned. The daemon only moves `Button1.Profile` once this
+    /// returns `Ok`, so a backend that recorded the mapping anyway would scan from a key
+    /// the daemon believes is clear — and from an entry the printer never put on its LCD.
+    #[tokio::test]
+    async fn a_device_that_refuses_the_registration_leaves_the_key_unassigned() {
+        let root = sysroot(&[AIRSCAN_SO]);
+        let device = FakeSnmp::refusing_registrations(skey::snmp::ErrorStatus::NoSuchName);
+        let (backend, scanner) = registering_backend(&root, device.clone()).await;
+
+        let error = backend
+            .set_button_mapping(
+                &scanner.id,
+                Function::Image.button_index(),
+                Some(ProfileKind::Image),
+                &BTreeMap::new(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, BackendError::Unsupported { .. }),
+            "a model that says no is not a model to retry: {error:?}",
+        );
+        assert!(
+            backend.buttons.lock().unwrap().is_empty(),
+            "the key is untouched"
+        );
+        assert!(panel(&backend, &scanner.id).await.is_empty());
+    }
+
+    /// A scanner with no address cannot be given a panel entry, and can still lose one.
+    ///
+    /// Registration is a network operation, so a scanner discovery has no address for —
+    /// a USB device, or one that has not been seen since the daemon started — has nothing
+    /// to send to. Clearing is the asymmetric half: it sends nothing, so it cannot fail,
+    /// and a key that could not be cleared would be a key stuck on the panel.
+    #[tokio::test]
+    async fn a_scanner_with_no_address_can_be_cleared_but_not_assigned() {
+        let root = sysroot(&[AIRSCAN_SO]);
+        let device = FakeSnmp::answering(Some(skey::snmp::ErrorStatus::NoError));
+        let (backend, scanner) = registering_backend(&root, device).await;
+        backend.devices.lock().unwrap().clear();
+        let index = Function::File.button_index();
+
+        let error = backend
+            .set_button_mapping(
+                &scanner.id,
+                index,
+                Some(ProfileKind::Image),
+                &BTreeMap::new(),
+            )
+            .await
+            .unwrap_err();
+
+        let BackendError::NotReachable { detail, .. } = &error else {
+            panic!("expected NotReachable, got {error:?}");
+        };
+        assert!(detail.contains("discovery"), "{detail}");
+
+        backend
+            .set_button_mapping(&scanner.id, index, None, &BTreeMap::new())
+            .await
+            .expect("clearing a key sends nothing and needs no address");
+    }
+
+    /// An index the panel does not have is our bug, not the printer's, and stays inert.
+    ///
+    /// The panel is four fixed entries ([`Function::ALL`]), and `Button1` objects are
+    /// exported from `buttons.count`, so no client can ask for a fifth: what can is our
+    /// own code — a restore replaying an assignment older than the key set, a count that
+    /// has drifted from the table. Refused with the shape HPLIP uses for every index but
+    /// its single walk-up trigger, [`BackendError::Other`] and so
+    /// `org.freedesktop.DBus.Error.Failed`, because the scanner is known and registration
+    /// is supported; none of §8's named errors is true of it. Clearing is refused on the
+    /// same terms — `None` for a key that does not exist is the same bug arriving through
+    /// `Profile = ""`, and answering `Ok` would report a key removed that never was.
+    #[tokio::test]
+    async fn an_index_the_panel_does_not_have_is_refused_and_sends_nothing() {
+        let root = sysroot(&[AIRSCAN_SO]);
+        let device = FakeSnmp::answering(Some(skey::snmp::ErrorStatus::NoError));
+        let (backend, scanner) = registering_backend(&root, device.clone()).await;
+
+        for index in [u32::try_from(Function::ALL.len()).unwrap(), u32::MAX] {
+            for profile in [Some(ProfileKind::Document), None] {
+                let error = backend
+                    .set_button_mapping(&scanner.id, index, profile, &BTreeMap::new())
+                    .await
+                    .unwrap_err();
+
+                let BackendError::Other(message) = &error else {
+                    panic!("an index off the table is no device condition: {error:?}");
+                };
+                assert!(message.contains("indices 0..=3"), "{message}");
+                assert!(
+                    message.contains(&format!("asked to map button {index}")),
+                    "the index asked for is what makes the message actionable: {message}",
+                );
+            }
+        }
+
+        assert!(
+            device.registrations().is_empty(),
+            "a bad index reaches no printer",
+        );
+        assert!(
+            backend.registrars.lock().await.is_empty(),
+            "and starts no refresh task",
+        );
+        assert!(backend.buttons.lock().unwrap().is_empty());
+    }
+
+    /// The refusal is also inert for the keys that *do* exist.
+    ///
+    /// Why the check comes before the registrar lock rather than after it: past that
+    /// point the call registers the whole set, and [`Registrar::start`] stops the running
+    /// refresh before it re-registers. A bad index handled there would take the user's
+    /// real entries off the panel and put them back, for a call that should have done
+    /// nothing at all.
+    #[tokio::test]
+    async fn a_refused_index_leaves_the_keys_that_do_exist_alone() {
+        let root = sysroot(&[AIRSCAN_SO]);
+        let device = FakeSnmp::answering(Some(skey::snmp::ErrorStatus::NoError));
+        let (backend, scanner) = registering_backend(&root, device.clone()).await;
+
+        backend
+            .set_button_mapping(
+                &scanner.id,
+                Function::File.button_index(),
+                Some(ProfileKind::Document),
+                &BTreeMap::new(),
+            )
+            .await
+            .unwrap();
+        let while_assigned = device.registered();
+
+        backend
+            .set_button_mapping(&scanner.id, 9, Some(ProfileKind::Image), &BTreeMap::new())
+            .await
+            .expect_err("9 is not one of this panel's entries");
+
+        assert_eq!(
+            device.registered(),
+            while_assigned,
+            "nothing was re-registered, so no lease was disturbed",
+        );
+        assert_eq!(
+            panel(&backend, &scanner.id).await,
+            BTreeSet::from([Function::File]),
+        );
+        assert_eq!(
+            backend
+                .buttons
+                .lock()
+                .unwrap()
+                .get(&(scanner.id.clone(), Function::File.button_index()))
+                .map(|mapping| mapping.profile),
+            Some(ProfileKind::Document),
+            "the key that was assigned still means what it meant",
+        );
+    }
+
+    /// The `DeviceLabel` half of 5.11: the firmware's wording, under the API's index.
+    ///
+    /// `labels` is a positional vector — `ButtonInfo::from_capabilities` hands index *i*
+    /// the label at `labels[i]` — so the assertion is made through that consumer rather
+    /// than on the vector, and reordering [`Function::ALL`] fails it. The wording itself
+    /// is checked against the two arch tables in `tests/arch_button_table.rs`; what is
+    /// checked here is that it arrives under the right key.
+    #[test]
+    fn every_index_carries_its_firmware_label() {
+        let capabilities = Capabilities {
+            buttons: panel_buttons(),
+            ..Capabilities::default()
+        };
+
+        let keys = scanbus_core::ButtonInfo::from_capabilities(&capabilities);
+
+        assert_eq!(
+            keys.len(),
+            Function::ALL.len(),
+            "one object per panel entry"
+        );
+        for function in Function::ALL {
+            let key = &keys[function.button_index() as usize];
+            assert_eq!(key.index, function.button_index());
+            assert_eq!(key.device_label, function.device_label());
+            assert!(
+                !key.label_configurable,
+                "the LCD's menu is the firmware's; nothing scanbus sends renames {function}",
+            );
+            // Nothing is assigned yet, so `Label` shows what the panel shows.
+            assert_eq!(key.effective_label(), function.device_label());
+        }
+    }
+
+    /// `buttons.count` is the count of entries the device *accepted*, not the count the
+    /// protocol defines: a model that answers the probe and then refuses the write has
+    /// its keys withdrawn at the next discovery.
+    #[tokio::test]
+    async fn a_refused_registration_withdraws_the_keys_at_the_next_discovery() {
+        let root = sysroot(&[AIRSCAN_SO]);
+        let device = FakeSnmp::refusing_registrations(skey::snmp::ErrorStatus::NoSuchName);
+        let (backend, scanner) = registering_backend(&root, device).await;
+        // The pairing probe is a read, and this device answers reads: after pairing it
+        // still looks like a scanner with four working keys.
+        assert_eq!(
+            backend.discover().await.unwrap()[0]
+                .capabilities
+                .buttons
+                .count,
+            4,
+        );
+
+        backend
+            .set_button_mapping(
+                &scanner.id,
+                Function::Ocr.button_index(),
+                Some(ProfileKind::Document),
+                &BTreeMap::new(),
+            )
+            .await
+            .expect_err("the device refused the registration");
+
+        let after = backend.discover().await.unwrap().remove(0);
+        assert_eq!(after.id, scanner.id);
+        assert_eq!(
+            after.capabilities.buttons.count, 0,
+            "no key is offered that the device will not register",
+        );
+        assert!(after.capabilities.buttons.labels.is_empty());
+        let dict = brother_dict(&after);
+        assert_eq!(dict.get("scan_to_pc"), Some(&Value::Bool(false)));
+        let Some(Value::Str(reason)) = dict.get("scan_to_pc_reason") else {
+            panic!("the reason travels with the scanner: {dict:?}");
+        };
+        assert!(reason.contains("refused to register OCR"), "{reason}");
+        // The scanner itself is untouched — it is a perfectly good pull scanner.
+        assert_eq!(after.status, Status::Online);
+        assert_eq!(
+            after.capabilities.resolutions,
+            scanner.capabilities.resolutions
+        );
+    }
+
+    /// And the same in reverse: a device that takes a write has its keys back.
+    ///
+    /// The write is the stronger answer whichever way it goes, so a scanner noted as
+    /// key-less — an older firmware since updated, or a probe that was answered by
+    /// something else — is not stuck that way until it is re-paired.
+    #[tokio::test]
+    async fn a_registration_the_device_accepts_gives_a_key_less_scanner_its_panel_back() {
+        let root = sysroot(&[AIRSCAN_SO]);
+        let device = FakeSnmp::answering(Some(skey::snmp::ErrorStatus::NoError));
+        let (backend, scanner) = registering_backend(&root, device).await;
+        backend.scan_to_pc.lock().unwrap().insert(
+            scanner.id.clone(),
+            ScanToPc::Unavailable {
+                reason: "recorded before the firmware update".to_owned(),
+            },
+        );
+        assert_eq!(
+            backend.discover().await.unwrap()[0]
+                .capabilities
+                .buttons
+                .count,
+            0,
+        );
+
+        backend
+            .set_button_mapping(
+                &scanner.id,
+                Function::File.button_index(),
+                Some(ProfileKind::Document),
+                &BTreeMap::new(),
+            )
+            .await
+            .expect("the device accepts registrations");
+
+        let after = backend.discover().await.unwrap().remove(0);
+        assert_eq!(after.capabilities.buttons.count, 4);
+        assert_eq!(
+            brother_dict(&after).get("scan_to_pc"),
+            Some(&Value::Bool(true)),
+        );
+        assert!(!brother_dict(&after).contains_key("scan_to_pc_reason"));
+    }
+
+    /// Silence is not a refusal, at registration time as at pairing time.
+    ///
+    /// A printer that is switched off mid-lease must come back with its panel: recording
+    /// "this model has no buttons" from a timeout would need a re-pair to undo, and the
+    /// user's fix is to switch the printer on.
+    #[tokio::test]
+    async fn a_device_that_does_not_answer_keeps_its_keys() {
+        let root = sysroot(&[AIRSCAN_SO]);
+        let device = FakeSnmp::answering(Some(skey::snmp::ErrorStatus::NoError));
+        let (backend, scanner) = registering_backend(&root, device).await;
+        // Now it stops answering anything at all.
+        let backend = BrotherBackend {
+            transport: FakeSnmp::answering(None),
+            ..backend
+        };
+
+        let error = backend
+            .set_button_mapping(
+                &scanner.id,
+                Function::Email.button_index(),
+                Some(ProfileKind::Document),
+                &BTreeMap::new(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, BackendError::NotReachable { .. }),
+            "silence is a statement about right now: {error:?}",
+        );
+        let after = backend.discover().await.unwrap().remove(0);
+        assert_eq!(
+            after.capabilities.buttons.count, 4,
+            "a printer that was switched off has not lost its panel",
+        );
+    }
+
+    /// `Unpair()`: the panel keeps nothing for a host that has forgotten the printer.
+    ///
+    /// The lease is the whole deregistration — there is no datagram to send — so what is
+    /// asserted is that the refresh stopped and that nothing went out after it.
+    #[tokio::test]
+    async fn forgetting_a_scanner_stops_every_refresh_and_sends_nothing() {
+        let root = sysroot(&[AIRSCAN_SO]);
+        let device = FakeSnmp::answering(Some(skey::snmp::ErrorStatus::NoError));
+        let (backend, scanner) = registering_backend(&root, device.clone()).await;
+
+        for (function, profile) in [
+            (Function::File, ProfileKind::Document),
+            (Function::Email, ProfileKind::Email),
+        ] {
+            backend
+                .set_button_mapping(
+                    &scanner.id,
+                    function.button_index(),
+                    Some(profile),
+                    &BTreeMap::new(),
+                )
+                .await
+                .unwrap();
+        }
+        let while_paired = device.registered();
+
+        backend.forget(&scanner.id).await.unwrap();
+
+        assert_eq!(
+            device.registered(),
+            while_paired,
+            "unpairing sends no teardown: the leases just stop being renewed",
+        );
+        assert!(panel(&backend, &scanner.id).await.is_empty());
+        assert!(
+            backend.registrars.lock().await.is_empty(),
+            "the refresh task is gone with the registrar that owned it",
+        );
+        assert!(
+            !backend
+                .buttons
+                .lock()
+                .unwrap()
+                .keys()
+                .any(|(id, _)| id == &scanner.id),
+            "the assignments the panel was derived from go with it",
+        );
+    }
+
+    /// Why the assignments are dropped and not just the task: the keys of a scanner the
+    /// user unpaired must not ride back onto the panel with the first key assigned after
+    /// a re-pair.
+    #[tokio::test]
+    async fn a_forgotten_scanners_old_keys_do_not_return_with_the_next_assignment() {
+        let root = sysroot(&[AIRSCAN_SO]);
+        let device = FakeSnmp::answering(Some(skey::snmp::ErrorStatus::NoError));
+        let (backend, scanner) = registering_backend(&root, device.clone()).await;
+
+        for (function, profile) in [
+            (Function::File, ProfileKind::Document),
+            (Function::Email, ProfileKind::Email),
+        ] {
+            backend
+                .set_button_mapping(
+                    &scanner.id,
+                    function.button_index(),
+                    Some(profile),
+                    &BTreeMap::new(),
+                )
+                .await
+                .unwrap();
+        }
+
+        backend.forget(&scanner.id).await.unwrap();
+        let before_repairing = device.registered().len();
+
+        backend
+            .set_button_mapping(
+                &scanner.id,
+                Function::Ocr.button_index(),
+                Some(ProfileKind::Document),
+                &BTreeMap::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            device.registered()[before_repairing..],
+            [Function::Ocr],
+            "one key was assigned, so one function is registered",
+        );
+        assert_eq!(
+            panel(&backend, &scanner.id).await,
+            BTreeSet::from([Function::Ocr]),
+        );
+    }
+
+    /// One scanner is unpaired at a time; the other printers on the desk keep their keys.
+    #[tokio::test]
+    async fn forgetting_one_scanner_leaves_another_ones_keys_alone() {
+        let root = sysroot(&[AIRSCAN_SO]);
+        let device = FakeSnmp::answering(Some(skey::snmp::ErrorStatus::NoError));
+        let (backend, scanner) = registering_backend(&root, device).await;
+        let other = ScannerId::from_backend(SCANNER_ID_BACKEND, "another-printer").unwrap();
+
+        backend
+            .set_button_mapping(
+                &scanner.id,
+                Function::File.button_index(),
+                Some(ProfileKind::Document),
+                &BTreeMap::new(),
+            )
+            .await
+            .unwrap();
+        backend.buttons.lock().unwrap().insert(
+            (other.clone(), Function::Image.button_index()),
+            ButtonMapping {
+                profile: ProfileKind::Image,
+                options: BTreeMap::new(),
+            },
+        );
+
+        backend.forget(&scanner.id).await.unwrap();
+
+        assert_eq!(
+            backend
+                .buttons
+                .lock()
+                .unwrap()
+                .get(&(other, Function::Image.button_index()))
+                .map(|mapping| mapping.profile),
+            Some(ProfileKind::Image),
+            "forgetting is per scanner, not a clear",
+        );
+    }
+
+    /// Unpairing a scanner that never had a key assigned — or that was never paired at
+    /// all — is `Ok(())` and touches nothing, so `Unpair()` cannot fail on it.
+    #[tokio::test]
+    async fn forgetting_a_scanner_with_nothing_registered_is_a_no_op() {
+        let root = sysroot(&[AIRSCAN_SO]);
+        let device = FakeSnmp::answering(Some(skey::snmp::ErrorStatus::NoError));
+        let (backend, scanner) = registering_backend(&root, device.clone()).await;
+
+        backend.forget(&scanner.id).await.unwrap();
+        backend
+            .forget(&ScannerId::from_backend(SCANNER_ID_BACKEND, "never-seen").unwrap())
+            .await
+            .unwrap();
+
+        assert!(
+            device.registrations().is_empty(),
+            "nothing was ever registered, and forgetting registers nothing either",
+        );
+    }
+
+    /// A lapsed lease is not a broken pairing: a restart finds the panel empty and that
+    /// is exactly what the protocol says should have happened.
+    #[tokio::test]
+    async fn a_restart_restores_the_pairing_although_the_panel_has_lapsed() {
+        let root = sysroot(&[AIRSCAN_SO]);
+        let device = FakeSnmp::answering(Some(skey::snmp::ErrorStatus::NoError));
+        let (backend, scanner) = registering_backend(&root, device).await;
+
+        // A fresh daemon: nothing registered, nothing assigned, the printer's panel long
+        // since lapsed. The scanner is still paired.
+        let restarted = BrotherBackend {
+            registrars: Arc::new(AsyncMutex::new(BTreeMap::new())),
+            buttons: Arc::new(Mutex::new(BTreeMap::new())),
+            ..backend
+        };
+
+        assert_eq!(
+            restarted.restore_disposition(&scanner).await,
+            RestoreDisposition::Paired,
+        );
+    }
+
+    /// The other half of a restart: the daemon replays its persisted assignments (4.1)
+    /// through `set_button_mapping`, and that needs an address this backend has not
+    /// discovered — it discovered nothing, the store did the remembering.
+    ///
+    /// `restore_disposition` is where it learns one, being the only point of the restore
+    /// path handed a `ScannerInfo`. The first half of this test is what a restart looked
+    /// like without that: every replayed key refused, and a paired printer with an empty
+    /// panel until someone ran a discovery.
+    #[tokio::test]
+    async fn a_restart_learns_the_address_its_registrations_need() {
+        let root = sysroot(&[AIRSCAN_SO]);
+        let device = FakeSnmp::answering(Some(skey::snmp::ErrorStatus::NoError));
+        let (backend, scanner) = registering_backend(&root, device.clone()).await;
+
+        // A fresh daemon: it publishes what the store holds and has probed nothing.
+        let restarted = BrotherBackend {
+            registrars: Arc::new(AsyncMutex::new(BTreeMap::new())),
+            buttons: Arc::new(Mutex::new(BTreeMap::new())),
+            devices: Arc::new(Mutex::new(BTreeMap::new())),
+            scan_to_pc: Arc::new(Mutex::new(BTreeMap::new())),
+            ..backend
+        };
+
+        let refused = restarted
+            .set_button_mapping(
+                &scanner.id,
+                Function::File.button_index(),
+                Some(ProfileKind::Document),
+                &BTreeMap::new(),
+            )
+            .await
+            .expect_err("nothing on record says where the registration would go");
+        assert!(
+            matches!(refused, BackendError::NotReachable { .. }),
+            "{refused}",
+        );
+
+        assert_eq!(
+            restarted.restore_disposition(&scanner).await,
+            RestoreDisposition::Paired,
+        );
+
+        let before = device.registered().len();
+        restarted
+            .set_button_mapping(
+                &scanner.id,
+                Function::File.button_index(),
+                Some(ProfileKind::Document),
+                &BTreeMap::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            device.registered()[before..],
+            [Function::File],
+            "the replayed assignment goes on the panel, at the address the store knew",
+        );
+        assert_eq!(
+            panel(&restarted, &scanner.id).await,
+            BTreeSet::from([Function::File]),
+        );
     }
 
     /// A scanner nothing has been discovered for cannot be scanned from, and the message
@@ -2611,10 +3818,10 @@ printf 'P5\\n1 1\\n255\\n\\001' > \"$(printf \"$batch\" 1)\"\n",
         assert!(detail.contains("brscan4/brscan5"), "{detail}");
         // The dependency step still ran and still passed: what failed is the device.
         assert!(
-            progress
-                .iter()
-                .any(|step| matches!(step, PairingProgress::Installing { package, .. }
-                    if package == "sane-airscan")),
+            progress.iter().any(
+                |step| matches!(step, PairingProgress::Installing { package, .. }
+                    if package == "sane-airscan")
+            ),
             "{progress:?}"
         );
     }
@@ -2701,7 +3908,12 @@ printf 'P5\\n1 1\\n255\\n\\001' > \"$(printf \"$batch\" 1)\"\n",
 
         // The library was never there; the cancelled run cannot have created it, and the
         // second run has to reach its verdict from the same evidence a first one would.
-        assert!(!root.path().join(AIRSCAN_SO.trim_start_matches('/')).exists());
+        assert!(
+            !root
+                .path()
+                .join(AIRSCAN_SO.trim_start_matches('/'))
+                .exists()
+        );
         let library = root.path().join(AIRSCAN_SO.trim_start_matches('/'));
         fs::create_dir_all(library.parent().unwrap()).unwrap();
         fs::write(&library, b"stub").unwrap();

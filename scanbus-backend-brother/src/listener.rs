@@ -90,7 +90,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::skey::event::{Event, KeyPress};
-use crate::skey::register::Function;
+use crate::skey::function::Function;
 
 /// How many presses one subscriber may fall behind by.
 ///

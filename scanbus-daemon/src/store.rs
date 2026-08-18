@@ -74,6 +74,10 @@ impl PairingStore for MemoryPairingStore {
                 // No `Connected` tracking in the ephemeral store: tests that need it use
                 // `JsonPairingStore`.
                 connected: false,
+                // Nor any assignments: `save_button` is the trait's no-op default here,
+                // for the same reason — a restore that has to replay `Button1` state is
+                // testing the JSON store's round trip as much as the registry's.
+                buttons: Vec::new(),
             })
             .collect())
     }
@@ -232,6 +236,10 @@ impl PairingStore for JsonPairingStore {
             .map(|entry| Restorable {
                 scanner: entry.scanner.clone(),
                 connected: entry.connected,
+                // In index order, because the map is keyed by index: the restore path
+                // replays them in that order and a client watching the keys go by sees
+                // them the way the object tree lists them.
+                buttons: entry.buttons.values().cloned().collect(),
             })
             .collect())
     }
@@ -428,6 +436,49 @@ mod tests {
             entry.buttons.get(&2).unwrap().profile,
             Some(ProfileKind::Document)
         );
+    }
+
+    /// What the restore path (4.2) reads: a store reopened from the file a previous run
+    /// left — a daemon restart, spelled out — still names every assignment, in index
+    /// order.
+    #[tokio::test]
+    async fn a_reopened_store_reports_its_assignments_for_the_restore_path() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("pairings.json");
+        let store = JsonPairingStore::with_path(path.clone());
+
+        let mut named = ButtonInfo::new(0, "Scan to File", false);
+        named.label = Some("Invoices".to_owned());
+        let mut assigned = ButtonInfo::new(2, "Scan to OCR", false);
+        assigned.profile = Some(ProfileKind::Document);
+
+        store.save_paired(&scanner()).await.unwrap();
+        store.save_connected(&scanner().id, true).await.unwrap();
+        // Written out of order on purpose: the map is keyed by index, and the replay
+        // follows the object tree rather than the order the user configured things in.
+        store.save_button(&scanner().id, &assigned).await.unwrap();
+        store.save_button(&scanner().id, &named).await.unwrap();
+
+        let restarted = JsonPairingStore::with_path(path);
+        let restorable = restarted.restorable().await.unwrap();
+
+        assert_eq!(restorable.len(), 1);
+        assert_eq!(restorable[0].scanner, scanner());
+        assert!(restorable[0].connected);
+        assert_eq!(restorable[0].buttons, vec![named, assigned]);
+    }
+
+    /// A store with nothing durable behind it restores nothing rather than failing —
+    /// the trait's default, which the ephemeral store keeps.
+    #[tokio::test]
+    async fn the_memory_store_restores_no_assignments() {
+        let store = MemoryPairingStore::new();
+        store.save_paired(&scanner()).await.unwrap();
+
+        let restorable = store.restorable().await.unwrap();
+        assert_eq!(restorable.len(), 1);
+        assert!(restorable[0].buttons.is_empty());
+        assert!(!restorable[0].connected);
     }
 
     #[tokio::test]
