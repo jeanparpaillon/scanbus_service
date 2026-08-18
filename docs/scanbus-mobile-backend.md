@@ -493,6 +493,18 @@ TLS 1.3 where both ends have it, **1.2 accepted**: the app enables the best vers
 platform offers, and Android 8 and 9 offer 1.2. Requiring 1.3 would refuse those phones
 outright for a benefit the pin already provides.
 
+**An EOF in this handshake is an app-side key, until proved otherwise** (#78). The phone
+serves this port with an `AndroidKeyStore` key, which is opaque: Conscrypt cannot give it
+a message to hash, so it hashes the TLS transcript itself and signs the digest raw, as
+`NONEwithECDSA`. A key generated without `DIGEST_NONE` refuses that operation — keystore2
+answers `INCOMPATIBLE_DIGEST` — and it refuses it while producing `CertificateVerify`,
+past `ServerHello`, where no alert can still be sent. The phone's socket simply closes and
+this host has nothing to report but `tls handshake eof`. The requirement belongs to the
+app's spec and is recorded there; what belongs here is that the host's own diagnosis of
+that error string is "the phone could not sign", not "the phone does not speak TLS", and
+that a Rust-to-Rust test cannot reach the failure at all — a keystore key is the only
+thing that has it.
+
 ### 11.4 The upload listener takes both, and the first byte says which
 
 The listener cannot simply become TLS: every pairing made before this change has no
