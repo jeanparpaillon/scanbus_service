@@ -53,6 +53,18 @@ pub const MAX_PAGES_PER_JOB: u32 = 200;
 /// Service type used by mobile app instances.
 pub const SERVICE_TYPE: &str = "_scanbus-mobile._tcp.local.";
 
+/// Service type this host publishes so a paired phone can find it again once the address
+/// it stored stops answering (§12.1).
+///
+/// Publishing only: §12.3 is explicit that the host never browses this type, so it must
+/// not join the discovery list [`SERVICE_TYPE`] is in.
+pub const HOST_SERVICE_TYPE: &str = "_scanbus-host._tcp.local.";
+
+/// TXT `v` of that record. Not a protocol version — a host that advertises and a host
+/// that does not both speak version 1, and the app learns which it has by finding a
+/// record or not finding one (§12.1).
+const HOST_RECORD_VERSION: &str = "1";
+
 /// How long one `discover()` call browses mDNS before returning.
 pub const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -160,6 +172,18 @@ struct PersistedDeviceStore {
     version: u32,
     #[serde(default)]
     upload_port: u16,
+    /// What `pair_request.host_id` carries, and what §12's `_scanbus-host._tcp` record
+    /// puts in TXT `id`. It sits next to `upload_port` for the same reason: the phone
+    /// stores it while pairing and looks for *that* id afterwards, so a value redrawn
+    /// at every start would make this host invisible to every phone paired before its
+    /// last restart.
+    ///
+    /// Empty means *mint one and write it* — which is what a fresh store means too, so
+    /// this is a `#[serde(default)]` addition and not a `DEVICE_STORE_VERSION` bump
+    /// (§12.2). Unlike the `tls` flag of §11.5, the default here claims nothing about a
+    /// past pairing.
+    #[serde(default)]
+    host_id: String,
     #[serde(default)]
     devices: BTreeMap<ScannerId, PersistedDevice>,
 }
@@ -184,6 +208,7 @@ impl Default for PersistedDeviceStore {
         Self {
             version: DEVICE_STORE_VERSION,
             upload_port: 0,
+            host_id: String::new(),
             devices: BTreeMap::new(),
         }
     }
@@ -219,6 +244,38 @@ struct ListenerBinding {
     bind_error: Option<String>,
     listener: Option<std::net::TcpListener>,
     task_started: bool,
+}
+
+/// The `_scanbus-host._tcp` record this host publishes (§12.1), decided before anything
+/// touches the network.
+///
+/// A type rather than three arguments to [`advertise_host`], because §12.1 is a rule
+/// about *which* port: this is built from the [`ListenerBinding`] and never sees
+/// `mobile.upload_port`, so the configured value is not in scope to be reached for by
+/// mistake. Deciding it separately from publishing it is also what lets the record be
+/// checked without starting a responder.
+struct HostRecord<'a> {
+    /// §12.1's instance name — this host's `host_name`.
+    instance: &'a str,
+    /// The bound port, which is the only port a phone could reach anyway.
+    port: u16,
+    /// TXT, in order and nothing else. `id` is the same string `pair_request` carries,
+    /// byte for byte: the app compares what it stored at pairing against this, so a
+    /// different formatting of the same value is a different host to the phone (§12.2).
+    txt: [(&'a str, &'a str); 2],
+}
+
+impl<'a> HostRecord<'a> {
+    /// `None` when the listener never bound. A record naming a port nothing listens on
+    /// resolves and then refuses the connection — the exact failure §12 exists to end,
+    /// arrived at by the one route §12 cannot fix.
+    fn new(host_id: &'a str, host_name: &'a str, listener: &ListenerBinding) -> Option<Self> {
+        listener.is_bound().then_some(Self {
+            instance: host_name,
+            port: listener.port,
+            txt: [("id", host_id), ("v", HOST_RECORD_VERSION)],
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -290,9 +347,11 @@ pub struct MobileBackend {
     /// §4.2 step 4's 120 s, overridable for the same reason.
     confirm_timeout: Duration,
     upload_port: u16,
-    /// What `pair_request.host_id` carries. Generated once per process, not persisted:
-    /// nothing on the wire needs it to survive a restart, only to be stable for the
-    /// duration of one handshake.
+    /// What `pair_request.host_id` carries, and what §12's `_scanbus-host._tcp` record
+    /// advertises in TXT `id`. Read from the store at startup and never redrawn: the
+    /// phone keeps the id it saw while pairing and, once the lease changes, browses for
+    /// *that* id. An id minted per process would be stable for one handshake and wrong
+    /// for every restart after it.
     host_id: String,
     /// What `pair_request.host_name` carries — shown on the phone next to the code.
     host_name: String,
@@ -319,6 +378,13 @@ pub struct MobileBackend {
     require_tls: Arc<AtomicBool>,
     listener: Arc<Mutex<ListenerBinding>>,
     listener_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// §12's `_scanbus-host._tcp` record, which exists for exactly as long as this guard
+    /// does — dropping the last clone of the backend is what puts the goodbye packet on
+    /// the wire. `None` is the tolerated failure: no responder, or no listener to name.
+    ///
+    /// Shared rather than owned because the daemon clones the backend; a copy per clone
+    /// would publish the same record several times and unregister it at the first drop.
+    advertisement: Option<Arc<mdns::Registration>>,
     subscriptions: Arc<Mutex<BTreeMap<ScannerId, mpsc::Sender<scanbus_core::ScanTrigger>>>>,
     pending_uploads: Arc<Mutex<BTreeMap<String, PendingUpload>>>,
     next_trigger_id: Arc<AtomicU64>,
@@ -341,6 +407,14 @@ impl MobileBackend {
         requested_upload_port: u16,
     ) -> Self {
         let mut store = load_or_reset_store(&store_path);
+        // Before anything else reads it: a store written by an older scanbus, or a
+        // fresh one, has no `host_id` and §12.2 says the fix is to draw one now and
+        // keep it forever.
+        let mut store_changed = false;
+        if store.host_id.is_empty() {
+            store.host_id = generate_host_id();
+            store_changed = true;
+        }
         let paired = store
             .devices
             .clone()
@@ -391,10 +465,19 @@ impl MobileBackend {
         }
         if store.upload_port != upload_port {
             store.upload_port = upload_port;
-            if let Err(error) = persist_device_store(&store_path, &store) {
-                warn!(path = %store_path.display(), %error, "could not persist mobile device store");
-            }
+            store_changed = true;
         }
+        if store_changed && let Err(error) = persist_device_store(&store_path, &store) {
+            warn!(path = %store_path.display(), %error, "could not persist mobile device store");
+        }
+
+        // §12.1: after the bind, and from the bound port rather than the configured one.
+        // Nothing else gates it — §12.3 keeps the record up whether or not a phone is
+        // paired, because one that appeared with the first pairing would make "the host
+        // moved" and "the host forgot me" the same symptom.
+        let host_name = host_name();
+        let advertisement =
+            HostRecord::new(&store.host_id, &host_name, &listener).and_then(advertise_host);
 
         let require_tls = require_tls_from_env();
         if require_tls {
@@ -413,8 +496,8 @@ impl MobileBackend {
             connect_timeout: PAIR_CONNECT_TIMEOUT,
             confirm_timeout: PAIR_CONFIRM_TIMEOUT,
             upload_port,
-            host_id: generate_host_id(),
-            host_name: host_name(),
+            host_id: store.host_id,
+            host_name,
             discovered: Arc::new(Mutex::new(BTreeMap::new())),
             paired: Arc::new(Mutex::new(paired)),
             store_path: Arc::new(store_path),
@@ -423,6 +506,7 @@ impl MobileBackend {
             require_tls: Arc::new(AtomicBool::new(require_tls)),
             listener: Arc::new(Mutex::new(listener)),
             listener_task: Arc::new(Mutex::new(None)),
+            advertisement,
             subscriptions: Arc::new(Mutex::new(BTreeMap::new())),
             pending_uploads: Arc::new(Mutex::new(BTreeMap::new())),
             next_trigger_id: Arc::new(AtomicU64::new(1)),
@@ -434,6 +518,15 @@ impl MobileBackend {
     /// The port `pair_request` advertises for uploads — the shared listener's port.
     pub fn upload_port(&self) -> u16 {
         self.upload_port
+    }
+
+    /// The `_scanbus-host._tcp` instance this host publishes, or `None` when it could
+    /// not be published — which is a working host missing one recovery path, not a
+    /// broken one.
+    pub fn advertised_fullname(&self) -> Option<&str> {
+        self.advertisement
+            .as_deref()
+            .map(mdns::Registration::fullname)
     }
 
     pub fn listener_is_bound(&self) -> bool {
@@ -1755,6 +1848,36 @@ fn host_name() -> String {
         .unwrap_or_else(|| "scanbus".to_owned())
 }
 
+/// Publish §12.1's record, or say once why this host will not be findable after its
+/// address changes.
+///
+/// Failure here is deliberately not the failure a taken `upload_port` is. A port that
+/// cannot be bound means no phone can upload at all; a responder that will not start
+/// means one recovery path is missing on a host whose scanning works, and it is only
+/// read after a stored address has already refused a connection. So it is one `warn`,
+/// every scanner stays online, and construction still succeeds.
+fn advertise_host(record: HostRecord<'_>) -> Option<Arc<mdns::Registration>> {
+    match mdns::register(HOST_SERVICE_TYPE, record.instance, record.port, &record.txt) {
+        Ok(registration) => {
+            debug!(
+                fullname = registration.fullname(),
+                port = record.port,
+                "advertising this host, so a paired phone can find it after the lease changes"
+            );
+            Some(Arc::new(registration))
+        }
+        Err(error) => {
+            warn!(
+                service_type = HOST_SERVICE_TYPE,
+                %error,
+                "could not advertise this host; paired phones keep working, but one whose \
+                 stored address stops answering will not find this host on its own"
+            );
+            None
+        }
+    }
+}
+
 /// `mobile.require_tls` as [`REQUIRE_TLS_ENV`] spells it. Default `false` (§11.5).
 fn require_tls_from_env() -> bool {
     require_tls_setting(std::env::var_os(REQUIRE_TLS_ENV).as_deref())
@@ -2830,6 +2953,10 @@ mod tests {
     /// What the fake phone puts in its TXT `id`.
     const DEVICE_ID: &str = "phone_a1b2c3";
 
+    /// A `host_id` that was already in the store — the 32 lowercase hex of §12.1, fixed
+    /// rather than drawn so a test can say which value it expects to survive.
+    const HOST_ID: &str = "0123456789abcdef0123456789abcdef";
+
     /// A phone with no TLS 1.3 — every Android 8 and 9 one (§11.3).
     const TLS12_ONLY: &[&rustls::SupportedProtocolVersion] = &[&rustls::version::TLS12];
 
@@ -3826,6 +3953,156 @@ mod tests {
         assert_eq!(second.upload_port(), first_port);
     }
 
+    /// §12.2, and the reason this issue exists at all: the phone stores the `host_id` it
+    /// saw while pairing and later browses for *that* id. A host that redraws it — which
+    /// is what `MobileBackend::new` did before — is invisible to every phone paired
+    /// before its last restart, so the id has to be minted once and written down.
+    #[test]
+    fn the_host_id_is_minted_once_written_down_and_never_redrawn() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("devices.json");
+
+        let first = MobileBackend::with_store_path(path.clone(), DISCOVERY_TIMEOUT, 0);
+        let minted = first.host_id.clone();
+        assert_eq!(minted.len(), 32, "§12.1's TXT id is 32 hex characters");
+        assert!(
+            minted
+                .chars()
+                .all(|digit| matches!(digit, '0'..='9' | 'a'..='f')),
+            "lowercase hex only, or the phone's comparison fails on formatting: {minted}"
+        );
+        assert_eq!(
+            load_store(&path).unwrap().host_id,
+            minted,
+            "an id that only lives in the process is the bug this fixes"
+        );
+        drop(first);
+
+        let second = MobileBackend::with_store_path(path.clone(), DISCOVERY_TIMEOUT, 0);
+        assert_eq!(
+            second.host_id, minted,
+            "a restart must reuse the id the phones stored"
+        );
+        assert_eq!(load_store(&path).unwrap().host_id, minted);
+    }
+
+    /// The store written before §12 existed has no `host_id` key at all. Absent means
+    /// *mint one and write it*, exactly as a fresh store does — no `DEVICE_STORE_VERSION`
+    /// bump, because unlike §11.5's `tls` flag the default here makes no claim about a
+    /// past pairing — and the pairings in it are untouched by the upgrade.
+    #[test]
+    fn a_store_written_before_host_ids_gains_one_and_keeps_its_pairing() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("devices.json");
+        ensure_store_dir(tmp.path()).unwrap();
+        let token_sha256 = hash_token("phone-token");
+        fs::write(
+            &path,
+            format!(
+                r#"{{
+                  "version": {DEVICE_STORE_VERSION},
+                  "upload_port": 0,
+                  "devices": {{
+                    "{scanner}": {{
+                      "device_id": "{DEVICE_ID}",
+                      "token_sha256": "{token_sha256}",
+                      "profiles": ["image"],
+                      "paired_at": 1700000000,
+                      "tls": false
+                    }}
+                  }}
+                }}"#,
+                scanner = scanner_id()
+            ),
+        )
+        .unwrap();
+
+        let backend = MobileBackend::with_store_path(path.clone(), DISCOVERY_TIMEOUT, 0);
+        assert_eq!(
+            backend.host_id.len(),
+            32,
+            "an absent id is minted, not empty"
+        );
+        assert!(backend.is_authorized(DEVICE_ID, "phone-token"));
+
+        let store = load_store(&path).unwrap();
+        assert_eq!(store.host_id, backend.host_id, "and written back at once");
+        assert_eq!(
+            store.version, DEVICE_STORE_VERSION,
+            "gaining an id is not a version bump"
+        );
+        assert!(store.devices.contains_key(&scanner_id()));
+    }
+
+    /// And the other direction: a store that already carries an id is left alone. This is
+    /// the case every restart after the first takes, so getting it wrong unpairs the host
+    /// silently rather than loudly.
+    #[test]
+    fn a_store_that_already_has_a_host_id_keeps_it() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("devices.json");
+        persist_device_store(
+            &path,
+            &PersistedDeviceStore {
+                version: DEVICE_STORE_VERSION,
+                upload_port: 0,
+                host_id: HOST_ID.to_owned(),
+                devices: BTreeMap::new(),
+            },
+        )
+        .unwrap();
+
+        let backend = MobileBackend::with_store_path(path.clone(), DISCOVERY_TIMEOUT, 0);
+        assert_eq!(backend.host_id, HOST_ID);
+        assert_eq!(load_store(&path).unwrap().host_id, HOST_ID);
+    }
+
+    /// §12.1 in one assertion: the record follows the *bind*, not the configuration.
+    /// Binding port 0 is what makes the two numbers differ — the configured port is 0,
+    /// which no phone could ever dial, so a record carrying it could only have come from
+    /// the wrong side of that rule.
+    #[test]
+    fn the_host_record_names_the_bound_port_and_exactly_two_txt_keys() {
+        let listener = bind_listener(0);
+        assert!(
+            listener.is_bound(),
+            "an ephemeral port must be bindable: {:?}",
+            listener.bind_error
+        );
+
+        let record = HostRecord::new(HOST_ID, "workshop", &listener)
+            .expect("a bound listener is advertisable");
+
+        assert_eq!(record.instance, "workshop", "the instance is host_name()");
+        assert_eq!(record.port, listener.port);
+        assert_ne!(
+            record.port, 0,
+            "the configured port never reaches the record"
+        );
+        assert_eq!(
+            record.txt,
+            [("id", HOST_ID), ("v", "1")],
+            "TXT is exactly id and v, in that order"
+        );
+    }
+
+    /// The degraded case, and the one where publishing would be worse than not: a phone
+    /// that resolves this record and is then refused by the port it names sees the same
+    /// *could not reach your computer* §12 exists to end, only now after a working
+    /// lookup. So a host with no listener advertises nothing.
+    #[test]
+    fn a_listener_that_never_bound_is_not_advertised() {
+        let blocker = std::net::TcpListener::bind((std::net::Ipv6Addr::UNSPECIFIED, 0))
+            .or_else(|_| std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)))
+            .unwrap();
+        let listener = bind_listener(blocker.local_addr().unwrap().port());
+        assert!(!listener.is_bound());
+
+        assert!(HostRecord::new(HOST_ID, "workshop", &listener).is_none());
+
+        drop(blocker);
+    }
+
     #[tokio::test]
     async fn device_store_hashes_the_token_and_uses_private_permissions() {
         let tmp = TempDir::new().unwrap();
@@ -3913,6 +4190,7 @@ mod tests {
             &PersistedDeviceStore {
                 version: DEVICE_STORE_VERSION,
                 upload_port: port,
+                host_id: String::new(),
                 devices: BTreeMap::from([(
                     scanner_id(),
                     PersistedDevice {
@@ -3968,6 +4246,7 @@ mod tests {
             &PersistedDeviceStore {
                 version: DEVICE_STORE_VERSION,
                 upload_port: 0,
+                host_id: String::new(),
                 devices: BTreeMap::from([(
                     scanner_id(),
                     PersistedDevice {
@@ -4045,6 +4324,68 @@ mod tests {
                 .unwrap()
                 .fingerprint_sha256(),
             fingerprint
+        );
+    }
+
+    /// §12.2's whole point: the id a phone stores while pairing and looks for after a
+    /// lease change has to outlive the process that drew it. A store with no `host_id`
+    /// is both the pre-§12 store and the fresh one, so both mint — and neither mints
+    /// again, because a second value would be invisible to every phone paired against
+    /// the first.
+    #[tokio::test]
+    async fn a_store_without_a_host_id_mints_one_and_then_keeps_it() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("devices.json");
+
+        let backend = MobileBackend::with_store_path(path.clone(), DISCOVERY_TIMEOUT, 0);
+        let minted = load_store(&path).unwrap().host_id;
+        assert_eq!(
+            backend.host_id, minted,
+            "the id written to disk is the one the handshake announces"
+        );
+        assert_eq!(minted.len(), 32, "a 128-bit id in hex: {minted}");
+        assert!(
+            minted.chars().all(|c| c.is_ascii_hexdigit()),
+            "the app compares TXT id byte for byte, so the formatting is part of the \
+             contract: {minted}"
+        );
+
+        let restarted = MobileBackend::with_store_path(path.clone(), DISCOVERY_TIMEOUT, 0);
+        assert_eq!(
+            load_store(&path).unwrap().host_id,
+            minted,
+            "a restart must not redraw the id every paired phone is looking for"
+        );
+        assert_eq!(restarted.host_id, minted);
+    }
+
+    /// The other half: an id already on disk is what the phones hold, so startup has no
+    /// business touching it — not even to normalize it — and it is that id, not a fresh
+    /// one, that the backend puts in `pair_request.host_id`.
+    #[tokio::test]
+    async fn a_store_that_already_has_a_host_id_is_left_alone() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("devices.json");
+        persist_device_store(
+            &path,
+            &PersistedDeviceStore {
+                version: DEVICE_STORE_VERSION,
+                upload_port: 0,
+                host_id: "0123456789abcdef0123456789abcdef".to_owned(),
+                devices: BTreeMap::new(),
+            },
+        )
+        .unwrap();
+
+        let backend = MobileBackend::with_store_path(path.clone(), DISCOVERY_TIMEOUT, 0);
+
+        assert_eq!(
+            load_store(&path).unwrap().host_id,
+            "0123456789abcdef0123456789abcdef"
+        );
+        assert_eq!(
+            backend.host_id, "0123456789abcdef0123456789abcdef",
+            "the handshake has to announce the persisted id, not a per-process one"
         );
     }
 
@@ -4147,6 +4488,7 @@ mod tests {
             &PersistedDeviceStore {
                 version: DEVICE_STORE_VERSION,
                 upload_port: 0,
+                host_id: String::new(),
                 devices: BTreeMap::from([(
                     scanner_id(),
                     PersistedDevice {

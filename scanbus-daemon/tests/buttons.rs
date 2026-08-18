@@ -741,13 +741,18 @@ async fn a_device_that_refuses_at_startup_keeps_its_assignment() {
     let dir = TempDir::new().unwrap();
     let store = store_with_assignment(&dir, &info, 1, ProfileKind::Image).await;
 
-    let daemon = Daemon::start_restoring_with(&bus, Arc::clone(&store), [info.clone()], |handle| {
-        handle.fail_button_mapping(BackendError::NotReachable {
-            scanner: ScannerId::from_backend(MockBackend::ID, "usb:001:002")
-                .expect("a legal mock id"),
-            detail: "the printer did not answer".to_owned(),
-        });
-    })
+    let daemon = Daemon::start_restoring_with(
+        &bus,
+        Arc::clone(&store) as Arc<dyn PairingStore>,
+        [info.clone()],
+        |handle| {
+            handle.fail_button_mapping(BackendError::NotReachable {
+                scanner: ScannerId::from_backend(MockBackend::ID, "usb:001:002")
+                    .expect("a legal mock id"),
+                detail: "the printer did not answer".to_owned(),
+            });
+        },
+    )
     .await;
     let client = bus.connect().await;
 
@@ -786,7 +791,12 @@ async fn an_assignment_for_a_key_that_is_gone_is_left_in_the_store() {
     let dir = TempDir::new().unwrap();
     let store = store_with_assignment(&dir, &info, 3, ProfileKind::Document).await;
 
-    let daemon = Daemon::start_restoring(&bus, Arc::clone(&store), [info.clone()]).await;
+    let daemon = Daemon::start_restoring(
+        &bus,
+        Arc::clone(&store) as Arc<dyn PairingStore>,
+        [info.clone()],
+    )
+    .await;
     let client = bus.connect().await;
 
     assert_eq!(button_paths(&client).await.len(), 2);

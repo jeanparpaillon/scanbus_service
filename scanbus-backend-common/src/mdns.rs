@@ -1,15 +1,24 @@
-//! One bounded mDNS browse window, shared by the backends that discover over DNS-SD.
+//! Both directions of DNS-SD for a backend: one bounded browse window, and one record
+//! this host publishes.
 //!
-//! Every caller wants the same shape: start a browser, watch one or more service types
-//! for a fixed window, keep whatever resolved, and never let an instance that does not
-//! resolve decide when the window ends. The mobile backend browses
+//! Every browsing caller wants the same shape: start a browser, watch one or more
+//! service types for a fixed window, keep whatever resolved, and never let an instance
+//! that does not resolve decide when the window ends. The mobile backend browses
 //! `_scanbus-mobile._tcp`; the hplip backend browses `_uscan._tcp` and `_scanner._tcp`
 //! because `hp-probe --bus=net` only ever looks for a *printer*. Rather than a third
 //! copy of the loop, the loop lives here.
 //!
+//! [`register`] is the opposite direction: this host announcing something a client
+//! comes back to after its stored address stops working. It lives here for the same
+//! reason the loop does — what a second copy would get wrong is not the record but the
+//! `ServiceDaemon` lifetime around it, which has to outlive the registration and shut
+//! down *after* the goodbye packet. [`Registration`] is that lifetime.
+//!
 //! [`browse`] blocks — `mdns-sd` hands out a synchronous channel — so callers on an
-//! async runtime must run it under `spawn_blocking`.
+//! async runtime must run it under `spawn_blocking`. [`register`] does not block: the
+//! responder answers queries on its own thread.
 
+use std::fmt;
 use std::time::{Duration, Instant};
 
 use flume::select::SelectError;
@@ -116,6 +125,133 @@ pub fn browse(service_types: &[&str], timeout: Duration) -> Result<Vec<ServiceIn
     Ok(buckets.into_iter().flatten().collect())
 }
 
+/// How long `Drop` waits for the responder to confirm the goodbye it just sent.
+///
+/// The wait is on a local channel, not on the network: the daemon thread writes the
+/// goodbye packet before it answers, so this is only ever long enough to notice a
+/// responder that has already died.
+const GOODBYE_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Why a record was never published.
+#[derive(Debug, thiserror::Error)]
+pub enum RegisterError {
+    /// No mDNS responder could be started at all — typically no usable interface.
+    #[error("failed to start mDNS responder: {0}")]
+    DaemonUnavailable(String),
+    /// The instance, service type or TXT set is not something DNS-SD can carry.
+    #[error("cannot publish this record: {0}")]
+    Malformed(String),
+    /// The responder started and then refused the record.
+    #[error("failed to register {0}")]
+    RegisterRefused(String),
+}
+
+/// A published record, alive for exactly as long as this guard.
+///
+/// Dropping it unregisters — which is what puts a goodbye packet on the wire, so
+/// clients drop the instance immediately instead of waiting out its TTL — and then
+/// shuts the responder down. Neither step can fail in a way the caller could act on at
+/// that point, so both are logged at `debug` and the drop completes regardless.
+pub struct Registration {
+    daemon: ServiceDaemon,
+    fullname: String,
+}
+
+// `ServiceDaemon` is a channel handle and is not `Debug`; the record's name is the only
+// part of a registration worth printing anyway.
+impl fmt::Debug for Registration {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Registration")
+            .field("fullname", &self.fullname)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Registration {
+    /// The published `<instance>.<service_type>`, as clients see it.
+    pub fn fullname(&self) -> &str {
+        &self.fullname
+    }
+}
+
+impl Drop for Registration {
+    fn drop(&mut self) {
+        match self.daemon.unregister(&self.fullname) {
+            // The responder handles commands in order, so the shutdown below cannot
+            // overtake the goodbye; waiting on the confirmation is what also keeps the
+            // process from exiting out from under it.
+            Ok(confirmation) => {
+                if let Err(error) = confirmation.recv_timeout(GOODBYE_TIMEOUT) {
+                    debug!(
+                        fullname = %self.fullname, %error,
+                        "mDNS unregister was never confirmed; continuing"
+                    );
+                }
+            }
+            Err(error) => {
+                debug!(fullname = %self.fullname, %error, "mDNS unregister failed; continuing");
+            }
+        }
+        shutdown(&self.daemon);
+    }
+}
+
+/// Publish `instance` of `service_type` on `port`, with `txt` as its TXT record.
+///
+/// `service_type` is the full DNS-SD type, `_something._tcp.local.` included; `txt` is
+/// the key/value set verbatim, in order, with duplicate keys after the first dropped as
+/// RFC 6763 §6.4 requires. Addresses are left to the responder — a host that gains or
+/// loses an address while the guard is alive re-announces itself, which is the whole
+/// point of publishing for a machine whose lease can change.
+///
+/// The record stays up until the returned [`Registration`] is dropped, so a caller that
+/// drops it immediately has published nothing.
+pub fn register(
+    service_type: &str,
+    instance: &str,
+    port: u16,
+    txt: &[(&str, &str)],
+) -> Result<Registration, RegisterError> {
+    let service = service_info(service_type, instance, port, txt)?;
+    let fullname = service.get_fullname().to_owned();
+
+    let daemon = ServiceDaemon::new()
+        .map_err(|error| RegisterError::DaemonUnavailable(error.to_string()))?;
+
+    if let Err(error) = daemon.register(service) {
+        shutdown(&daemon);
+        return Err(RegisterError::RegisterRefused(format!(
+            "{fullname}: {error}"
+        )));
+    }
+
+    debug!(%fullname, port, "published an mDNS record");
+    Ok(Registration { daemon, fullname })
+}
+
+/// Describe the record, separately from publishing it, so the shape can be tested
+/// without a responder and a network.
+fn service_info(
+    service_type: &str,
+    instance: &str,
+    port: u16,
+    txt: &[(&str, &str)],
+) -> Result<ServiceInfo, RegisterError> {
+    ServiceInfo::new(
+        service_type,
+        instance,
+        // The A/AAAA name, which `mdns-sd` requires fully qualified. Addresses stay
+        // empty here and are filled in by `enable_addr_auto`.
+        &format!("{instance}.local."),
+        (),
+        port,
+        txt,
+    )
+    .map(ServiceInfo::enable_addr_auto)
+    .map_err(|error| RegisterError::Malformed(format!("{instance}.{service_type}: {error}")))
+}
+
 /// Insert `service`, or replace the record already held for the same instance.
 fn record(bucket: &mut Vec<ServiceInfo>, service: ServiceInfo) {
     match bucket
@@ -183,6 +319,51 @@ mod tests {
         assert_eq!(
             instances,
             ["first._uscan._tcp.local.", "second._uscan._tcp.local."]
+        );
+    }
+
+    #[test]
+    fn a_described_record_carries_the_instance_the_port_and_the_txt_verbatim() {
+        let service = service_info(
+            "_scanbus-host._tcp.local.",
+            "workshop",
+            45654,
+            &[("id", "0123456789abcdef0123456789abcdef"), ("v", "1")],
+        )
+        .expect("a plain instance and two ASCII keys are publishable");
+
+        assert_eq!(service.get_fullname(), "workshop._scanbus-host._tcp.local.");
+        assert_eq!(service.get_hostname(), "workshop.local.");
+        assert_eq!(service.get_port(), 45654);
+        assert_eq!(
+            service.get_property_val_str("id"),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(service.get_property_val_str("v"), Some("1"));
+        assert_eq!(
+            service.get_properties().len(),
+            2,
+            "TXT is exactly what the caller passed, with nothing added"
+        );
+        assert!(
+            service.is_addr_auto(),
+            "addresses must follow the host, or the record is stale the moment the lease changes"
+        );
+    }
+
+    #[test]
+    fn a_txt_key_dns_sd_cannot_carry_is_rejected_before_a_responder_starts() {
+        let error = service_info(
+            "_scanbus-host._tcp.local.",
+            "workshop",
+            45654,
+            &[("id=nope", "1")],
+        )
+        .expect_err("'=' is not allowed in a TXT key");
+
+        assert!(
+            matches!(error, RegisterError::Malformed(_)),
+            "a record that cannot exist is not a responder failure: {error}"
         );
     }
 

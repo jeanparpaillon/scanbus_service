@@ -7,8 +7,9 @@ rust-version.workspace = true
 repository.workspace = true
 
 [features]
-# The DNS-SD browse helper. Off by default so the backends that only shell out to a
-# vendor tool — and the daemon that links them — do not pull mdns-sd into their tree.
+# The DNS-SD helpers, browsing and registering both. Off by default so the backends
+# that only shell out to a vendor tool — and the daemon that links them — do not pull
+# mdns-sd into their tree.
 mdns = ["dep:mdns-sd", "dep:flume", "dep:thiserror"]
 
 [dependencies]
