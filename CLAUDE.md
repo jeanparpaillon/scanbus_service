@@ -145,4 +145,4 @@ that worktree — it keeps the main checkout free for parallel work
 and shares one object store, so no re-clone. Remove it with
 `git worktree remove` once the branch is merged.
 
-Let user run test, fmt and lint manually.
+Let user run build, test, fmt and lint manually.
