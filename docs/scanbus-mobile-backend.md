@@ -50,6 +50,7 @@ breaking clients that match on it.
 | `Scanner1.Backend` | `"mobile"` |
 | `ScannerId` | `ScannerId::from_backend("mobile", <TXT id>)` |
 | mDNS service type | `_scanbus-mobile._tcp.local.` (unchanged — already correct) |
+| Host mDNS service type | `_scanbus-host._tcp.local.` (§12) |
 
 ## 3. The wire protocol
 
@@ -368,10 +369,11 @@ needs agreement in the `scanbus_android_app` repository before the app implement
    host actually reached the phone on. A `host_ip` field in `pair_request` would be
    wrong for exactly the multi-homed and VPN cases that make the question interesting.
 5. **A host whose DHCP lease changes breaks every paired phone**, permanently, because
-   §2 removes discovery from the upload path. The cheap fix is for the host to advertise
-   `_scanbus-host._tcp` with `id=<host_id>`, and for the app to fall back to browsing
-   for its paired `host_id` when the stored address refuses a connection. Recommended,
-   not in the base protocol, and it needs the app side to agree.
+   §2 removes discovery from the upload path. Agreed, and specified in §12: the host
+   advertises `_scanbus-host._tcp` with `id=<host_id>`, and the app browses for its
+   paired `host_id` only after a stored address has refused a connection. This entry
+   used to call it recommended and out of the base protocol; §12 is what both sides are
+   building.
 6. **`page`/`of` bounds**: 1-based, strictly incrementing, `of` constant for the life of
    the connection, `of` ≤ 200.
 7. **A per-job final status.** §6.3 above: the ack means "received", and there is no
@@ -600,3 +602,100 @@ next to the six digits was considered and rejected: it asks a human to compare 6
 characters that they have no second copy of, and the six digits already carry the
 confirmation this design depends on. A client that wants to say "encrypted" can say it
 from the backend's own state; it is not part of the pairing contract.
+
+## 12. Being found again after the host's address changes
+
+§10.5 used to describe this as a recommendation, "not in the base protocol, and it needs
+the app side to agree". The app repository worked it through in its issue 5.1 and asked
+for the host half first; what follows is the agreed shape and it supersedes that entry.
+
+The problem is created by a decision that is otherwise right. app-specs.md §2 hands the
+app an `upload_port` and §3.1 has it remember the address it was dialled from, so no
+mDNS stands in front of an upload. That is what makes a sleeping phone, NAT and a
+changing *phone* address irrelevant (§1). It also means **a DHCP lease change on the
+host breaks every paired phone permanently** — not until a retry, not until a reboot —
+with a failure that reads *could not reach your computer* about a computer that is
+sitting right there, working.
+
+The fix is one mDNS record, and it stays off the happy path: the app browses **only**
+after a stored address has refused a connection.
+
+### 12.1 The record
+
+| | |
+|---|---|
+| Service type | `_scanbus-host._tcp.local.` |
+| Instance name | the `host_name` of §4.2 — what the phone already shows next to the six digits |
+| SRV port | the bound `upload_port` (§5) |
+| TXT `id` | `host_id`, the same string `pair_request` carries — 32 lowercase hex characters |
+| TXT `v` | `1` |
+
+Four things follow from that table rather than being additional rules:
+
+- **It is registered after the listener binds, from the bound port.** Not from the
+  configured value: §5 already refuses to re-pick a taken `upload_port`, and publishing a
+  port that failed to bind would hand the app an address that resolves and then refuses,
+  which is the exact failure this section exists to end.
+- **One record per host, not one per paired phone.** Nothing in it is per-device. The app
+  matches on `id` and authenticates with its token; a record per pairing would leak how
+  many phones are paired to anyone with `avahi-browse`.
+- **There is no `tlsport`.** §11.4 demuxes TLS from cleartext on the first byte, so the
+  host has exactly one upload port and the SRV record names it. The asymmetry with the
+  phone's record (§11.3), which needs two ports, is the demux the phone cannot do and we
+  can — not an oversight in one of them.
+- **`v` stays `1`.** This is not a protocol version: a host that advertises and a host
+  that does not both speak version 1, and the app finds out which it has by finding a
+  record or not finding one. Burning a version number would strand phones for no gain,
+  which is the same argument §11.3 makes about TLS.
+
+### 12.2 `host_id` has to be persisted, and today it is not
+
+`MobileBackend::host_id` is drawn from the CSPRNG at construction and never written down.
+For `pair_request` that is enough — it only has to be stable for the length of one
+handshake — and for this record it is precisely wrong: the phone stores the id it saw
+while pairing and later looks for **that** id, so a host that redraws it at every start
+is invisible to every phone paired before its last restart. It is §5's re-picked port
+arriving by a second route, and it earns the same answer.
+
+`host_id` therefore joins `upload_port` in `devices.json` (§8): drawn once, written down,
+reused forever. An absent field means *mint one and write it*, which is what a fresh
+store does anyway, so it is a `#[serde(default)]` addition and not a store version bump.
+
+- **It is not derived from `/etc/machine-id`, a MAC address or the hostname.** An
+  identifier this host broadcasts on every network it joins should not be a function of
+  the machine's identity, and a random 128-bit value costs nothing and gives up nothing.
+  A hostname-derived id would also break on the one event — the machine being renamed —
+  that must not invalidate a pairing.
+- **Phones paired before this lands keep the id they stored, which will never match a
+  record.** They go on working: nothing on the upload path reads `host_id`. They lose
+  only the recovery added here, which is the state they are in today, so there is no
+  migration and none is offered — the *pair again* route (§12.4) is what covers them.
+- The value in `pair_request` is unchanged in shape and merely becomes stable. The app
+  compares TXT `id` to what it stored byte for byte, so the two must be the same string,
+  not the same value differently formatted.
+
+### 12.3 What the host does not do
+
+- **It never browses `_scanbus-host._tcp`.** The host publishes; nothing here consumes.
+  If two hosts collide on an instance name, mDNS renames one of them and no one notices:
+  the app matches on TXT `id`, never on the name.
+- **Advertising is not gated on a phone being paired.** It is up whenever the listener is.
+  Gating it would make the record's presence a function of state the app cannot see, so a
+  phone that fails to find its host could no longer tell *the host moved* from *the host
+  forgot me* — and the record on an unpaired host is a hostname and a random number on a
+  LAN that is already full of printers saying more than that.
+- **It is unregistered at shutdown**, so the goodbye packet clears the cache. This is
+  politeness rather than correctness: a stale record costs the app one resolve and one
+  refused connection, which is the failure it was about to report anyway.
+- **Nothing changes on D-Bus, and the host still never dials a phone** after pairing
+  (§1). This record is the host saying where it is, not the host reaching for anything.
+
+### 12.4 What the app owes, so the two halves can be checked
+
+Built in the app repository's issue 5.1, listed here because neither half is testable
+against a description of the other: browse only after a stored address refuses a
+connection, one attempt per send within a 5 s budget, match `id` exactly and ignore a
+sole instance that does not match, replace the stored address and port only after the
+retried connection succeeds, release the multicast lock in every path — and keep the
+*this computer moved, pair again* route, because a host that is older than this section
+or on another subnet entirely will keep existing.
