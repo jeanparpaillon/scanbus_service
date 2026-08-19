@@ -68,6 +68,11 @@ mdns-sd = "0.13"
 futures-util = "0.3"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "pnm", "tiff"] }
 lopdf = "0.38"
+# Reading the HP walk-up destination collection (scanbus-backend-hplip `walkup`). A real
+# parser rather than a substring match because the sweep *deletes* what it returns: an
+# entry's `dd:ResourceURI` paired with the wrong `dd3:Hostname` takes another machine off
+# the printer's panel. Default features only — no serde, no encoding tables.
+quick-xml = "0.41"
 # The pairing nonce (9.3): six digits, uniform, from a CSPRNG.
 rand = "0.9"
 # Generates the host's one self-signed ECDSA P-256 certificate, once, at first start

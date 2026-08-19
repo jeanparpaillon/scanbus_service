@@ -15,7 +15,20 @@ futures-util.workspace = true
 # For `ServiceInfo`: the records the mDNS filter reads come from the browse helper in
 # scanbus-backend-common, which hands them over in mdns-sd's own type.
 mdns-sd.workspace = true
-tokio = { workspace = true, features = ["macros", "rt", "sync"] }
+# The walk-up destination collection, whose entries this backend deletes by URI.
+quick-xml.workspace = true
+# `net`, `io-util` and `time` are the walk-up transport: HTTP/1.1 over a TcpStream to the
+# device's embedded server, with one timeout around the whole exchange. Three request
+# shapes to a plain-HTTP server on the LAN is not enough to justify reqwest, hyper and a
+# TLS trust store in the daemon.
+tokio = { workspace = true, features = [
+    "io-util",
+    "macros",
+    "net",
+    "rt",
+    "sync",
+    "time",
+] }
 tracing.workspace = true
 zbus.workspace = true
 

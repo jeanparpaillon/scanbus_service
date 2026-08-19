@@ -26,6 +26,11 @@
 //! second can only be reported after the fact, which is what [`ActivationFailure`] is for.
 
 mod mdns;
+// Walk-up registration: putting this host into the device's WalkupScanToComp collection,
+// which is what makes the panel offer it under *Scan → Computer* — and what nothing in
+// HPLIP does. Public because it is a device protocol in its own right, the way Brother's
+// `registrar` is.
+pub mod walkup;
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -49,7 +54,8 @@ use scanbus_core::{
     ScanTrigger, ScannerBackend, ScannerId, ScannerInfo, Source, Status, Value,
 };
 use tokio::sync::mpsc;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
+use walkup::{Device, TcpHttp, Walkup, WalkupTransport, panel_name};
 use zbus::fdo::DBusProxy;
 use zbus::message::Type as MessageType;
 use zbus::names::{BusName, WellKnownName};
@@ -100,6 +106,23 @@ pub struct HplipBackend {
     models_dat_path: PathBuf,
     scanimage_helper_path: PathBuf,
     fetch_state: Arc<Mutex<FetchState>>,
+    /// What carries the walk-up exchanges to a device.
+    ///
+    /// A seam for the same reason Brother's `SnmpTransport` is one: the answers that
+    /// matter — the `201` with its `Location`, the bare `400`, the `404` that means USB —
+    /// cannot be staged on a printer in a test suite.
+    walkup_transport: Arc<dyn WalkupTransport>,
+    /// The panel entry this host holds on each listening scanner, by the URI that deletes
+    /// it.
+    ///
+    /// Shared with every clone of the backend, because
+    /// [`stop_listening`](ScannerBackend::stop_listening) runs on one and
+    /// [`start_listening`](ScannerBackend::start_listening) on another. Nothing durable
+    /// is kept here on purpose — the device is the record, and the sweep in
+    /// [`Walkup::register`] is what reconciles with it after a crash, which is the only
+    /// thing that can: a `Location` learnt in a process that no longer exists is
+    /// unreachable, while `dd3:Hostname` is on the device.
+    panels: Arc<Mutex<BTreeMap<ScannerId, PanelEntry>>>,
 }
 
 impl Default for HplipBackend {
@@ -110,8 +133,17 @@ impl Default for HplipBackend {
             models_dat_path: PathBuf::from("/usr/share/hplip/data/models/models.dat"),
             scanimage_helper_path: PathBuf::from(DEFAULT_SCANIMAGE_HELPER),
             fetch_state: Arc::new(Mutex::new(FetchState::default())),
+            walkup_transport: Arc::new(TcpHttp::default()),
+            panels: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
+}
+
+/// This host's entry on one device's panel, and what it takes to remove it.
+#[derive(Debug, Clone)]
+struct PanelEntry {
+    walkup: Walkup,
+    uri: String,
 }
 
 /// One discovered device, in both of the spellings HPLIP uses for it.
@@ -370,6 +402,97 @@ impl HplipBackend {
         }
     }
 
+    /// Put this host into `scanner`'s walk-up destination collection, if it has one.
+    ///
+    /// This is the write nothing in HPLIP performs, and without it the listener below is
+    /// waiting for an event the device never emits: the panel offers no *Scan → Computer*
+    /// entry, so nobody can press one. See [`walkup`].
+    ///
+    /// Two devices are skipped rather than failed, and they are the same device seen at
+    /// two depths. A `hp:/usb/…` URI carries no host to dial, and a USB-attached HP
+    /// serves no `/WalkupScanToComp` even when it does — `hpssd` reports
+    /// `scanWaitingForPC` off the USB status channel with no destination involved, so
+    /// there is nothing to register and nothing lost by not registering it.
+    ///
+    /// Anything else is a failed connect. A device that is reachable, has the collection
+    /// and would not take this host is a device whose buttons will not work, and
+    /// reporting `connected` for it is exactly the silence this issue was filed about.
+    async fn register_on_panel(&self, scanner: &ScannerInfo) -> Result<(), BackendError> {
+        let device_uri = Self::device_uri(scanner)?;
+        let Some(device) = Device::from_device_uri(device_uri) else {
+            debug!(
+                scanner = %scanner.id,
+                device_uri,
+                "no host in this device URI; listening without a panel registration",
+            );
+            return Ok(());
+        };
+
+        let walkup = Walkup::new(device, Arc::clone(&self.walkup_transport));
+        // Bound rather than matched on directly: the arms below move `walkup`, and a
+        // scrutinee temporary would still be holding a borrow of it.
+        let installed = walkup.install(panel_name()).await;
+        match installed {
+            Ok(Some(registration)) => {
+                self.panels
+                    .lock()
+                    .expect("hplip panel lock is not poisoned")
+                    .insert(
+                        scanner.id.clone(),
+                        PanelEntry {
+                            walkup,
+                            uri: registration.uri().to_owned(),
+                        },
+                    );
+                Ok(())
+            }
+            Ok(None) => {
+                info!(
+                    scanner = %scanner.id,
+                    device = %walkup.device(),
+                    "this device serves no walk-up destination collection; its walk-up \
+                     scans arrive over the USB status channel instead",
+                );
+                Ok(())
+            }
+            Err(error) => Err(error.into_backend_error(&scanner.id)),
+        }
+    }
+
+    /// Take this host back off `scanner_id`'s panel.
+    ///
+    /// A no-op for a scanner that has no entry — never registered, USB, or already
+    /// withdrawn — which is what makes a `Connect()`/`Disconnect()` cycle repeatable.
+    ///
+    /// The entry is forgotten whether or not the `DELETE` was accepted. Keeping it to
+    /// retry later would be keeping a `Location` for a device that is off, which is
+    /// precisely the state the sweep in [`Walkup::register`] exists to reconcile: the
+    /// next registration finds the entry by `dd3:Hostname` and deletes it, and that is
+    /// the only recovery available to a daemon that may not run again for days.
+    async fn withdraw_from_panel(&self, scanner_id: &ScannerId) -> Result<(), BackendError> {
+        let Some(entry) = self
+            .panels
+            .lock()
+            .expect("hplip panel lock is not poisoned")
+            .remove(scanner_id)
+        else {
+            return Ok(());
+        };
+
+        entry
+            .walkup
+            .remove(&entry.uri)
+            .await
+            .inspect(|()| {
+                info!(
+                    scanner = %scanner_id,
+                    device = %entry.walkup.device(),
+                    "took this host off Scan to Computer",
+                );
+            })
+            .map_err(|error| error.into_backend_error(scanner_id))
+    }
+
     async fn status_service_owner(
         scanner_id: &ScannerId,
         bus: &DBusProxy<'_>,
@@ -522,6 +645,16 @@ impl ScannerBackend for HplipBackend {
                 BackendError::Other(format!("could not watch hpssd ownership: {error}"))
             })?;
 
+        // Last, and deliberately after the match rules are installed. The issue asked for
+        // the opposite order, and the opposite order leaks: this registration is the one
+        // durable thing a connect creates — there is no lease behind it, unlike Brother's
+        // panel entry — so a subscription that failed after it would leave this host on
+        // the panel until some later run swept it by name. Nothing here can fail after
+        // this line. The subscription being already up is the other half: a press
+        // arriving between the `201` and the task below is queued in the message stream,
+        // not lost.
+        self.register_on_panel(scanner).await?;
+
         let (sender, receiver) = mpsc::channel(8);
         tokio::spawn(async move {
             let mut last_trigger_id = None::<String>;
@@ -586,8 +719,20 @@ impl ScannerBackend for HplipBackend {
         Ok(Box::pin(EventStream(receiver)))
     }
 
-    async fn stop_listening(&self, _scanner_id: &ScannerId) -> Result<(), BackendError> {
-        Ok(())
+    /// Takes this host off the printer's panel.
+    ///
+    /// The listener itself needs no teardown — the stream ends when its consumer drops
+    /// it, and the D-Bus match rules go with it — so this is entirely about the
+    /// destination, which nothing else would remove. HP publishes no lease: an entry left
+    /// behind here is on the panel across reboots, it is selectable, and selecting it
+    /// does nothing.
+    ///
+    /// A device that has gone away in the meantime is reported rather than swallowed. It
+    /// is one of the two cases the trait reserves an error for — the teardown genuinely
+    /// did not happen — and the user is the only one who can see the consequence, which
+    /// is on the printer and not in any log this daemon writes.
+    async fn stop_listening(&self, scanner_id: &ScannerId) -> Result<(), BackendError> {
+        self.withdraw_from_panel(scanner_id).await
     }
 
     async fn set_button_mapping(
@@ -1685,5 +1830,215 @@ printf 'P5\\n1 1\\n255\\n\\003' > \"$(printf \"$batch\" 1)\"\n",
                 .any(|argument| argument == format!("--device-name={}", record.sane_name)),
             "scanimage was called with {arguments:?}"
         );
+    }
+
+    /// A device that answers walk-up requests from a script and remembers what it was
+    /// asked. The one in `walkup` is private to that module's tests, and duplicating
+    /// thirty lines beats making a test double part of the crate's surface.
+    #[derive(Debug, Default)]
+    struct FakeDevice {
+        seen: Mutex<Vec<walkup::Request>>,
+        answers: Mutex<Vec<walkup::Response>>,
+    }
+
+    impl FakeDevice {
+        fn answering(answers: impl IntoIterator<Item = walkup::Response>) -> Arc<Self> {
+            Arc::new(Self {
+                seen: Mutex::new(Vec::new()),
+                answers: Mutex::new(answers.into_iter().collect()),
+            })
+        }
+
+        fn seen(&self) -> Vec<walkup::Request> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl WalkupTransport for FakeDevice {
+        async fn exchange(
+            &self,
+            _device: &Device,
+            request: &walkup::Request,
+        ) -> Result<walkup::Response, walkup::TransportError> {
+            self.seen.lock().unwrap().push(request.clone());
+            let mut answers = self.answers.lock().unwrap();
+            Ok(if answers.len() > 1 {
+                answers.remove(0)
+            } else {
+                answers[0].clone()
+            })
+        }
+    }
+
+    /// A `200` carrying `document`.
+    fn document(body: &str) -> walkup::Response {
+        walkup::Response::new(
+            walkup::status::OK,
+            vec![("Content-Type".into(), "text/xml".into())],
+            body.as_bytes().to_vec(),
+        )
+    }
+
+    const DESTINATION_URI: &str =
+        "/WalkupScanToComp/WalkupScanToCompDestinations/1c8d4e40-dabb-1f08-aa30-644ed7fe04c4";
+
+    /// The `201` the recorded device returned, `Location` and all.
+    fn created() -> walkup::Response {
+        walkup::Response::new(
+            walkup::status::CREATED,
+            vec![("Location".into(), DESTINATION_URI.into())],
+            Vec::new(),
+        )
+    }
+
+    fn backend_talking_to(device: Arc<FakeDevice>) -> HplipBackend {
+        HplipBackend {
+            walkup_transport: device,
+            ..HplipBackend::default()
+        }
+    }
+
+    fn scanner_at(device_uri: &str) -> ScannerInfo {
+        scanner_from_probe(
+            ProbeRecord {
+                device_uri: device_uri.to_owned(),
+                sane_name: device_uri.replacen("hp:", "hpaio:", 1),
+                model_name: "HP OfficeJet 250".to_owned(),
+                display_name: "OfficeJet 250".to_owned(),
+            },
+            &BTreeMap::new(),
+        )
+        .unwrap()
+    }
+
+    /// Connecting writes this host into the collection, and disconnecting deletes exactly
+    /// the entry the device handed back — the entry no lease will ever clear.
+    #[tokio::test]
+    async fn connecting_puts_this_host_on_the_panel_and_disconnecting_takes_it_off() {
+        let device = FakeDevice::answering([
+            document(
+                "<WalkupScanToCompCaps><MaxNetworkDestinations>15</MaxNetworkDestinations></WalkupScanToCompCaps>",
+            ),
+            document("<WalkupScanToCompDestinations/>"),
+            created(),
+            walkup::Response::status_only(walkup::status::NO_CONTENT),
+        ]);
+        let backend = backend_talking_to(Arc::clone(&device));
+        let scanner = scanner_at("hp:/net/Officejet_250?ip=192.168.1.3&queue=false");
+
+        backend.register_on_panel(&scanner).await.unwrap();
+        let posted = device.seen();
+        assert_eq!(posted.len(), 3, "{posted:?}");
+        assert_eq!(posted[2].method(), walkup::Method::Post);
+        assert_eq!(posted[2].body(), walkup::destination_document(panel_name()));
+
+        backend.stop_listening(&scanner.id).await.unwrap();
+        let deleted = device.seen();
+        assert_eq!(deleted.len(), 4, "{deleted:?}");
+        assert_eq!(deleted[3].method(), walkup::Method::Delete);
+        assert_eq!(deleted[3].target(), DESTINATION_URI);
+    }
+
+    /// Twice in a row, with no crash in between: the second connect finds its own entry
+    /// and takes it back before adding one, so the collection holds one and not two.
+    #[tokio::test]
+    async fn registering_twice_leaves_one_entry() {
+        let mine = format!(
+            "<WalkupScanToCompDestinations><WalkupScanToCompDestination>\
+             <dd:ResourceURI>{DESTINATION_URI}</dd:ResourceURI>\
+             <dd3:Hostname>{name}</dd3:Hostname>\
+             </WalkupScanToCompDestination></WalkupScanToCompDestinations>",
+            name = panel_name(),
+        );
+        let device = FakeDevice::answering([
+            document(
+                "<WalkupScanToCompCaps><MaxNetworkDestinations>15</MaxNetworkDestinations></WalkupScanToCompCaps>",
+            ),
+            document(&mine),
+            walkup::Response::status_only(walkup::status::NO_CONTENT),
+            created(),
+        ]);
+        let backend = backend_talking_to(Arc::clone(&device));
+        let scanner = scanner_at("hp:/net/Officejet_250?ip=192.168.1.3");
+
+        backend.register_on_panel(&scanner).await.unwrap();
+
+        let seen = device.seen();
+        assert_eq!(seen[2].method(), walkup::Method::Delete);
+        assert_eq!(seen[2].target(), DESTINATION_URI);
+        assert_eq!(seen[3].method(), walkup::Method::Post);
+    }
+
+    /// The USB case, from the URI. There is no host in `hp:/usb/…` to dial and no
+    /// collection behind it; the walk-up scan arrives over hpssd's USB status channel.
+    #[tokio::test]
+    async fn a_usb_device_is_listened_to_with_nothing_registered() {
+        let device = FakeDevice::answering([walkup::Response::status_only(walkup::status::OK)]);
+        let backend = backend_talking_to(Arc::clone(&device));
+        let scanner = scanner_at("hp:/usb/Officejet_250?serial=CN12345");
+
+        backend.register_on_panel(&scanner).await.unwrap();
+        backend.stop_listening(&scanner.id).await.unwrap();
+
+        assert!(device.seen().is_empty(), "{:?}", device.seen());
+    }
+
+    /// The other USB case: a device with an address that serves no capability document.
+    /// A `404` there is the device saying it has no walk-up registration, which is a skip
+    /// and not a failed connect.
+    #[tokio::test]
+    async fn a_device_without_the_capability_document_still_connects() {
+        let device =
+            FakeDevice::answering([walkup::Response::status_only(walkup::status::NOT_FOUND)]);
+        let backend = backend_talking_to(Arc::clone(&device));
+        let scanner = scanner_at("hp:/net/Officejet_250?ip=192.168.1.3");
+
+        backend.register_on_panel(&scanner).await.unwrap();
+
+        let seen = device.seen();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_eq!(seen[0].target(), walkup::CAPS_PATH);
+        backend.stop_listening(&scanner.id).await.unwrap();
+    }
+
+    /// A device that has the collection and will not take this host is a device whose
+    /// buttons will not work. Reporting `connected` for it is the silence this whole
+    /// module was written to end.
+    #[tokio::test]
+    async fn a_registration_the_device_refuses_fails_the_connect() {
+        let device = FakeDevice::answering([
+            document(
+                "<WalkupScanToCompCaps><MaxNetworkDestinations>15</MaxNetworkDestinations></WalkupScanToCompCaps>",
+            ),
+            document("<WalkupScanToCompDestinations/>"),
+            walkup::Response::status_only(walkup::status::BAD_REQUEST),
+        ]);
+        let backend = backend_talking_to(Arc::clone(&device));
+        let scanner = scanner_at("hp:/net/Officejet_250?ip=192.168.1.3");
+
+        let error = backend
+            .register_on_panel(&scanner)
+            .await
+            .expect_err("the device refused the document");
+
+        assert!(matches!(error, BackendError::Other(_)), "{error}");
+        // Nothing to withdraw: the registration never happened.
+        backend.stop_listening(&scanner.id).await.unwrap();
+        assert_eq!(device.seen().len(), 3, "{:?}", device.seen());
+    }
+
+    /// `Disconnect()` on a scanner that never listened, and `Disconnect()` twice — both
+    /// are no-ops, per the trait, and neither sends anything to a printer.
+    #[tokio::test]
+    async fn disconnecting_what_was_never_registered_sends_nothing() {
+        let device = FakeDevice::answering([walkup::Response::status_only(walkup::status::OK)]);
+        let backend = backend_talking_to(Arc::clone(&device));
+        let scanner_id = ScannerId::from_backend(ID, "192.168.1.3").unwrap();
+
+        backend.stop_listening(&scanner_id).await.unwrap();
+        backend.stop_listening(&scanner_id).await.unwrap();
+
+        assert!(device.seen().is_empty(), "{:?}", device.seen());
     }
 }
