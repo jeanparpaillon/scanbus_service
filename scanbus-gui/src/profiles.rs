@@ -290,7 +290,7 @@ pub(crate) mod widget_checks {
             rows.iter()
                 .map(|row| row.title().to_string())
                 .collect::<Vec<_>>(),
-            ["Email", "Ocr"]
+            ["E-mail", "OCR"]
         );
         drop(rows);
 

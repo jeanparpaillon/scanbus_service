@@ -48,7 +48,8 @@ scanbus-gui/             # binary `scanbus-gui`. Depends on scanbus-client, gtk4
     ├── store.rs         # the object store of §6 — scanners, buttons, jobs, profiles
     ├── notify.rs        # §5, and the only module that may run with no window
     ├── window.rs        # AdwApplicationWindow, sidebar, navigation stack
-    ├── scanners.rs      # list rows, discovery, the detail pane, the pairing flow
+    ├── scanners.rs      # list rows, discovery, selection, the pairing flow
+    ├── details.rs       # the detail pane of design/main.png — identity, facts, actions
     ├── buttons.rs       # the Configure buttons page of design/buttons.png
     ├── profiles.rs      # the Profiles view: one group per exported Profile1
     ├── options.rs       # the widget factory OptionsSchema drives (§11.1)

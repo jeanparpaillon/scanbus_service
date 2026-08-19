@@ -1,6 +1,7 @@
 mod autostart;
 mod bus;
 mod buttons;
+mod details;
 mod error;
 #[cfg(all(test, feature = "gtk-tests"))]
 mod gtk_tests;

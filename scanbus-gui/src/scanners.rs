@@ -13,6 +13,7 @@ use scanbus_core::{PairingState, ProfileKind, Status};
 
 use crate::bus::BusCommand;
 use crate::buttons::ButtonsPage;
+use crate::details::DetailsPane;
 use crate::store::{
     DiscoveryState, ProfileEntry, ScannerEntry, ServiceDetails, ServiceState, Store, StoreEvent,
 };
@@ -147,38 +148,29 @@ impl ScannerObject {
     }
 }
 
-pub fn status_line(status: Status, connected: bool, paired: bool) -> String {
+/// The two halves of a scanner's one-line summary: the status word, which the detail
+/// pane colours, and the rest of the line, which it never does.
+pub(crate) fn status_summary(
+    status: Status,
+    connected: bool,
+    paired: bool,
+) -> (&'static str, &'static str) {
     if !paired {
-        return "Discovered • Not paired".to_owned();
+        return ("Discovered", " • Not paired");
     }
 
-    match status {
-        Status::Offline => "Offline".to_owned(),
-        Status::Online => {
-            if connected {
-                "Online • Connected".to_owned()
-            } else {
-                "Online".to_owned()
-            }
-        }
-        Status::Busy => {
-            if connected {
-                "Busy • Connected".to_owned()
-            } else {
-                "Busy".to_owned()
-            }
-        }
-        Status::Error => {
-            if connected {
-                "Error • Connected".to_owned()
-            } else {
-                "Error".to_owned()
-            }
-        }
-    }
+    (
+        status_value(status),
+        if connected { " • Connected" } else { "" },
+    )
 }
 
-fn default_profile_label(profile: Option<ProfileKind>) -> String {
+pub fn status_line(status: Status, connected: bool, paired: bool) -> String {
+    let (lead, rest) = status_summary(status, connected, paired);
+    format!("{lead}{rest}")
+}
+
+pub(crate) fn default_profile_label(profile: Option<ProfileKind>) -> String {
     profile.map_or_else(
         || "None".to_owned(),
         |profile| humanize_profile(profile.as_str()),
@@ -186,6 +178,13 @@ fn default_profile_label(profile: Option<ProfileKind>) -> String {
 }
 
 pub fn humanize_profile(profile: &str) -> String {
+    // Two of the four kinds are not simply capitalised words.
+    match profile {
+        "ocr" => return "OCR".to_owned(),
+        "email" => return "E-mail".to_owned(),
+        _ => {}
+    }
+
     let mut chars = profile.chars();
     if let Some(first) = chars.next() {
         let mut label = first.to_uppercase().collect::<String>();
@@ -196,7 +195,7 @@ pub fn humanize_profile(profile: &str) -> String {
     }
 }
 
-fn status_value(status: Status) -> &'static str {
+pub(crate) fn status_value(status: Status) -> &'static str {
     match status {
         Status::Offline => "Offline",
         Status::Online => "Online",
@@ -205,11 +204,16 @@ fn status_value(status: Status) -> &'static str {
     }
 }
 
-fn connection_value(connected: bool) -> &'static str {
+/// What the detail pane's *Connection* row says.
+///
+/// The verb is the user's, not the daemon's: the switch that turns the host listener on
+/// lives on the Configure buttons page and still says so ([`connection_subtitle`]), but
+/// the fact this row states is whether scanner and host are talking.
+pub(crate) fn connection_value(connected: bool) -> &'static str {
     if connected {
-        "Listening"
+        "Connected"
     } else {
-        "Not listening"
+        "Disconnected"
     }
 }
 
@@ -545,77 +549,12 @@ impl ScannersPane {
             .description("Select a scanner to inspect it")
             .build();
 
-        let detail_title = gtk::Label::new(Some("Scanner details"));
-        detail_title.add_css_class("title-3");
-        detail_title.set_xalign(0.0);
-
-        let detail_name = gtk::Label::new(None);
-        detail_name.add_css_class("heading");
-        detail_name.set_xalign(0.0);
-        detail_name.set_wrap(true);
-
-        let detail_status_value = gtk::Label::new(None);
-        detail_status_value.set_xalign(0.0);
-        detail_status_value.set_wrap(true);
-
-        let detail_connection_value = gtk::Label::new(None);
-        detail_connection_value.set_xalign(0.0);
-        detail_connection_value.set_wrap(true);
-
-        let detail_connection_hint = gtk::Label::new(None);
-        detail_connection_hint.add_css_class("dim-label");
-        detail_connection_hint.set_xalign(0.0);
-        detail_connection_hint.set_wrap(true);
-
-        let detail_address_value = gtk::Label::new(None);
-        detail_address_value.set_xalign(0.0);
-        detail_address_value.set_wrap(true);
-        detail_address_value.set_selectable(true);
-
-        let detail_backend_value = gtk::Label::new(None);
-        detail_backend_value.set_xalign(0.0);
-        detail_backend_value.set_wrap(true);
-
-        let detail_default_profile_value = gtk::Label::new(None);
-        detail_default_profile_value.set_xalign(0.0);
-        detail_default_profile_value.set_wrap(true);
-
-        let configure_buttons = gtk::Button::with_label("Configure buttons");
-        configure_buttons.set_halign(gtk::Align::Start);
-        configure_buttons.add_css_class("flat");
-        configure_buttons.set_visible(false);
-
-        let unpair_button = gtk::Button::with_label("Unpair");
-        unpair_button.add_css_class("destructive-action");
-        unpair_button.set_halign(gtk::Align::Start);
-        unpair_button.set_visible(false);
-
-        let detail_page = gtk::Box::new(gtk::Orientation::Vertical, 18);
-        detail_page.set_margin_top(24);
-        detail_page.set_margin_bottom(24);
-        detail_page.set_margin_start(24);
-        detail_page.set_margin_end(24);
-        detail_page.append(&detail_title);
-        detail_page.append(&detail_name);
-        detail_page.append(&detail_fact_row("Status", &detail_status_value));
-        detail_page.append(&detail_fact_with_hint_row(
-            "Connection",
-            &detail_connection_value,
-            &detail_connection_hint,
-        ));
-        detail_page.append(&detail_fact_row("Address", &detail_address_value));
-        detail_page.append(&detail_fact_row("Backend", &detail_backend_value));
-        detail_page.append(&detail_fact_row(
-            "Default profile",
-            &detail_default_profile_value,
-        ));
-        detail_page.append(&configure_buttons);
-        detail_page.append(&unpair_button);
+        let details = Rc::new(DetailsPane::new());
 
         let detail_scroller = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
             .min_content_width(360)
-            .child(&detail_page)
+            .child(details.widget())
             .build();
 
         let buttons_page = Rc::new(ButtonsPage::new(commands.clone()));
@@ -683,16 +622,8 @@ impl ScannersPane {
             let discovered_group = discovered_group.clone();
             let discovery_caption = discovery_caption.clone();
             let detail_stack = detail_stack.clone();
-            let detail_name = detail_name.clone();
-            let detail_status_value = detail_status_value.clone();
-            let detail_connection_value = detail_connection_value.clone();
-            let detail_connection_hint = detail_connection_hint.clone();
-            let detail_address_value = detail_address_value.clone();
-            let detail_backend_value = detail_backend_value.clone();
-            let detail_default_profile_value = detail_default_profile_value.clone();
-            let configure_buttons = configure_buttons.clone();
+            let details = Rc::clone(&details);
             let buttons_page = Rc::clone(&buttons_page);
-            let unpair_button = unpair_button.clone();
             model.connect_changed(move || {
                 let paired_count = paired_model.n_items();
                 let discovered_count = discovered_model.n_items();
@@ -711,22 +642,8 @@ impl ScannersPane {
                 if let Some(path) = model_for_callback.selected_path()
                     && let Some(scanner) = model_for_callback.scanner(&path)
                 {
-                    detail_name.set_label(&scanner.state.name);
-                    detail_status_value.set_label(status_value(scanner.state.status));
-                    detail_connection_value.set_label(connection_value(scanner.state.connected));
-                    detail_connection_hint.set_label(connection_subtitle(
-                        scanner.state.status,
-                        scanner.state.connected,
-                    ));
-                    detail_address_value.set_label(&scanner.state.address);
-                    detail_backend_value.set_label(&humanize_backend(&scanner.state.backend));
-                    detail_default_profile_value
-                        .set_label(&default_profile_label(scanner.state.default_profile));
-                    configure_buttons.set_visible(scanner.state.paired);
-                    configure_buttons.set_sensitive(scanner.state.paired);
+                    details.render(&scanner);
                     buttons_page.render(&scanner, &model_for_callback.profiles());
-                    unpair_button.set_visible(scanner.state.paired);
-                    unpair_button.set_sensitive(scanner.state.paired);
                     if detail_stack.visible_child_name().as_deref() == Some("placeholder") {
                         detail_stack.set_visible_child_name("details");
                     }
@@ -736,17 +653,8 @@ impl ScannersPane {
                         detail_stack.set_visible_child_name("details");
                     }
                 } else {
-                    detail_name.set_label("");
-                    detail_status_value.set_label("");
-                    detail_connection_value.set_label("");
-                    detail_connection_hint.set_label("");
-                    detail_address_value.set_label("");
-                    detail_backend_value.set_label("");
-                    detail_default_profile_value.set_label("");
-                    configure_buttons.set_visible(false);
+                    details.clear();
                     buttons_page.clear();
-                    unpair_button.set_visible(false);
-                    unpair_button.set_sensitive(false);
                     detail_stack.set_visible_child_name("placeholder");
                 }
 
@@ -769,7 +677,7 @@ impl ScannersPane {
         {
             let detail_stack = detail_stack.clone();
             let model = Rc::clone(&model);
-            configure_buttons.connect_clicked(move |_| {
+            details.connect_configure(move || {
                 if model
                     .selected_path()
                     .and_then(|path| model.scanner(&path))
@@ -791,7 +699,7 @@ impl ScannersPane {
             let model = Rc::clone(&model);
             let commands = commands.clone();
             let parent = root.clone();
-            unpair_button.connect_clicked(move |_| {
+            details.connect_unpair(move || {
                 let Some(path) = model.selected_path() else {
                     return;
                 };
@@ -864,23 +772,6 @@ pub fn discovery_caption_text(state: DiscoveryState, discovered_count: usize) ->
             format!("Finding scanners... {discovered_count} {noun} found")
         }
     }
-}
-
-fn detail_fact_row(title: &str, value: &gtk::Label) -> gtk::Box {
-    let title_label = gtk::Label::new(Some(title));
-    title_label.add_css_class("caption-heading");
-    title_label.set_xalign(0.0);
-
-    let row = gtk::Box::new(gtk::Orientation::Vertical, 4);
-    row.append(&title_label);
-    row.append(value);
-    row
-}
-
-fn detail_fact_with_hint_row(title: &str, value: &gtk::Label, hint: &gtk::Label) -> gtk::Box {
-    let row = detail_fact_row(title, value);
-    row.append(hint);
-    row
 }
 
 fn scanner_row(
@@ -1093,7 +984,18 @@ fn pairing_code(state: &PairingState) -> String {
     state.pairing_info().to_owned()
 }
 
-fn humanize_backend(backend: &str) -> String {
+pub(crate) fn humanize_backend(backend: &str) -> String {
+    // The ids the three backends actually publish (`scanbus_backend_*::ID`, plus the
+    // `proprietary:brother` form of API §3). Spelling them out is what keeps the row
+    // reading "Brother" and "HPLIP" rather than "Brother Skey" and "Hplip"; anything
+    // else still falls through to the generic humanisation below.
+    match backend {
+        "brother-skey" | "proprietary:brother" => return "Brother".to_owned(),
+        "hplip" => return "HPLIP".to_owned(),
+        "mobile" => return "Mobile".to_owned(),
+        _ => {}
+    }
+
     let short = backend
         .rsplit([':', '/', '.'])
         .next()
@@ -1161,9 +1063,9 @@ mod tests {
     }
 
     #[test]
-    fn connection_copy_spells_out_host_listening() {
-        assert_eq!(connection_value(false), "Not listening");
-        assert_eq!(connection_value(true), "Listening");
+    fn connection_copy_separates_the_fact_from_the_switch() {
+        assert_eq!(connection_value(false), "Disconnected");
+        assert_eq!(connection_value(true), "Connected");
         assert_eq!(
             connection_subtitle(Status::Offline, false),
             "Unavailable while the scanner is offline"
@@ -1185,6 +1087,25 @@ mod tests {
             default_profile_label(Some(ProfileKind::Document)),
             "Document"
         );
+        // The two kinds the design does not spell as a capitalised word.
+        assert_eq!(default_profile_label(Some(ProfileKind::Ocr)), "OCR");
+        assert_eq!(default_profile_label(Some(ProfileKind::Email)), "E-mail");
+    }
+
+    #[test]
+    fn the_summary_line_splits_where_the_colour_stops() {
+        assert_eq!(
+            status_summary(Status::Online, true, true),
+            ("Online", " • Connected")
+        );
+        assert_eq!(
+            status_summary(Status::Offline, false, true),
+            ("Offline", "")
+        );
+        assert_eq!(
+            status_summary(Status::Online, true, false),
+            ("Discovered", " • Not paired")
+        );
     }
 
     #[test]
@@ -1204,5 +1125,9 @@ mod tests {
     fn backend_labels_are_humanized() {
         assert_eq!(humanize_backend("proprietary:brother"), "Brother");
         assert_eq!(humanize_backend("mock_backend"), "Mock Backend");
+        // The ids the shipped backends publish, spelled as the design spells them.
+        assert_eq!(humanize_backend("brother-skey"), "Brother");
+        assert_eq!(humanize_backend("hplip"), "HPLIP");
+        assert_eq!(humanize_backend("mobile"), "Mobile");
     }
 }

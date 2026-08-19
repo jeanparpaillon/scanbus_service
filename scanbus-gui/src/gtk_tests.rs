@@ -19,6 +19,7 @@ fn the_widget_layer_binds_to_the_store() {
     }
 
     crate::buttons::widget_checks::run();
+    crate::details::widget_checks::run();
     crate::options::widget_checks::run();
     crate::profiles::widget_checks::run();
 }
