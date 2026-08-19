@@ -125,6 +125,59 @@ action groups they go with, and the `Rc` callbacks that are not GObject signals
 (`ScannerListModel::connect_changed`, `OptionsEditor::connect_write`) have no
 declarative form and stay where they are.
 
+### 2.2 The files, and what the linter decides
+
+One `.blp` per widget instantiated as a unit, named for the module that owns it and
+carrying a `template $Class` no other file declares:
+
+| File | Template | Module |
+|---|---|---|
+| `window.blp` | `$ScanbusWindow` | window.rs — window, header, sidebar, page stack, app menu |
+| `settings-page.blp` | `$SettingsPage` | window.rs `settings_page` |
+| `scanners-pane.blp` | `$ScannersPane` | scanners.rs — banner, the two lists, empty state, detail stack |
+| `scanner-row.blp` | `$ScannerRow` | scanners.rs `scanner_row` |
+| `details-pane.blp` | `$DetailsPane` | details.rs |
+| `details-fact-row.blp` | `$DetailsFactRow` | details.rs `fact_row` |
+| `unpair-dialog.blp` | `$UnpairDialog` | scanners.rs |
+| `buttons-page.blp` | `$ButtonsPage` | buttons.rs |
+| `button-row.blp` | `$ButtonRow` | buttons.rs `ButtonRow` |
+| `options-dialog.blp` | `$OptionsDialog` | buttons.rs `open_options` |
+| `profiles-page.blp` | `$ProfilesPage` | profiles.rs |
+| `options-editor.blp` | `$OptionsEditor` | options.rs |
+| `option-row-{choice,number,flag,text,folder,read-only}.blp` | `$OptionRow…` | options.rs `build_row` |
+
+`details-fact-row.blp` is not one of the widgets §2.1 names, and it is one for the same
+reason the scanner row is: `details.rs` builds five of them from a table, so an id in
+`details-pane.blp` would name one of the five. The three things that differ between them
+— `icon-name`, `title`, `value-selectable` — are properties of the class rather than ids,
+so the pane declares them and holds one template child per row instead of three.
+
+`$OptionsEditor` is declared *inside* `$OptionsDialog` rather than appended to its body
+per open, which is the one place the files depart from what the code does today. The
+window always holds exactly one editor above the actions row; only its `Scope` and its
+rows change, and `Scope` is content.
+
+**`blueprint-compiler lint` is part of the build convention, and four of its rules
+decide things this document did not.** All of them apply to `data/ui/*.blp`, none to the
+Rust:
+
+- **User-visible strings are marked `_("…")`.** The crate has no gettext domain and no
+  `.po` files, so the markup is inert — GTK returns the msgid — and the user-visible
+  strings still in Rust (`status_value`, the daemon-state subtitles, `humanize_backend`)
+  are not marked. This is the shape a translation would need, not a translation.
+- **Decorative icons carry `accessible-role: presentation` and an empty accessible
+  name.** The lint asks for a label on every `Gtk.Image`; giving the chevrons and the
+  fact-row icons a real one would have a screen reader announce them over the row title
+  they duplicate. The empty name is what says "this has no name", and satisfies both.
+- **A `Gtk.Adjustment` in a `.blp` may hold only `lower`, `upper` and `value`**
+  (`adjustment-prop-order` warns on anything else in it). The spin row's step and page
+  increments — 1 and 10 — therefore stay in `options.rs` `build_row` beside the bounds it
+  computes from the schema, which is the one place the adjustment is set.
+- **A wrapper that will only ever hold one child is an `Adw.Bin`, not a `Gtk.Box`.**
+  Three of them: the service banner's body, a scanner row's failure banner, and the
+  read-only option row's suffix. Behaviour is identical; the port changes the type rather
+  than keeping a box that never gets a second child.
+
 ## 3. The window
 
 `AdwApplicationWindow` with an `AdwNavigationSplitView`: a sidebar (Scanners, Profiles, and

@@ -1,0 +1,45 @@
+// One option whose schema declares a closed set of values — `options.rs` `build_row`,
+// the `Str { values }` arm. Built once per OptionsSchema entry of that type.
+//
+// Title, subtitle and the model's strings all come from the schema entry, so the model
+// is declared empty. The suffix is the same on every editable row: the origin pill, then
+// Reset. See option-row-read-only.blp for the row that has no Reset and why.
+
+using Gtk 4.0;
+using Adw 1;
+
+template $OptionRowChoice : Adw.ComboRow {
+  model: Gtk.StringList {};
+
+  // Every editable row commits on change — there is no separate Apply, except on the
+  // text row, where Adw.EntryRow's own apply button is the commit.
+  notify::selected => $on_choice_changed();
+
+  [suffix]
+  Gtk.Box {
+    orientation: horizontal;
+    spacing: 6;
+    valign: center;
+
+    // Says which level the effective value comes from; hidden unless the key is set at
+    // this scope, or the scope is Button, where "inherited" is worth saying out loud.
+    Gtk.Label origin {
+      valign: center;
+
+      styles ["dim-label", "caption"]
+    }
+
+    Gtk.Button reset {
+      label: _("Reset");
+      valign: center;
+      visible: false;
+
+      // Every Reset is the same handler: clear the key at this editor's scope and let
+      // the value fall back to what the pill says it inherits. Its tooltip names that
+      // scope, so it is written per row.
+      clicked => $on_option_reset();
+
+      styles ["flat"]
+    }
+  }
+}

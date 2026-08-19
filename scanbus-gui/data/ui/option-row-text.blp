@@ -1,0 +1,43 @@
+// One option that is a string with no closed set — `options.rs` `build_row`, the
+// catch-all `Str { .. }` arm.
+//
+// The description from the schema entry becomes a **tooltip**, not a subtitle, on this
+// row: `build_row` calls `set_tooltip_text` for the three Adw.ActionRow-shaped kinds and
+// `.subtitle()` for the combo, spin and switch rows. Both are content, so neither is
+// declared — but they are not the same widget, and swapping one for the other on a port
+// would silently move the text.
+//
+// The one row that does not commit on change: Adw.EntryRow's own apply button is the
+// commit, because every keystroke would otherwise be a write to the daemon.
+
+using Gtk 4.0;
+using Adw 1;
+
+template $OptionRowText : Adw.EntryRow {
+  show-apply-button: true;
+
+  apply => $on_text_applied();
+
+  [suffix]
+  Gtk.Box {
+    orientation: horizontal;
+    spacing: 6;
+    valign: center;
+
+    Gtk.Label origin {
+      valign: center;
+
+      styles ["dim-label", "caption"]
+    }
+
+    Gtk.Button reset {
+      label: _("Reset");
+      valign: center;
+      visible: false;
+
+      clicked => $on_option_reset();
+
+      styles ["flat"]
+    }
+  }
+}

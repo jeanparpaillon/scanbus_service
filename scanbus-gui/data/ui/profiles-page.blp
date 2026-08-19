@@ -1,0 +1,41 @@
+// The Profiles page — `profiles.rs` `ProfilesPage::new`, which returns this scroller.
+// No mockup: §3 "Profiles" describes it in prose.
+//
+// There is no declared page for `image` and none for `document`. One $OptionsEditor group
+// per exported `Profile1` is built at render time and inserted **between** the two groups
+// below: `unimplemented` is lifted out and re-added after the editors, so the two
+// informational groups stay first and last around whatever the daemon exports.
+
+using Gtk 4.0;
+using Adw 1;
+
+template $ProfilesPage : Gtk.ScrolledWindow {
+  hscrollbar-policy: never;
+  vscrollbar-policy: automatic;
+
+  // The title is never drawn: this page lives in a plain Gtk.Stack, not in an
+  // Adw.PreferencesDialog with a view switcher. It is the page's accessible name.
+  child: Adw.PreferencesPage page {
+    title: _("Profiles");
+
+    // The daemon is not running, or exports no profile at all.
+    Adw.PreferencesGroup absent {
+      title: _("Profiles");
+      visible: false;
+
+      Adw.ActionRow {
+        title: _("No profiles");
+        subtitle: _("The scanbus service exports no profile objects. Start it from Settings, then come back.");
+      }
+    }
+
+    // A kind GetProfileTypes advertises with no Profile1 object gets a row here rather
+    // than going missing — API §6's `email` and `ocr`. The rows are one per missing kind,
+    // built per render, so none is declared.
+    Adw.PreferencesGroup unimplemented {
+      title: _("Not implemented yet");
+      description: _("The service reports these profile types but exports no object for them, so they have no options to edit.");
+      visible: false;
+    }
+  };
+}

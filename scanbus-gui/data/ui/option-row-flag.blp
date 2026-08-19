@@ -1,0 +1,32 @@
+// One option whose schema declares a boolean — `options.rs` `build_row`, the `Boolean`
+// arm.
+
+using Gtk 4.0;
+using Adw 1;
+
+template $OptionRowFlag : Adw.SwitchRow {
+  notify::active => $on_flag_toggled();
+
+  [suffix]
+  Gtk.Box {
+    orientation: horizontal;
+    spacing: 6;
+    valign: center;
+
+    Gtk.Label origin {
+      valign: center;
+
+      styles ["dim-label", "caption"]
+    }
+
+    Gtk.Button reset {
+      label: _("Reset");
+      valign: center;
+      visible: false;
+
+      clicked => $on_option_reset();
+
+      styles ["flat"]
+    }
+  }
+}

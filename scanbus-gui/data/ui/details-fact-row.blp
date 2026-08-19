@@ -1,0 +1,44 @@
+// One fact in the detail pane's middle section — `details.rs` `fact_row`, which the pane
+// calls once per entry of a five-row table. Mockup: ../../../docs/design/main.png.
+//
+// Its own file for the same reason $ScannerRow has one: it is a shape the pane builds n
+// of, so an id in details-pane.blp would name exactly one of the five.
+//
+// The three things that differ between the five are properties of this class rather than
+// ids, so details-pane.blp can declare them and the pane keeps one template child per
+// row instead of three. `value` is the only id: it is the half a render writes.
+
+using Gtk 4.0;
+
+template $DetailsFactRow : Gtk.Box {
+  orientation: horizontal;
+  spacing: 12;
+
+  // Decorative: the title beside it says the same thing in words.
+  Gtk.Image {
+    icon-name: bind template.icon-name;
+    accessible-role: presentation;
+
+    accessibility {
+      label: "";
+    }
+
+    styles ["dim-label"]
+  }
+
+  Gtk.Label {
+    label: bind template.title;
+    xalign: 0;
+  }
+
+  Gtk.Box {
+    hexpand: true;
+  }
+
+  Gtk.Label value {
+    xalign: 1;
+    halign: end;
+    wrap: true;
+    selectable: bind template.value-selectable;
+  }
+}

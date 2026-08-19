@@ -1,0 +1,48 @@
+// One option whose schema declares a bounded integer — `options.rs` `build_row`, the
+// `Integer { min, max }` arm.
+//
+// Nothing about the adjustment is shape: `build_row` computes lower and upper from the
+// schema entry's min and max, and the value comes from the store. It is declared at zero
+// anyway so Adw.SpinRow has an object to hang them on, and the port writes this one per
+// render rather than constructing a second.
+//
+// The step and page increments — 1 and 10 — are *not* declared with it, though they are
+// constants: blueprint-compiler's `adjustment-prop-order` rule accepts a Gtk.Adjustment
+// holding exactly lower, upper and value and warns on anything else in it. So they stay
+// beside the bounds in `build_row`, which is the one place the whole adjustment is set.
+
+using Gtk 4.0;
+using Adw 1;
+
+template $OptionRowNumber : Adw.SpinRow {
+  adjustment: Gtk.Adjustment {
+    lower: 0;
+    upper: 0;
+    value: 0;
+  };
+
+  notify::value => $on_number_changed();
+
+  [suffix]
+  Gtk.Box {
+    orientation: horizontal;
+    spacing: 6;
+    valign: center;
+
+    Gtk.Label origin {
+      valign: center;
+
+      styles ["dim-label", "caption"]
+    }
+
+    Gtk.Button reset {
+      label: _("Reset");
+      valign: center;
+      visible: false;
+
+      clicked => $on_option_reset();
+
+      styles ["flat"]
+    }
+  }
+}

@@ -1,0 +1,185 @@
+// The Configure buttons page — `buttons.rs` `ButtonsPage::new`, which returns this box.
+// Mockup: ../../../docs/design/buttons.png.
+//
+// A `SimpleActionGroup` holding the stateful `default-profile` action is inserted on
+// this box under the prefix `scanner`, so the default-profile menu items target
+// `scanner.default-profile` with the profile name (empty for unassigned). Neither the
+// group nor the menu model can be declared: the model is rebuilt from
+// `Scanner1.SupportedProfiles` on every render.
+
+using Gtk 4.0;
+using Adw 1;
+
+template $ButtonsPage : Gtk.Box {
+  orientation: vertical;
+  spacing: 18;
+  margin-top: 24;
+  margin-bottom: 24;
+  margin-start: 24;
+  margin-end: 24;
+
+  Gtk.Box {
+    orientation: horizontal;
+    spacing: 12;
+
+    Gtk.Button back {
+      label: _("Back");
+
+      // Back to "details" in the scanners pane's `detail_stack`.
+      clicked => $on_buttons_back();
+
+      styles ["flat"]
+    }
+
+    Gtk.Label {
+      label: _("Configure buttons");
+      xalign: 0;
+      hexpand: true;
+
+      styles ["title-3"]
+    }
+  }
+
+  // Which scanner this page is about, plus the one control on the page that changes the
+  // daemon's behaviour rather than its configuration.
+  Gtk.Box {
+    orientation: vertical;
+    spacing: 12;
+    margin-top: 6;
+    margin-bottom: 6;
+    margin-start: 6;
+    margin-end: 6;
+
+    styles ["card"]
+
+    Gtk.Label banner_title {
+      xalign: 0;
+      wrap: true;
+
+      styles ["heading"]
+    }
+
+    Gtk.Label banner_address {
+      xalign: 0;
+      wrap: true;
+
+      styles ["dim-label"]
+    }
+
+    Gtk.Box {
+      orientation: horizontal;
+      spacing: 12;
+
+      Gtk.Box {
+        orientation: vertical;
+        spacing: 4;
+
+        Gtk.Label {
+          label: _("Connection");
+          xalign: 0;
+
+          styles ["heading"]
+        }
+
+        Gtk.Label connection_hint {
+          xalign: 0;
+          wrap: true;
+
+          styles ["dim-label"]
+        }
+      }
+
+      Gtk.Box {
+        hexpand: true;
+      }
+
+      Gtk.Switch connection_switch {
+        halign: end;
+        valign: center;
+
+        // Sends Connect or Disconnect and always returns Propagation::Stop: the switch
+        // shows `Scanner1`'s state, so it moves when the daemon says so and not when the
+        // pointer says so. Ignored entirely while the scanner is unpaired or offline.
+        state-set => $on_connection_state_set();
+      }
+    }
+  }
+
+  // buttons.rs `group`. One $ButtonRow per device key, appended to `buttons_list`.
+  Adw.PreferencesGroup buttons_group {
+    title: _("Scanner buttons");
+    description: _("Each physical button on your scanner can start a profile without opening your computer.");
+
+    // buttons.rs `list`.
+    Gtk.ListBox buttons_list {
+      selection-mode: none;
+
+      styles ["boxed-list"]
+    }
+  }
+
+  // buttons.rs `empty`. Shown instead of the group: "no keys" and "keys not readable
+  // yet" say different things, so the text is written per render.
+  Gtk.Label buttons_empty {
+    xalign: 0;
+    wrap: true;
+    visible: false;
+
+    styles ["dim-label"]
+  }
+
+  Adw.PreferencesGroup {
+    title: _("Default profile");
+    description: _("Profile applied by default to data received without an explicit profile.");
+
+    Gtk.ListBox {
+      selection-mode: none;
+
+      styles ["boxed-list"]
+
+      // One fixed row rather than a bound list: there is exactly one default profile.
+      Gtk.ListBoxRow {
+        selectable: false;
+        activatable: false;
+
+        child: Gtk.Box {
+          orientation: horizontal;
+          spacing: 12;
+          margin-top: 12;
+          margin-bottom: 12;
+          margin-start: 12;
+          margin-end: 12;
+
+          // Menu model rebuilt from the scanner's SupportedProfiles, so it has none
+          // here; every item targets `scanner.default-profile` with the profile name.
+          // The button's own style class follows the assignment (`flat` when
+          // unassigned, `suggested-action` otherwise), so neither is declared.
+          Gtk.MenuButton default_button {
+            valign: center;
+          }
+
+          Gtk.Box {
+            hexpand: true;
+          }
+
+          Gtk.Label default_summary {
+            xalign: 1;
+            wrap: true;
+
+            styles ["dim-label"]
+          }
+
+          Gtk.Button default_configure {
+            label: _("Configure");
+            valign: center;
+
+            // Opens $OptionsDialog on the scanner's default profile, at Profile scope.
+            clicked => $on_default_configure();
+
+            styles ["flat"]
+          }
+        };
+      }
+    }
+  }
+}

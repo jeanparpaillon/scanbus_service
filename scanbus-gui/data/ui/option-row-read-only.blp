@@ -1,0 +1,35 @@
+// One option this version cannot type — `options.rs` `build_row`'s `Unknown` arm, and
+// `undeclared_row` for a key the stored map holds and the schema does not describe.
+//
+// The description from the schema entry becomes a **tooltip**, not a subtitle, on this
+// row: `build_row` calls `set_tooltip_text` for the three Adw.ActionRow-shaped kinds and
+// `.subtitle()` for the combo, spin and switch rows. Both are content, so neither is
+// declared — but they are not the same widget, and swapping one for the other on a port
+// would silently move the text.
+//
+// No Reset: nothing here can be written, so nothing can be cleared. Hiding the row
+// instead would make a daemon-side extension look like data loss, which is why §3 of the
+// GUI design has it name the type it could not draw.
+//
+// One divergence worth recording: `undeclared_row` builds an origin label and never
+// parents it — it does not go through `finish_row`, which is what hangs the suffix off
+// the row — so the pill is invisible on an undeclared key today. This template gives
+// both cases the same suffix, which is what `Unknown` already has.
+
+using Gtk 4.0;
+using Adw 1;
+
+template $OptionRowReadOnly : Adw.ActionRow {
+  // An Adw.Bin where the other five rows have a Gtk.Box: with no Reset beside it the
+  // pill is the only suffix, and the box would never get a second child.
+  [suffix]
+  Adw.Bin {
+    valign: center;
+
+    child: Gtk.Label origin {
+      valign: center;
+
+      styles ["dim-label", "caption"]
+    };
+  }
+}

@@ -1,0 +1,48 @@
+// The unpair confirmation — `scanners.rs`, raised by the detail pane's Unpair button.
+// No mockup: §7 of the GUI design owes the destructive action a confirmation, and this
+// is it.
+//
+// Transient for the window and modal. The body text names the scanner, so it is written
+// before presenting.
+
+using Gtk 4.0;
+
+template $UnpairDialog : Gtk.Window {
+  modal: true;
+  title: _("Unpair scanner?");
+
+  child: Gtk.Box {
+    orientation: vertical;
+    spacing: 18;
+
+    Gtk.Label body {
+      wrap: true;
+      xalign: 0;
+      margin-top: 18;
+      margin-bottom: 18;
+      margin-start: 18;
+      margin-end: 18;
+    }
+
+    Gtk.Box {
+      orientation: horizontal;
+      spacing: 12;
+      halign: end;
+
+      Gtk.Button cancel {
+        label: _("Cancel");
+
+        clicked => $on_unpair_cancel();
+      }
+
+      // scanners.rs `destructive`. Sends Unpair, then closes.
+      Gtk.Button confirm {
+        label: _("Unpair");
+
+        clicked => $on_unpair_confirm();
+
+        styles ["destructive-action"]
+      }
+    }
+  };
+}

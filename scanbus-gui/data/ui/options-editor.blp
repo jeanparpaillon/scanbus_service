@@ -1,0 +1,22 @@
+// The options editor group — `options.rs` `OptionsEditor::new`. Used twice: once per
+// exported profile on the Profiles page, and once inside $OptionsDialog for a per-key
+// override. No mockup.
+//
+// Its title and description name the profile and say what the scope means, so neither is
+// declared. Every option row is built per `OptionsSchema` entry and appended here — see
+// the option-row-*.blp files for the six shapes — and rebuilt only when the set of keys
+// or one of their types changes, so a value that moves keeps its widget and a
+// PropertiesChanged cannot close a dropdown the user has open.
+
+using Gtk 4.0;
+using Adw 1;
+
+template $OptionsEditor : Adw.PreferencesGroup {
+  // Shown instead of the rows when a profile publishes no options at all. Added first so
+  // it stays above the rows a render appends.
+  Adw.ActionRow empty {
+    title: _("No options");
+    subtitle: _("This profile publishes no options for this version to edit.");
+    visible: false;
+  }
+}

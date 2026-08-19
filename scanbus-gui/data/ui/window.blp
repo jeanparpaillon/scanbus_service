@@ -1,0 +1,181 @@
+// The window — `window.rs` `build_window`.
+// Mockup: ../../../docs/design/main.png (the sidebar and header bar it frames).
+//
+// GActions the widgets here name rather than connect to, reconciled against the code:
+//
+//   * `app.quit` — main.rs. The only menu item, and the whole of `app_menu`.
+//   * `win.retry-pair`, string target: the object path — window.rs, added to this
+//     window. Activated by the toast a failed pairing raises, never by a widget.
+//   * `app.open-file`, `app.open-folder`, `app.show-scanner`, string targets —
+//     notify.rs. Activated from desktop notifications, so no widget names them either.
+//   * `scanner.default-profile` — buttons.rs, stateful, in a `SimpleActionGroup`
+//     inserted on the buttons page rather than on this window; see buttons-page.blp.
+//   * `button.profile` — buttons.rs, stateful, one action group per key row; see
+//     button-row.blp.
+//
+// All seven still exist. The last two are named where they are installed, because the
+// group they belong to is inserted on a widget below this one.
+
+using Gtk 4.0;
+using Adw 1;
+
+// Static, so it stays declarative. The profile menus are the ones that cannot: they are
+// rebuilt from `Scanner1.SupportedProfiles` every render.
+menu app_menu {
+  item ("Quit", "app.quit")
+}
+
+template $ScanbusWindow : Adw.ApplicationWindow {
+  title: _("Scanbus");
+  default-width: 1180;
+  default-height: 720;
+
+  // Stops discovery, then destroys instead of closing while the background hold is
+  // taken, so the app keeps running without a window.
+  close-request => $on_close_request();
+
+  // window.rs `overlay`. Held past construction: `ScannerListModel::connect_toast`
+  // adds to it, and the settings page reaches it to report a failed autostart write.
+  content: Adw.ToastOverlay toast_overlay {
+    child: Gtk.Box {
+      orientation: vertical;
+      spacing: 0;
+
+      Adw.HeaderBar {
+        // Packed end-first in this order, which is why the menu button ends up
+        // rightmost and "Find scanners…" leftmost of the three.
+        [end]
+        Gtk.MenuButton {
+          icon-name: "open-menu-symbolic";
+          menu-model: app_menu;
+        }
+
+        [end]
+        Gtk.Spinner spinner {
+          spinning: false;
+          visible: false;
+        }
+
+        [end]
+        Gtk.Button find_button {
+          label: _("Find scanners…");
+
+          // One button for both directions: starts discovery when idle, stops it
+          // while it runs, and does nothing while a stop is in flight.
+          clicked => $on_find_clicked();
+        }
+      }
+
+      Gtk.Box {
+        orientation: horizontal;
+        spacing: 0;
+
+        // -- Sidebar --------------------------------------------------------
+        Gtk.Box {
+          orientation: vertical;
+          spacing: 12;
+          margin-top: 18;
+          margin-bottom: 18;
+          margin-start: 18;
+          margin-end: 18;
+          width-request: 220;
+
+          // The page name each row selects is its widget name, read back in
+          // `row-selected` and passed to the stack.
+          Gtk.ListBox sections {
+            selection-mode: single;
+
+            // Clears the footer's selection, then switches `page_stack` to the row's
+            // name.
+            row-selected => $on_section_selected();
+
+            styles ["navigation-sidebar"]
+
+            // The one row with an id: it is selected programmatically at the end of
+            // construction, which is what makes Scanners the page the window opens on.
+            Gtk.ListBoxRow scanners_row {
+              name: "scanners";
+
+              child: Gtk.Label {
+                label: _("Scanners");
+                xalign: 0;
+                margin-top: 12;
+                margin-bottom: 12;
+                margin-start: 12;
+                margin-end: 12;
+              };
+            }
+
+            Gtk.ListBoxRow {
+              name: "profiles";
+
+              child: Gtk.Label {
+                label: _("Profiles");
+                xalign: 0;
+                margin-top: 12;
+                margin-bottom: 12;
+                margin-start: 12;
+                margin-end: 12;
+              };
+            }
+          }
+
+          // Pushes the footer to the bottom of the sidebar.
+          Gtk.Box {
+            orientation: vertical;
+            spacing: 0;
+            vexpand: true;
+          }
+
+          Gtk.ListBox footer {
+            selection-mode: single;
+
+            // Mirror of `sections`: clears that selection, then switches `page_stack`.
+            row-selected => $on_footer_selected();
+
+            styles ["navigation-sidebar"]
+
+            Gtk.ListBoxRow {
+              name: "settings";
+
+              child: Gtk.Label {
+                label: _("Settings");
+                xalign: 0;
+                margin-top: 12;
+                margin-bottom: 12;
+                margin-start: 12;
+                margin-end: 12;
+              };
+            }
+          }
+        }
+
+        Gtk.Separator {
+          orientation: vertical;
+        }
+
+        // -- Pages ----------------------------------------------------------
+        // Named pages, because the sidebar switches by name and not by index.
+        Gtk.Stack page_stack {
+          hexpand: true;
+          vexpand: true;
+
+          Gtk.StackPage {
+            name: "scanners";
+            child: $ScannersPane scanners_pane {};
+          }
+
+          Gtk.StackPage {
+            name: "profiles";
+            child: $ProfilesPage profiles_page {};
+          }
+
+          Gtk.StackPage {
+            name: "settings";
+            child: $SettingsPage settings_page {};
+          }
+        }
+      }
+    };
+  };
+}

@@ -1,0 +1,44 @@
+// The per-key options window — `buttons.rs` `open_options`. One per page at a time;
+// opening a second closes the first. No mockup.
+//
+// Its title names the profile ("Document options") and its subtitle says what the scope
+// means, so neither is declared. The editor's Scope — Profile or Button — is the whole
+// difference between the two ways this window opens, and is content: `open_options`
+// builds the editor with it today, and a template sets it on `editor` per open.
+
+using Gtk 4.0;
+using Adw 1;
+
+template $OptionsDialog : Gtk.Window {
+  modal: true;
+  default-width: 520;
+
+  // Clears the one-dialog-at-a-time slot, so the next Configure can open.
+  close-request => $on_options_dialog_closed();
+
+  child: Gtk.Box {
+    orientation: vertical;
+    spacing: 18;
+    margin-top: 18;
+    margin-bottom: 18;
+    margin-start: 18;
+    margin-end: 18;
+
+    // Declared rather than appended per open, which is the one place this file departs
+    // from `open_options`: the window always holds exactly one editor, above the actions
+    // row, and only its Scope and its rows change.
+    $OptionsEditor editor {}
+
+    // An Adw.Bin where buttons.rs builds a horizontal Gtk.Box: it right-aligns one
+    // button and never gets a second.
+    Adw.Bin {
+      halign: end;
+
+      child: Gtk.Button close {
+        label: _("Close");
+
+        clicked => $on_options_close();
+      };
+    }
+  };
+}

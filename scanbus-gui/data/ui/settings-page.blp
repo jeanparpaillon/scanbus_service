@@ -1,0 +1,150 @@
+// The Settings page — `window.rs` `settings_page`, which returns this scroller.
+// No mockup: §3 "Settings" describes it in prose only.
+//
+// Every subtitle here is written from the store or from the autostart override, so the
+// rows carry titles and nothing else. The chevrons are decorative — the row's own title
+// is what a screen reader announces — so each carries the presentation role and an
+// empty accessible name rather than a second name over the row's.
+
+using Gtk 4.0;
+using Adw 1;
+
+template $SettingsPage : Gtk.ScrolledWindow {
+  hscrollbar-policy: never;
+  vscrollbar-policy: automatic;
+
+  // The title is never drawn: this page lives in a plain Gtk.Stack, not in an
+  // Adw.PreferencesDialog with a view switcher. It is the page's accessible name.
+  child: Adw.PreferencesPage {
+    title: _("Settings");
+
+    Adw.PreferencesGroup {
+      title: _("Daemon");
+      description: _("Read the scanbus daemon state without starting it, then start it explicitly when it is only activatable.");
+
+      Adw.ActionRow daemon_row {
+        title: _("Service");
+
+        [suffix]
+        // window.rs `start_button`. Visible only in the Activatable state — the other
+        // three service states have nothing to start.
+        Gtk.Button daemon_start_button {
+          label: _("Start");
+          valign: center;
+
+          // Asks the bus thread to start the daemon; the row's own text follows the
+          // store.
+          clicked => $on_start_service();
+        }
+      }
+
+      // window.rs `version_row`.
+      Adw.ActionRow daemon_version_row {
+        title: _("Version");
+      }
+
+      // window.rs `backends_row`.
+      Adw.ActionRow daemon_backends_row {
+        title: _("Backends");
+      }
+
+      // window.rs `profiles_row` — the "Profile types" row, not the sidebar's Profiles.
+      Adw.ActionRow daemon_profile_types_row {
+        title: _("Profile types");
+      }
+    }
+
+    // Read-only here; activating a row jumps to Profiles.
+    Adw.PreferencesGroup {
+      title: _("Default output folders");
+      description: _("These folders are read-only here. Use Profiles to change them.");
+
+      // window.rs `image_row`.
+      Adw.ActionRow output_image_row {
+        title: _("Image");
+        activatable: true;
+
+        // Both output rows do the same thing: jump to the Profiles page, where the
+        // folder is editable.
+        activated => $on_show_profiles();
+
+        [suffix]
+        Gtk.Image {
+          icon-name: "go-next-symbolic";
+          accessible-role: presentation;
+
+          accessibility {
+            label: "";
+          }
+        }
+      }
+
+      // window.rs `document_row`.
+      Adw.ActionRow output_document_row {
+        title: _("Document");
+        activatable: true;
+
+        activated => $on_show_profiles();
+
+        [suffix]
+        Gtk.Image {
+          icon-name: "go-next-symbolic";
+          accessible-role: presentation;
+
+          accessibility {
+            label: "";
+          }
+        }
+      }
+    }
+
+    Adw.PreferencesGroup {
+      title: _("Background mode");
+      description: _("The packaged GNOME session starts scanbus-gui in the background at login through XDG autostart.");
+
+      // window.rs `row`. Its subtitle is written from the autostart override's state, or
+      // from the error that stopped it being read — which also desensitises the switch,
+      // so neither is declared here.
+      Adw.ActionRow autostart_row {
+        title: _("Start in the background at login");
+        activatable-widget: autostart_toggle;
+
+        [suffix]
+        // window.rs `toggle`.
+        Gtk.Switch autostart_toggle {
+          valign: center;
+
+          // Writes the XDG autostart override. A failed write toasts and puts the switch
+          // back, which is why the handler has to guard against the notify its own
+          // revert raises.
+          notify::active => $on_autostart_toggled();
+        }
+      }
+    }
+
+    // Opens a Gtk.AboutDialog built at runtime, because its version and repository come
+    // from the crate's own env!() values and the daemon version comes from the store.
+    Adw.PreferencesGroup {
+      title: _("About");
+
+      Adw.ActionRow about_row {
+        title: _("About Scanbus");
+        subtitle: _("GUI version, daemon version, repository and licence");
+        activatable: true;
+
+        // Builds the Gtk.AboutDialog described above.
+        activated => $on_about();
+
+        [suffix]
+        Gtk.Image {
+          icon-name: "go-next-symbolic";
+          accessible-role: presentation;
+
+          accessibility {
+            label: "";
+          }
+        }
+      }
+    }
+  };
+}

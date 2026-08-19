@@ -1,0 +1,146 @@
+// One row in either scanner list — `scanners.rs` `scanner_row`, built once per model
+// item. Mockup: ../../../docs/design/main.png, the rows of the two lists.
+//
+// The row's widget name is the scanner's object path, which is how selection is reported
+// back to the store, so it is set per item and not declared here. Title and subtitle are
+// bound to the ScannerObject properties; the three pairing sub-boxes are shown one at a
+// time by PairingState, and all three are hidden when the scanner is not pairing.
+
+using Gtk 4.0;
+using Adw 1;
+
+template $ScannerRow : Gtk.ListBoxRow {
+  selectable: true;
+  activatable: true;
+
+  // Activation selects: the row's widget name is the object path the store is told.
+  activate => $on_scanner_row_activate();
+
+  child: Gtk.Box {
+    orientation: vertical;
+    spacing: 8;
+    margin-top: 12;
+    margin-bottom: 12;
+    margin-start: 12;
+    margin-end: 12;
+
+    Gtk.Box {
+      orientation: horizontal;
+      spacing: 12;
+
+      Gtk.Box {
+        orientation: vertical;
+        spacing: 4;
+
+        // Bound to ScannerObject:name.
+        Gtk.Label title {
+          xalign: 0;
+
+          styles ["heading"]
+        }
+
+        // Bound to ScannerObject:status-line.
+        Gtk.Label subtitle {
+          xalign: 0;
+
+          styles ["dim-label"]
+        }
+      }
+
+      Gtk.Box {
+        hexpand: true;
+      }
+
+      Gtk.Button pair_button {
+        label: _("Pair");
+        valign: center;
+
+        // Pair, or cancel while pairing — the label says which ("Pair", then "Cancel"
+        // while pairing, "Try again" after a failure), and the handler reads the
+        // scanner's PairingState rather than the label to decide. Hidden entirely once
+        // the scanner is paired.
+        clicked => $on_pair_clicked();
+      }
+    }
+
+    Gtk.Box {
+      orientation: vertical;
+      spacing: 8;
+
+      Gtk.Box progress_box {
+        orientation: horizontal;
+        spacing: 8;
+        visible: false;
+
+        Gtk.Spinner spinner {
+          halign: start;
+        }
+
+        // "Pairing in progress", or the backend being installed.
+        Gtk.Label progress_label {
+          xalign: 0;
+          wrap: true;
+
+          styles ["dim-label"]
+        }
+      }
+
+      Gtk.Box confirm_box {
+        orientation: vertical;
+        spacing: 4;
+        visible: false;
+
+        Gtk.Label {
+          label: _("Confirm on your device");
+          xalign: 0;
+        }
+
+        Gtk.Label code_label {
+          xalign: 0;
+
+          styles ["title-2", "monospace"]
+        }
+      }
+
+      Gtk.Box failure_box {
+        orientation: vertical;
+        spacing: 6;
+        visible: false;
+
+        // Shown and hidden separately from `failure_box`, because the expander below it
+        // carries the error text whether or not the banner is up.
+        // An Adw.Bin where scanners.rs builds a vertical Gtk.Box: it wraps one label to
+        // give it the `error card` background, and never gets a second child.
+        Adw.Bin failure_banner {
+          margin-top: 6;
+          margin-bottom: 6;
+          margin-start: 12;
+          margin-end: 12;
+          visible: false;
+
+          styles ["error", "card"]
+
+          child: Gtk.Label failure_message {
+            wrap: true;
+            xalign: 0;
+            margin-top: 10;
+            margin-bottom: 10;
+            margin-start: 10;
+            margin-end: 10;
+          };
+        }
+
+        Gtk.Expander {
+          label: _("Details");
+          expanded: false;
+
+          child: Gtk.Label failure_details_label {
+            selectable: true;
+            wrap: true;
+            xalign: 0;
+          };
+        }
+      }
+    }
+  };
+}

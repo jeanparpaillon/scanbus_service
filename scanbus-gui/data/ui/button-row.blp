@@ -1,0 +1,88 @@
+// One device key — `buttons.rs` `ButtonRow::new`, built once per Button1 object.
+// Mockup: ../../../docs/design/buttons.png, the rows of the Scanner buttons group.
+//
+// A `SimpleActionGroup` holding the stateful `profile` action is inserted on this row
+// under the prefix `button`, so the profile menu items target `button.profile`. The menu
+// model is rebuilt from `Scanner1.SupportedProfiles` per render and cannot be declared.
+//
+// The entry replaces the label text only on a device whose keys are writable — API §9's
+// `LabelConfigurable`, so an insensitive entry is not an option — and the caption appears
+// only when the key's own label disagrees with the profile it runs.
+
+using Gtk 4.0;
+
+template $ButtonRow : Gtk.ListBoxRow {
+  selectable: false;
+  activatable: false;
+
+  child: Gtk.Box {
+    orientation: horizontal;
+    spacing: 12;
+    margin-top: 12;
+    margin-bottom: 12;
+    margin-start: 12;
+    margin-end: 12;
+
+    // The key index, and its tooltip — "Key N — the index the device and `scanbus
+    // button` use" — both name N, so both are written per row.
+    Gtk.Label index_label {
+      width-chars: 2;
+      valign: center;
+
+      styles ["caption-heading", "numeric"]
+    }
+
+    Gtk.Box {
+      orientation: vertical;
+      spacing: 4;
+      hexpand: true;
+      valign: center;
+
+      Gtk.Label label_text {
+        xalign: 0;
+        wrap: true;
+      }
+
+      Gtk.Entry label_entry {
+        visible: false;
+        tooltip-text: _("Press Enter to send this label to the device");
+
+        // Enter writes the label to the device. The row then ignores the store's value
+        // until that write comes back, so the text does not flick to the old label.
+        activate => $on_label_entry_activate();
+      }
+
+      Gtk.Label caption {
+        xalign: 0;
+        wrap: true;
+        visible: false;
+
+        styles ["dim-label", "caption"]
+      }
+    }
+
+    // Menu rebuilt from Scanner1.SupportedProfiles; items target `button.profile`. Its
+    // style class follows the assignment, so neither is declared.
+    Gtk.MenuButton profile_button {
+      valign: center;
+    }
+
+    // The ProfileOptions this key overrides, summarised — empty when it overrides none.
+    Gtk.Label summary {
+      xalign: 1;
+      wrap: true;
+
+      styles ["dim-label"]
+    }
+
+    Gtk.Button configure {
+      label: _("Configure");
+      valign: center;
+
+      // Opens $OptionsDialog at Button scope, with the profile's options inherited.
+      clicked => $on_button_configure();
+
+      styles ["flat"]
+    }
+  };
+}

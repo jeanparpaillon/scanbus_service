@@ -1,0 +1,50 @@
+// One option whose schema declares a path — `options.rs` `build_row`, the `Path` arm.
+//
+// The description from the schema entry becomes a **tooltip**, not a subtitle, on this
+// row: `build_row` calls `set_tooltip_text` for the three Adw.ActionRow-shaped kinds and
+// `.subtitle()` for the combo, spin and switch rows. Both are content, so neither is
+// declared — but they are not the same widget, and swapping one for the other on a port
+// would silently move the text.
+//
+// No `notify` handler: the chooser is what commits, so there is nothing to watch. Two
+// suffixes, in this order — the origin pill and Reset first, then the chooser, so the
+// button the user reaches for sits at the outer edge.
+
+using Gtk 4.0;
+using Adw 1;
+
+template $OptionRowFolder : Adw.ActionRow {
+  [suffix]
+  Gtk.Box {
+    orientation: horizontal;
+    spacing: 6;
+    valign: center;
+
+    Gtk.Label origin {
+      valign: center;
+
+      styles ["dim-label", "caption"]
+    }
+
+    Gtk.Button reset {
+      label: _("Reset");
+      valign: center;
+      visible: false;
+
+      clicked => $on_option_reset();
+
+      styles ["flat"]
+    }
+  }
+
+  [suffix]
+  Gtk.Button chooser {
+    label: _("Choose…");
+    valign: center;
+
+    // Runs the folder chooser, then commits the path it returns.
+    clicked => $on_choose_folder();
+
+    styles ["flat"]
+  }
+}

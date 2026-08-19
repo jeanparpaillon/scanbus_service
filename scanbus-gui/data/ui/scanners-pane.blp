@@ -1,0 +1,155 @@
+// The Scanners page — `scanners.rs` `ScannersPane::new`, which returns this box.
+// Mockup: ../../../docs/design/main.png — the two lists on the left, the detail pane
+// on the right.
+
+using Gtk 4.0;
+using Adw 1;
+
+template $ScannersPane : Gtk.Box {
+  orientation: vertical;
+  spacing: 0;
+  hexpand: true;
+  vexpand: true;
+
+  // ---- Service banner ------------------------------------------------------
+  // Revealed while the daemon is absent from the session bus.
+  Gtk.Revealer service_banner {
+    transition-type: slide_down;
+    reveal-child: false;
+
+    // An Adw.Bin where scanners.rs builds a horizontal Gtk.Box: the box exists only to
+    // carry the `toolbar` style and the margins around one label, and `Adw.Bin` is what
+    // blueprint-compiler's lint wants for a single-child wrapper. Behaviour is
+    // identical; the port changes the type here rather than keeping a box that never
+    // holds a second child.
+    child: Adw.Bin {
+      margin-top: 12;
+      margin-bottom: 12;
+      margin-start: 18;
+      margin-end: 18;
+
+      styles ["toolbar"]
+
+      child: Gtk.Label {
+        label: _("Scanbus service is not running");
+        xalign: 0;
+      };
+    };
+  }
+
+  // ---- Content / empty -----------------------------------------------------
+  // scanners.rs `stack`. Switched by `has_scanners`, not by discovery state: a stopped
+  // discovery that found something keeps its results on screen.
+  Gtk.Stack scanners_stack {
+    vexpand: true;
+
+    Gtk.StackPage {
+      name: "content";
+      child: Gtk.Box {
+        orientation: horizontal;
+        spacing: 0;
+        vexpand: true;
+
+        // ---- Scanner lists -------------------------------------------------
+        Gtk.ScrolledWindow {
+          hscrollbar-policy: never;
+          min-content-width: 420;
+          hexpand: true;
+          vexpand: true;
+
+          child: Gtk.Box {
+            orientation: vertical;
+            spacing: 18;
+            margin-top: 24;
+            margin-bottom: 24;
+            margin-start: 24;
+            margin-end: 24;
+
+            // Both groups are hidden while their filtered model is empty, and the
+            // discovered group's *description* is where the "Finding scanners… N found"
+            // caption is written. scanners.rs also builds a `discovery_caption` label
+            // for that text and never parents it; only its string reaches the screen,
+            // through `set_description`, so there is nothing to declare for it here.
+            Adw.PreferencesGroup paired_group {
+              title: _("Paired scanners");
+
+              // Bound to a Gtk.FilterListModel over the store, one $ScannerRow per item.
+              Gtk.ListBox paired_list {
+                selection-mode: single;
+
+                // The two lists clear each other's selection, so one scanner is selected
+                // across both; the selected row's widget name is the path handed to the
+                // store.
+                row-selected => $on_paired_selected();
+
+                styles ["boxed-list"]
+              }
+            }
+
+            Adw.PreferencesGroup discovered_group {
+              title: _("Discovered scanners");
+
+              Gtk.ListBox discovered_list {
+                selection-mode: single;
+
+                // Mirror of `paired_list`.
+                row-selected => $on_discovered_selected();
+
+                styles ["boxed-list"]
+              }
+            }
+          };
+        }
+
+        Gtk.Separator {
+          orientation: vertical;
+        }
+
+        // ---- Right-hand pane -----------------------------------------------
+        Gtk.Stack detail_stack {
+          visible-child-name: "placeholder";
+
+          Gtk.StackPage {
+            name: "placeholder";
+            child: Adw.StatusPage {
+              title: _("No scanner selected");
+              description: _("Select a scanner to inspect it");
+            };
+          }
+
+          Gtk.StackPage {
+            name: "details";
+            child: Gtk.ScrolledWindow {
+              hscrollbar-policy: never;
+              min-content-width: 360;
+
+              // scanners.rs `details`.
+              child: $DetailsPane details_pane {};
+            };
+          }
+
+          Gtk.StackPage {
+            name: "buttons";
+            child: Gtk.ScrolledWindow {
+              hscrollbar-policy: never;
+              min-content-width: 360;
+
+              // scanners.rs `buttons_page`. Reached from the detail pane's Configure
+              // row, and left again as soon as the scanner stops being paired.
+              child: $ButtonsPage buttons_page {};
+            };
+          }
+        }
+      };
+    }
+
+    Gtk.StackPage {
+      name: "empty";
+      child: Adw.StatusPage {
+        title: _("No scanners yet");
+        description: _("Find scanners…");
+        vexpand: true;
+      };
+    }
+  }
+}

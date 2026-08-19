@@ -1,0 +1,172 @@
+// The right-hand detail pane — `details.rs` `DetailsPane::new`, which returns this box.
+// Mockup: ../../../docs/design/main.png — identity, facts, actions, separated by rules.
+//
+// Every value here is written by `DetailsPane::render` from one ScannerEntry, so the
+// labels are declared empty. The status colour is a css class added and removed per
+// render (`success` / `warning` / `error`), which is why none is declared.
+//
+// The five facts are $DetailsFactRow instances — see details-fact-row.blp for why they
+// are a template and not five copies of one box. `details.rs` holds the five *value*
+// labels; the port holds the five rows and reaches `value` through each.
+
+using Gtk 4.0;
+using Adw 1;
+
+template $DetailsPane : Gtk.Box {
+  orientation: vertical;
+  spacing: 24;
+  margin-top: 24;
+  margin-bottom: 24;
+  margin-start: 24;
+  margin-end: 24;
+
+  // Identity: icon, name, and the summary line whose first half carries the status
+  // colour. The box fills the pane so a long name has the full width to wrap into;
+  // each child centres itself.
+  Gtk.Box {
+    orientation: vertical;
+    spacing: 12;
+
+    // `printer-symbolic` for a machine, `phone-symbolic` for the one scanner the user
+    // holds; the backend decides, per render. Decorative: the name below it is what a
+    // screen reader announces.
+    Gtk.Image icon {
+      icon-name: "printer-symbolic";
+      pixel-size: 80;
+      halign: center;
+      accessible-role: presentation;
+
+      accessibility {
+        label: "";
+      }
+    }
+
+    Gtk.Label name {
+      wrap: true;
+      justify: center;
+
+      styles ["title-2"]
+    }
+
+    Gtk.Box {
+      orientation: horizontal;
+      spacing: 0;
+      halign: center;
+
+      // The two halves of the summary line: `summary_status` is the status word and the
+      // only one that takes a colour, `summary_rest` never does. Both are empty until a
+      // render. `xalign` is GTK's own default, spelled out because a Gtk.Label with no
+      // property at all is what blueprint-compiler's lint flags; the box centres them,
+      // so it changes nothing.
+      Gtk.Label summary_status {
+        xalign: 0.5;
+      }
+
+      Gtk.Label summary_rest {
+        xalign: 0.5;
+      }
+    }
+  }
+
+  Gtk.Separator {
+    orientation: horizontal;
+  }
+
+  // Facts: icon / label / value, five rows of one shape, in the order the mockup shows.
+  Gtk.Box {
+    orientation: vertical;
+    spacing: 18;
+
+    $DetailsFactRow status_row {
+      icon-name: "network-cellular-signal-excellent-symbolic";
+      title: _("Status");
+    }
+
+    $DetailsFactRow connection_row {
+      icon-name: "network-wireless-hotspot-symbolic";
+      title: _("Connection");
+    }
+
+    // The one selectable value: an address is the thing a user copies out.
+    $DetailsFactRow address_row {
+      icon-name: "network-wired-symbolic";
+      title: _("Address");
+      value-selectable: true;
+    }
+
+    $DetailsFactRow backend_row {
+      icon-name: "application-x-sharedlib-symbolic";
+      title: _("Backend");
+    }
+
+    $DetailsFactRow default_profile_row {
+      icon-name: "text-x-generic-symbolic";
+      title: _("Default profile");
+    }
+  }
+
+  // The bottom section is pairing-only: rule and box are shown together or not at all,
+  // because a lone rule over empty space is not a section.
+  Gtk.Separator actions_separator {
+    orientation: horizontal;
+    visible: false;
+  }
+
+  Gtk.Box actions {
+    orientation: vertical;
+    spacing: 12;
+    visible: false;
+
+    // `boxed-list` is what gives the row the lighter-than-the-pane background the paired
+    // scanner list already has; a plain button would sit on the pane colour.
+    Gtk.ListBox configure_list {
+      selection-mode: none;
+
+      // Wired on the list, not on the row: a plain Gtk.ListBox is what emits
+      // `row-activated` for the click, with no Adw.PreferencesGroup in between to
+      // forward it to the row's own activation. Switches `detail_stack` to "buttons",
+      // only for a scanner that is still paired.
+      row-activated => $on_configure_activated();
+
+      styles ["boxed-list"]
+
+      Adw.ActionRow {
+        title: _("Configure buttons");
+        activatable: true;
+
+        [prefix]
+        Gtk.Image {
+          icon-name: "preferences-other-symbolic";
+          accessible-role: presentation;
+
+          accessibility {
+            label: "";
+          }
+        }
+
+        [suffix]
+        Gtk.Image {
+          icon-name: "go-next-symbolic";
+          accessible-role: presentation;
+
+          accessibility {
+            label: "";
+          }
+        }
+      }
+    }
+
+    // Not in the mockup, and kept anyway: unpairing is reachable from nowhere else in
+    // the window. It sits below the row rather than in the same list so a mis-aimed
+    // click cannot land on the irreversible half of the section. Raises $UnpairDialog;
+    // nothing is sent until it is confirmed.
+    Gtk.Button unpair {
+      label: _("Unpair");
+      halign: fill;
+
+      clicked => $on_unpair_clicked();
+
+      styles ["destructive-action"]
+    }
+  }
+}
