@@ -27,3 +27,8 @@ libadwaita = { version = "0.8", features = ["v1_4"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 tracing.workspace = true
 zbus.workspace = true
+
+# build.rs only: bundles the blueprint-compiled .ui into a .gresource. 0.21 matches the
+# glib 0.21 that gtk4 0.10 already pulls in, so the two agree on the resource format.
+[build-dependencies]
+glib-build-tools = "0.21"
