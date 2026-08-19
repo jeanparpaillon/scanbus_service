@@ -3,6 +3,7 @@ Section: utils
 Priority: optional
 Maintainer: Jean Parpaillon <jean@parpaillon.info>
 Build-Depends: cargo,
+ blueprint-compiler,
  rustc,
  make,
  dpkg-dev,
