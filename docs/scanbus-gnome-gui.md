@@ -42,6 +42,8 @@ One new crate, a workspace member beside the CLI:
 
 ```
 scanbus-gui/             # binary `scanbus-gui`. Depends on scanbus-client, gtk4, libadwaita, tokio.
+├── build.rs             # .blp → .ui → .gresource, see §2.1
+├── data/ui/             # one .blp per widget: the shape of everything in §3
 └── src/
     ├── main.rs          # AdwApplication, the two entry modes of §4
     ├── bus.rs           # the tokio side: connection, ObjectManager, the reconnect loop
@@ -77,11 +79,66 @@ The crate is **not** in `default-members`. `cargo build` on a headless CI box or
 not require the GTK4 development libraries, and the daemon must stay buildable by someone who
 will never run a desktop. `make gui` and an explicit `-p scanbus-gui` build it.
 
+### 2.1 Widget shape lives in Blueprint, behaviour lives in Rust
+
+Every widget whose shape is fixed at build time is declared in a `.blp` file under
+`data/ui/`, not built by a constructor. The line between the two is *when the value is
+known*: a `Gtk.Box` with an orientation, a label whose text never changes, a css class
+that is always applied are shape and belong in the `.blp`; a label the store writes, a
+row's sensitivity, which stack page is visible, a `Gtk.MenuButton`'s menu model built
+from `Scanner1.SupportedProfiles` are content and stay in Rust. Shape in Rust is the
+thing this rule exists to stop: 7.6k lines of `scanbus-gui/src/` were `Box::new` and
+`append` before the port, and reading the mockups out of them was impossible.
+
+The build path has three steps, all in `build.rs`, none of them checked in:
+
+1. `blueprint-compiler batch-compile` turns `data/ui/*.blp` into `.ui` XML in `OUT_DIR`.
+   The `.blp` is the source of truth; a generated `.ui` never enters git, because a
+   committed generated file drifts the first time someone edits the `.blp` without
+   regenerating.
+2. `glib_build_tools::compile_resources` bundles the `.ui` into one `.gresource` under
+   the `/org/scanbus/Gui/ui/` prefix.
+3. `gio::resources_register_include!` links the bundle into the binary, so an installed
+   `scanbus-gui` has no data files to find and `.deb` packaging (§9) gains nothing to
+   install.
+
+`blueprint-compiler` therefore becomes a build dependency of this crate — Debian ships
+it, so `debian/control` gains it in `Build-Depends` and the CI jobs that build the GUI
+install it. It costs the headless build nothing: `scanbus-gui` is not in
+`default-members`, so a machine that never builds the GUI never needs the compiler.
+
+**One `gtk::CompositeTemplate` subclass per widget, and template callbacks rather than
+builder callbacks.** A `.ui` loaded through `gtk::Builder` can name a handler, but the
+free function it resolves to sees neither the store nor the bus command channel, which
+is what every handler in this client needs. A subclass whose `#[template_callback]`
+methods hang off the object reaches both. So `ScannersPane` is a `gtk::Box` subclass
+rather than a struct holding one, and the same for the window, the detail pane, the
+buttons page, the profiles page and the options editor.
+
+**Per-item widgets get their own template and are instantiated per item**: a scanner
+row, a device-key row and each option-row type are one `.blp` each, not ids inside the
+page that contains them. They are the widgets a list builds `n` of, so an id in the
+page's template would name exactly one of them.
+
+Not everything in §3 can be declared. Menu models rebuilt from `SupportedProfiles`, the
+action groups they go with, and the `Rc` callbacks that are not GObject signals
+(`ScannerListModel::connect_changed`, `OptionsEditor::connect_write`) have no
+declarative form and stay where they are.
+
 ## 3. The window
 
 `AdwApplicationWindow` with an `AdwNavigationSplitView`: a sidebar (Scanners, Profiles, and
 Settings pinned to the bottom) and a content pane that is an `AdwNavigationView`, so
 *Configure buttons* pushes a page with a real back button rather than opening a dialog.
+
+What shipped is the same layout built from plainer widgets: a `Gtk.Box` holding the
+sidebar, a `Gtk.Separator` and a `Gtk.Stack` of pages, and *Configure buttons* switches
+a second `Gtk.Stack` (`detail_stack`) to a page carrying its own back button. The
+adaptive behaviour the two Adw containers would bring — collapsing the sidebar on a
+narrow window, the swipe-back gesture — is what the client currently does not have; the
+navigation the mockups show works. The `.blp` files describe the shipped tree, so
+adopting `AdwNavigationSplitView` is a change to `window.blp` and its callbacks rather
+than a rewrite, and it is not part of the Blueprint port.
 
 ### Scanners — [design/main.png](design/main.png)
 
@@ -284,7 +341,10 @@ the user is the only one who can act on it.
 Ships in the same `.deb` as the daemon and the CLI ([7.2](todo/7_2.md)): the binary in
 `/usr/bin`, `org.scanbus.Gui.desktop` in `/usr/share/applications`, an autostart entry in
 `/etc/xdg/autostart` (§4), the icon in `/usr/share/icons/hicolor/scalable/apps`, and a GSettings
-schema if window geometry ends up persisted. `Depends:` gains the GTK4 and libadwaita runtime;
+schema if window geometry ends up persisted. The widget definitions are *not* among them: the
+`.gresource` of §2.1 is linked into the binary, so the package installs one more file than it
+did before the port — none. What the package gains is a build dependency,
+`blueprint-compiler`. `Depends:` gains the GTK4 and libadwaita runtime;
 the daemon must remain installable without them, so a `scanbus-gui` binary package split from
 `scanbus` is the packaging shape, with the daemon's package not depending on it.
 
@@ -302,7 +362,11 @@ Two layers, split where the toolkit starts:
 - **The widget layer is tested by being thin.** Rows bind to store values; the tests that
   matter are that the binding exists, run under `xvfb-run` with the GTK offscreen backend for
   the handful of cases (a `Status` change updating a row in place, `LabelConfigurable=false`
-  rendering as a label) that are worth the flakiness budget.
+  rendering as a label) that are worth the flakiness budget. Templates do not change what is worth
+  asserting, but they add one failure the old code could not have: a `.blp` that renames or
+  drops a child fails at `Class::ensure`/instantiation rather than at compile time, so every
+  templated widget is instantiated once in the `gtk-tests` suite. That instantiation is the
+  test that the template and the `#[template_child]` list still agree.
 
 The notification path (§5) is tested by standing a stub `org.freedesktop.Notifications` on the
 private bus and asserting on what the GUI sends: one notification per job, replaced not
