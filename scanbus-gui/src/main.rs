@@ -27,6 +27,12 @@ use crate::notify::Notifier;
 use crate::scanners::ScannerListModel;
 
 fn main() -> glib::ExitCode {
+    // The widget definitions build.rs compiled out of data/ui/*.blp. Registered before
+    // anything builds a widget, so a template lookup can never race it; nothing reads
+    // the bundle yet, which is what makes this issue reviewable on its own.
+    gio::resources_register_include!("scanbus.gresource")
+        .expect("register the gresource build.rs bundled into the binary");
+
     let app = adw::Application::builder()
         .application_id("org.scanbus.Gui")
         .flags(gio::ApplicationFlags::HANDLES_COMMAND_LINE)
