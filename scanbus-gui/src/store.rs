@@ -7,7 +7,10 @@ use zbus::zvariant::{OwnedValue, Value as ZValue};
 pub type Dict = HashMap<String, OwnedValue>;
 pub type ManagedSnapshot = HashMap<String, HashMap<String, Dict>>;
 
-const SCANNER_INTERFACE: &str = "org.scanbus.Scanner1";
+/// `pub(crate)` for the widget checks in `scanners.rs`, which drive this store
+/// with the same wire dicts a running daemon sends rather than with `ScannerEntry`
+/// literals; every other interface name below stays private to this module.
+pub(crate) const SCANNER_INTERFACE: &str = "org.scanbus.Scanner1";
 const BUTTON_INTERFACE: &str = "org.scanbus.Button1";
 const JOB_INTERFACE: &str = "org.scanbus.Job1";
 const PROFILE_INTERFACE: &str = "org.scanbus.Profile1";

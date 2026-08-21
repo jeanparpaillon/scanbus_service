@@ -154,16 +154,16 @@ impl ScanbusWindow {
 
         // The three pages of `page_stack`, added by instance because `window.blp`
         // declares the stack empty: a `Gtk.StackPage` there has to name a child *class*,
-        // and only Settings has one — the two panes below become subclasses with [10.20]
-        // and [10.23]. `add_named` takes an instance and so does not care what class it
-        // is, which is what lets the stack be filled before they land.
+        // and a builder-instantiated child gets no constructor arguments — all three
+        // pages are handed the store and the bus channel when they are built. `add_named`
+        // takes an instance and so does not care what class it is, which is what lets
+        // Profiles sit in the same stack while it is still a plain widget ([10.23]).
         let model = Rc::clone(imp.scanners.get().expect("scanners set just above"));
         let commands = imp.commands.get().expect("commands set just above").clone();
 
         let scanners_pane = ScannersPane::new(Rc::clone(&model), commands.clone());
         let profiles_page = Rc::new(ProfilesPage::new(commands.clone()));
-        imp.page_stack
-            .add_named(scanners_pane.widget(), Some("scanners"));
+        imp.page_stack.add_named(&scanners_pane, Some("scanners"));
         imp.page_stack
             .add_named(profiles_page.widget(), Some("profiles"));
         imp.page_stack.add_named(

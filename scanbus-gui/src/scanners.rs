@@ -1,19 +1,24 @@
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 
+use async_channel::Sender;
 use gio::ListStore;
-use glib::subclass::prelude::*;
 use gtk::gio;
 use gtk::glib;
+use gtk::{CompositeTemplate, TemplateChild};
 use gtk4 as gtk;
 use libadwaita as adw;
 use libadwaita::prelude::*;
+// Brings in gtk4's subclass prelude, and glib's through it, so `BoxImpl` arrives
+// alongside the `ObjectSubclass`/`ObjectImpl` the two subclasses in this file need.
+use libadwaita::subclass::prelude::*;
 use scanbus_core::{PairingState, ProfileKind, Status};
 
 use crate::bus::BusCommand;
 use crate::buttons::ButtonsPage;
 use crate::details::DetailsPane;
+use crate::scanner_row::ScannerRow;
 use crate::store::{
     DiscoveryState, ProfileEntry, ScannerEntry, ServiceDetails, ServiceState, Store, StoreEvent,
 };
@@ -458,33 +463,101 @@ impl ScannerListModel {
     }
 }
 
-pub struct ScannersPane {
-    root: gtk::Box,
+/// The private instance struct GObject owns for the pane; [`ScannersPane`] is the handle
+/// `ScanbusWindow` holds.
+mod scanners_pane {
+    use super::*;
+
+    // No `Debug`, for the reason `window.rs` gives: half the handles below are plain Rust
+    // types that do not derive it.
+    #[derive(Default, CompositeTemplate)]
+    #[template(resource = "/org/scanbus/Gui/ui/scanners-pane.ui")]
+    pub struct ScannersPane {
+        #[template_child]
+        pub service_banner: TemplateChild<gtk::Revealer>,
+        #[template_child]
+        pub scanners_stack: TemplateChild<gtk::Stack>,
+        #[template_child]
+        pub paired_group: TemplateChild<adw::PreferencesGroup>,
+        #[template_child]
+        pub paired_list: TemplateChild<gtk::ListBox>,
+        #[template_child]
+        pub discovered_group: TemplateChild<adw::PreferencesGroup>,
+        #[template_child]
+        pub discovered_list: TemplateChild<gtk::ListBox>,
+        /// Declared with its placeholder page only; `new` adds the other two.
+        #[template_child]
+        pub detail_stack: TemplateChild<gtk::Stack>,
+
+        /// The two handles every callback on this pane needs, as `OnceCell`s for the
+        /// reason `window.rs` gives: neither is a `glib::Value`.
+        pub model: OnceCell<Rc<ScannerListModel>>,
+        pub commands: OnceCell<Sender<BusCommand>>,
+
+        /// The two filtered views of the one store list. Held because `render` asks each
+        /// for `n_items` — that count, and not the store's, is what decides whether a
+        /// group is on screen.
+        pub paired_model: OnceCell<gtk::FilterListModel>,
+        pub discovered_model: OnceCell<gtk::FilterListModel>,
+
+        /// The two panes `detail_stack` shows, which are not template classes yet
+        /// ([10.21] and [10.24]). Held rather than looked up out of the stack, because
+        /// `render` calls `render`/`clear` on each — methods the stack's `gtk::Widget`
+        /// does not have.
+        pub details: OnceCell<Rc<DetailsPane>>,
+        pub buttons_page: OnceCell<Rc<ButtonsPage>>,
+    }
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for ScannersPane {
+        /// Must match `template $ScannersPane` in `scanners-pane.blp`.
+        const NAME: &'static str = "ScannersPane";
+        type Type = super::ScannersPane;
+        type ParentType = gtk::Box;
+
+        fn class_init(klass: &mut Self::Class) {
+            klass.bind_template();
+            // Instance callbacks, as in `window.rs`: the `#[gtk::template_callbacks]`
+            // block is on the wrapper type.
+            klass.bind_template_instance_callbacks();
+        }
+
+        fn instance_init(obj: &glib::subclass::InitializingObject<Self>) {
+            obj.init_template();
+        }
+    }
+
+    impl ObjectImpl for ScannersPane {}
+    impl WidgetImpl for ScannersPane {}
+    impl BoxImpl for ScannersPane {}
+}
+
+glib::wrapper! {
+    /// The Scanners page, built from `scanners-pane.blp` and written from the store.
+    pub struct ScannersPane(ObjectSubclass<scanners_pane::ScannersPane>)
+        @extends gtk::Box, gtk::Widget,
+        @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget, gtk::Orientable;
 }
 
 impl ScannersPane {
-    pub fn new(model: Rc<ScannerListModel>, commands: async_channel::Sender<BusCommand>) -> Self {
-        let service_banner = gtk::Revealer::builder()
-            .transition_type(gtk::RevealerTransitionType::SlideDown)
-            .reveal_child(false)
-            .build();
-        let service_banner_body = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        service_banner_body.add_css_class("toolbar");
-        service_banner_body.set_margin_top(12);
-        service_banner_body.set_margin_bottom(12);
-        service_banner_body.set_margin_start(18);
-        service_banner_body.set_margin_end(18);
-        let service_banner_label = gtk::Label::new(Some("Scanbus service is not running"));
-        service_banner_label.set_xalign(0.0);
-        service_banner_body.append(&service_banner_label);
-        service_banner.set_child(Some(&service_banner_body));
+    /// Builds the pane, binds both lists to their filtered views of the store, and fills
+    /// the detail stack.
+    pub fn new(model: Rc<ScannerListModel>, commands: Sender<BusCommand>) -> Self {
+        let pane: Self = glib::Object::new();
 
-        let empty_state = adw::StatusPage::builder()
-            .title("No scanners yet")
-            .description("Find scanners…")
-            .build();
-        empty_state.set_vexpand(true);
+        // Empty cells: the object was built on the line above and this is its only
+        // constructor, so no `set` below can fail — see the note in `window.rs`.
+        let imp = pane.imp();
+        assert!(imp.model.set(Rc::clone(&model)).is_ok(), "model set twice");
+        assert!(
+            imp.commands.set(commands.clone()).is_ok(),
+            "commands set twice"
+        );
 
+        // The model is not shape, so it stays here rather than in the `.blp`: one
+        // `ListStore` in the store, two `CustomFilter`s over it, and a `FilterListModel`
+        // per list. Filtering rather than keeping two stores is what lets a scanner move
+        // from Discovered to Paired without being destroyed and rebuilt.
         let paired_filter = gtk::CustomFilter::new(|item| {
             item.downcast_ref::<ScannerObject>()
                 .is_some_and(ScannerObject::paired)
@@ -493,271 +566,318 @@ impl ScannersPane {
             item.downcast_ref::<ScannerObject>()
                 .is_some_and(|scanner| !scanner.paired())
         });
-
-        let paired_model =
-            gtk::FilterListModel::new(Some(model.list()), Some(paired_filter.clone()));
+        let paired_model = gtk::FilterListModel::new(Some(model.list()), Some(paired_filter));
         let discovered_model =
-            gtk::FilterListModel::new(Some(model.list()), Some(discovered_filter.clone()));
+            gtk::FilterListModel::new(Some(model.list()), Some(discovered_filter));
 
-        let paired_group = adw::PreferencesGroup::builder()
-            .title("Paired scanners")
-            .build();
-        let paired_list = gtk::ListBox::new();
-        paired_list.add_css_class("boxed-list");
-        paired_list.set_selection_mode(gtk::SelectionMode::Single);
-        paired_list.bind_model(Some(&paired_model), {
+        // Both factories are a downcast and one `ScannerRow::new`, and nothing else.
+        // That is the in-place rule of §3: work done in a factory is work that runs again
+        // every time the model changes, and the row — with its selection and its pairing
+        // progress — is what would be thrown away to do it. These two calls are also the
+        // only callers `ScannerRow::new` is meant to have.
+        imp.paired_list.bind_model(Some(&paired_model), {
             let commands = commands.clone();
             let model = Rc::clone(&model);
-            move |item| scanner_row(item, commands.clone(), Rc::clone(&model))
+            move |item| {
+                ScannerRow::new(&scanner_item(item), commands.clone(), Rc::clone(&model)).upcast()
+            }
         });
-        paired_group.add(&paired_list);
-
-        let discovered_group = adw::PreferencesGroup::builder()
-            .title("Discovered scanners")
-            .build();
-        let discovery_caption = gtk::Label::new(None);
-        discovery_caption.add_css_class("dim-label");
-        discovery_caption.set_xalign(0.0);
-        let discovered_list = gtk::ListBox::new();
-        discovered_list.add_css_class("boxed-list");
-        discovered_list.set_selection_mode(gtk::SelectionMode::Single);
-        discovered_list.bind_model(Some(&discovered_model), {
+        imp.discovered_list.bind_model(Some(&discovered_model), {
             let commands = commands.clone();
             let model = Rc::clone(&model);
-            move |item| scanner_row(item, commands.clone(), Rc::clone(&model))
+            move |item| {
+                ScannerRow::new(&scanner_item(item), commands.clone(), Rc::clone(&model)).upcast()
+            }
         });
-        discovered_group.add(&discovered_list);
 
-        let lists = gtk::Box::new(gtk::Orientation::Vertical, 18);
-        lists.set_margin_top(24);
-        lists.set_margin_bottom(24);
-        lists.set_margin_start(24);
-        lists.set_margin_end(24);
-        lists.append(&paired_group);
-        lists.append(&discovered_group);
+        assert!(
+            imp.paired_model.set(paired_model).is_ok(),
+            "paired model set twice"
+        );
+        assert!(
+            imp.discovered_model.set(discovered_model).is_ok(),
+            "discovered model set twice"
+        );
 
-        let scroller = gtk::ScrolledWindow::builder()
-            .hscrollbar_policy(gtk::PolicyType::Never)
-            .min_content_width(420)
-            .child(&lists)
-            .build();
-        scroller.set_hexpand(true);
-        scroller.set_vexpand(true);
-
-        let detail_placeholder = adw::StatusPage::builder()
-            .title("No scanner selected")
-            .description("Select a scanner to inspect it")
-            .build();
-
+        // The two pages `scanners-pane.blp` leaves out, added by instance for the reason
+        // the `.blp` gives there: neither class exists to the builder yet, and both are
+        // built with the bus channel a builder-instantiated child could not be given.
         let details = Rc::new(DetailsPane::new());
+        let buttons_page = Rc::new(ButtonsPage::new(commands));
+        imp.detail_stack.add_named(
+            &gtk::ScrolledWindow::builder()
+                .hscrollbar_policy(gtk::PolicyType::Never)
+                .min_content_width(360)
+                .child(details.widget())
+                .build(),
+            Some("details"),
+        );
+        imp.detail_stack.add_named(
+            &gtk::ScrolledWindow::builder()
+                .hscrollbar_policy(gtk::PolicyType::Never)
+                .min_content_width(360)
+                .child(buttons_page.widget())
+                .build(),
+            Some("buttons"),
+        );
+        assert!(imp.details.set(details).is_ok(), "details set twice");
+        assert!(
+            imp.buttons_page.set(buttons_page).is_ok(),
+            "buttons page set twice"
+        );
 
-        let detail_scroller = gtk::ScrolledWindow::builder()
-            .hscrollbar_policy(gtk::PolicyType::Never)
-            .min_content_width(360)
-            .child(details.widget())
-            .build();
-
-        let buttons_page = Rc::new(ButtonsPage::new(commands.clone()));
-
-        let buttons_scroller = gtk::ScrolledWindow::builder()
-            .hscrollbar_policy(gtk::PolicyType::Never)
-            .min_content_width(360)
-            .child(buttons_page.widget())
-            .build();
-
-        let detail_stack = gtk::Stack::new();
-        detail_stack.add_named(&detail_placeholder, Some("placeholder"));
-        detail_stack.add_named(&detail_scroller, Some("details"));
-        detail_stack.add_named(&buttons_scroller, Some("buttons"));
-        detail_stack.set_visible_child_name("placeholder");
-
-        let content = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        content.set_vexpand(true);
-        content.append(&scroller);
-        content.append(&gtk::Separator::new(gtk::Orientation::Vertical));
-        content.append(&detail_stack);
-
-        let stack = gtk::Stack::new();
-        stack.add_named(&content, Some("content"));
-        stack.add_named(&empty_state, Some("empty"));
-        stack.set_vexpand(true);
-
-        let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        root.append(&service_banner);
-        root.append(&stack);
-        root.set_hexpand(true);
-        root.set_vexpand(true);
-
+        // The three callbacks the two sub-panes raise. Each holds a weak handle: this pane
+        // owns both sub-panes through the cells just filled, and each sub-pane keeps every
+        // callback it is given for its own lifetime, so a strong `self` would be a cycle
+        // and the pane would never be finalised.
         {
-            let model = Rc::clone(&model);
-            let discovered_list = discovered_list.clone();
-            paired_list.connect_row_selected(move |list, row| {
-                if let Some(row) = row {
-                    discovered_list.unselect_all();
-                    model.set_selected_path(Some(row.widget_name().to_string()));
-                } else if list.selected_row().is_none() {
-                    model.set_selected_path(None);
-                }
-            });
-        }
-
-        {
-            let model = Rc::clone(&model);
-            let paired_list = paired_list.clone();
-            discovered_list.connect_row_selected(move |list, row| {
-                if let Some(row) = row {
-                    paired_list.unselect_all();
-                    model.set_selected_path(Some(row.widget_name().to_string()));
-                } else if list.selected_row().is_none() {
-                    model.set_selected_path(None);
-                }
-            });
-        }
-
-        {
-            let model_for_callback = Rc::clone(&model);
-            let stack = stack.clone();
-            let service_banner = service_banner.clone();
-            let paired_group = paired_group.clone();
-            let discovered_group = discovered_group.clone();
-            let discovery_caption = discovery_caption.clone();
-            let detail_stack = detail_stack.clone();
-            let details = Rc::clone(&details);
-            let buttons_page = Rc::clone(&buttons_page);
-            model.connect_changed(move || {
-                let paired_count = paired_model.n_items();
-                let discovered_count = discovered_model.n_items();
-                let discovery_state = model_for_callback.discovery_state();
-
-                paired_group.set_visible(paired_count > 0);
-                discovered_group.set_visible(discovered_count > 0);
-                service_banner
-                    .set_reveal_child(model_for_callback.service_state() == ServiceState::Absent);
-                stack.set_visible_child_name(if model_for_callback.has_scanners() {
-                    "content"
-                } else {
-                    "empty"
-                });
-
-                if let Some(path) = model_for_callback.selected_path()
-                    && let Some(scanner) = model_for_callback.scanner(&path)
-                {
-                    details.render(&scanner);
-                    buttons_page.render(&scanner, &model_for_callback.profiles());
-                    if detail_stack.visible_child_name().as_deref() == Some("placeholder") {
-                        detail_stack.set_visible_child_name("details");
-                    }
-                    if !scanner.state.paired
-                        && detail_stack.visible_child_name().as_deref() == Some("buttons")
+            let weak = pane.downgrade();
+            imp.details
+                .get()
+                .expect("details set just above")
+                .connect_configure(move || {
+                    let Some(pane) = weak.upgrade() else {
+                        return;
+                    };
+                    let imp = pane.imp();
+                    let model = imp.model.get().expect("model set in `new`");
+                    // Configure is only reachable for a paired scanner; the check is
+                    // against the store rather than against the row, because the scanner
+                    // may have been unpaired since the pane was last written.
+                    if model
+                        .selected_path()
+                        .and_then(|path| model.scanner(&path))
+                        .is_some_and(|scanner| scanner.state.paired)
                     {
-                        detail_stack.set_visible_child_name("details");
-                    }
-                } else {
-                    details.clear();
-                    buttons_page.clear();
-                    detail_stack.set_visible_child_name("placeholder");
-                }
-
-                let caption =
-                    discovery_caption_text(discovery_state, model_for_callback.discovered_count());
-                discovery_caption.set_label(&caption);
-                discovered_group.set_description(match discovery_state {
-                    DiscoveryState::Idle => None,
-                    DiscoveryState::Starting
-                    | DiscoveryState::Active
-                    | DiscoveryState::Stopping => Some(caption.as_str()),
-                });
-            });
-        }
-
-        // Seed the derived visibility once the widgets exist without erasing a
-        // programmatic selection that may already have been requested.
-        model.refresh();
-
-        {
-            let detail_stack = detail_stack.clone();
-            let model = Rc::clone(&model);
-            details.connect_configure(move || {
-                if model
-                    .selected_path()
-                    .and_then(|path| model.scanner(&path))
-                    .is_some_and(|scanner| scanner.state.paired)
-                {
-                    detail_stack.set_visible_child_name("buttons");
-                }
-            });
-        }
-
-        {
-            let detail_stack = detail_stack.clone();
-            buttons_page.connect_back(move || {
-                detail_stack.set_visible_child_name("details");
-            });
-        }
-
-        {
-            let model = Rc::clone(&model);
-            let commands = commands.clone();
-            let parent = root.clone();
-            details.connect_unpair(move || {
-                let Some(path) = model.selected_path() else {
-                    return;
-                };
-                let Some(scanner) = model.scanner(&path) else {
-                    return;
-                };
-
-                let window = gtk::Window::builder()
-                    .modal(true)
-                    .title("Unpair scanner?")
-                    .build();
-                let body = gtk::Label::new(Some(&format!(
-                    "Unpairing {} removes its saved pairing information.",
-                    scanner.state.name
-                )));
-                body.set_wrap(true);
-                body.set_xalign(0.0);
-                body.set_margin_top(18);
-                body.set_margin_bottom(18);
-                body.set_margin_start(18);
-                body.set_margin_end(18);
-
-                let actions = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-                actions.set_halign(gtk::Align::End);
-                let cancel = gtk::Button::with_label("Cancel");
-                let destructive = gtk::Button::with_label("Unpair");
-                destructive.add_css_class("destructive-action");
-                actions.append(&cancel);
-                actions.append(&destructive);
-
-                let content = gtk::Box::new(gtk::Orientation::Vertical, 18);
-                content.append(&body);
-                content.append(&actions);
-                window.set_child(Some(&content));
-                window.set_transient_for(parent.root().and_downcast_ref::<gtk::Window>());
-
-                cancel.connect_clicked({
-                    let window = window.clone();
-                    move |_| window.close()
-                });
-                destructive.connect_clicked({
-                    let commands = commands.clone();
-                    let window = window.clone();
-                    move |_| {
-                        let _ = commands.try_send(BusCommand::Unpair { path: path.clone() });
-                        window.close();
+                        imp.detail_stack.set_visible_child_name("buttons");
                     }
                 });
-                window.present();
-            });
         }
 
-        Self { root }
+        {
+            let weak = pane.downgrade();
+            imp.buttons_page
+                .get()
+                .expect("buttons page set just above")
+                .connect_back(move || {
+                    if let Some(pane) = weak.upgrade() {
+                        pane.imp().detail_stack.set_visible_child_name("details");
+                    }
+                });
+        }
+
+        {
+            let weak = pane.downgrade();
+            imp.details
+                .get()
+                .expect("details set just above")
+                .connect_unpair(move || {
+                    if let Some(pane) = weak.upgrade() {
+                        pane.confirm_unpair();
+                    }
+                });
+        }
+
+        // Registered once, here, rather than from a `#[template_callback]`: `render` is
+        // driven by the store rather than by a signal on any widget of this pane. Weak
+        // again, and for the same reason `settings.rs` gives — `ScannerListModel` keeps
+        // every callback it is given for its own lifetime.
+        let weak = pane.downgrade();
+        model.connect_changed(move || {
+            if let Some(pane) = weak.upgrade() {
+                pane.render();
+            }
+        });
+
+        // Seeds the derived visibility now the widgets exist. It is a `render` and not a
+        // `ScannerListModel::refresh` because nothing about the store has changed: a
+        // programmatic selection may already have been requested, and every other view of
+        // it is written by its own registration.
+        pane.render();
+
+        pane
     }
 
-    pub fn widget(&self) -> &gtk::Box {
-        &self.root
+    /// Writes everything on this pane that is derived from the store: the banner, both
+    /// group headers, the empty state, and which detail page is up.
+    ///
+    /// The rows themselves are not written here — each is bound to its own
+    /// `ScannerObject` and repaints itself, which is the whole of why a `Status` change
+    /// does not move the selection.
+    fn render(&self) {
+        let imp = self.imp();
+        let model = imp.model.get().expect("model set in `new`");
+        let details = imp.details.get().expect("details set in `new`");
+        let buttons_page = imp.buttons_page.get().expect("buttons page set in `new`");
+
+        let paired_count = imp
+            .paired_model
+            .get()
+            .expect("paired model set in `new`")
+            .n_items();
+        let discovered_count = imp
+            .discovered_model
+            .get()
+            .expect("discovered model set in `new`")
+            .n_items();
+        let discovery_state = model.discovery_state();
+
+        imp.paired_group.set_visible(paired_count > 0);
+        imp.discovered_group.set_visible(discovered_count > 0);
+        imp.service_banner
+            .set_reveal_child(model.service_state() == ServiceState::Absent);
+        imp.scanners_stack
+            .set_visible_child_name(if model.has_scanners() {
+                "content"
+            } else {
+                "empty"
+            });
+
+        if let Some(path) = model.selected_path()
+            && let Some(scanner) = model.scanner(&path)
+        {
+            details.render(&scanner);
+            buttons_page.render(&scanner, &model.profiles());
+            if imp.detail_stack.visible_child_name().as_deref() == Some("placeholder") {
+                imp.detail_stack.set_visible_child_name("details");
+            }
+            // A scanner unpaired while its buttons page was up has no buttons to
+            // configure any more.
+            if !scanner.state.paired
+                && imp.detail_stack.visible_child_name().as_deref() == Some("buttons")
+            {
+                imp.detail_stack.set_visible_child_name("details");
+            }
+        } else {
+            details.clear();
+            buttons_page.clear();
+            imp.detail_stack.set_visible_child_name("placeholder");
+        }
+
+        // The discovered group's description is where the "Finding scanners… N found"
+        // caption is written: it is a header on the group it counts, so there is no
+        // caption widget of its own.
+        let caption = discovery_caption_text(discovery_state, model.discovered_count());
+        imp.discovered_group.set_description(match discovery_state {
+            DiscoveryState::Idle => None,
+            DiscoveryState::Starting | DiscoveryState::Active | DiscoveryState::Stopping => {
+                Some(caption.as_str())
+            }
+        });
     }
+
+    /// The confirmation the detail pane's *Unpair* row raises.
+    ///
+    /// Still built by hand rather than from `unpair-dialog.blp`: its body names the
+    /// scanner, and the whole dialog exists only for the length of one answer. The
+    /// transient parent is looked up through `self.root()`, which is why this is a method
+    /// on the pane and not a free function.
+    fn confirm_unpair(&self) {
+        let imp = self.imp();
+        let model = imp.model.get().expect("model set in `new`");
+        let commands = imp.commands.get().expect("commands set in `new`").clone();
+
+        let Some(path) = model.selected_path() else {
+            return;
+        };
+        let Some(scanner) = model.scanner(&path) else {
+            return;
+        };
+
+        let window = gtk::Window::builder()
+            .modal(true)
+            .title("Unpair scanner?")
+            .build();
+        let body = gtk::Label::new(Some(&format!(
+            "Unpairing {} removes its saved pairing information.",
+            scanner.state.name
+        )));
+        body.set_wrap(true);
+        body.set_xalign(0.0);
+        body.set_margin_top(18);
+        body.set_margin_bottom(18);
+        body.set_margin_start(18);
+        body.set_margin_end(18);
+
+        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        actions.set_halign(gtk::Align::End);
+        let cancel = gtk::Button::with_label("Cancel");
+        let destructive = gtk::Button::with_label("Unpair");
+        destructive.add_css_class("destructive-action");
+        actions.append(&cancel);
+        actions.append(&destructive);
+
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 18);
+        content.append(&body);
+        content.append(&actions);
+        window.set_child(Some(&content));
+        window.set_transient_for(self.root().and_downcast_ref::<gtk::Window>());
+
+        cancel.connect_clicked({
+            let window = window.clone();
+            move |_| window.close()
+        });
+        destructive.connect_clicked({
+            let window = window.clone();
+            move |_| {
+                let _ = commands.try_send(BusCommand::Unpair { path: path.clone() });
+                window.close();
+            }
+        });
+        window.present();
+    }
+}
+
+/// The two handlers `scanners-pane.blp` names.
+///
+/// Both are declared `swapped` there, which is what puts the pane in `&self`; the
+/// emitting list box is the argument that gets dropped, and the pane reaches it again
+/// through `self.imp()` when it needs to.
+#[gtk::template_callbacks]
+impl ScannersPane {
+    /// Clears the discovered list's selection, then tells the store which scanner is
+    /// selected.
+    ///
+    /// The `unselect_all` makes the mirror handler below fire with `None`, which is what
+    /// the second arm guards: it reports "nothing selected" only when its *own* list has
+    /// nothing selected either, so the pair of handlers does not erase the selection the
+    /// other one has just made.
+    #[template_callback]
+    fn on_paired_selected(&self, row: Option<gtk::ListBoxRow>) {
+        let imp = self.imp();
+        let model = imp.model.get().expect("model set in `new`");
+
+        if let Some(row) = row {
+            imp.discovered_list.unselect_all();
+            model.set_selected_path(Some(row.widget_name().to_string()));
+        } else if imp.paired_list.selected_row().is_none() {
+            model.set_selected_path(None);
+        }
+    }
+
+    /// Mirror of [`Self::on_paired_selected`].
+    #[template_callback]
+    fn on_discovered_selected(&self, row: Option<gtk::ListBoxRow>) {
+        let imp = self.imp();
+        let model = imp.model.get().expect("model set in `new`");
+
+        if let Some(row) = row {
+            imp.paired_list.unselect_all();
+            model.set_selected_path(Some(row.widget_name().to_string()));
+        } else if imp.discovered_list.selected_row().is_none() {
+            model.set_selected_path(None);
+        }
+    }
+}
+
+/// The one line of either `bind_model` factory that is not `ScannerRow::new`.
+///
+/// A `Gtk.FilterListModel` over the store's `ListStore` yields nothing else, so a failure
+/// here is a filter pointed at the wrong model rather than anything a user could cause.
+fn scanner_item(item: &glib::Object) -> ScannerObject {
+    item.clone()
+        .downcast::<ScannerObject>()
+        .expect("the filtered model should contain ScannerObject")
 }
 
 pub fn discovery_caption_text(state: DiscoveryState, discovered_count: usize) -> String {
@@ -772,204 +892,6 @@ pub fn discovery_caption_text(state: DiscoveryState, discovered_count: usize) ->
             format!("Finding scanners... {discovered_count} {noun} found")
         }
     }
-}
-
-fn scanner_row(
-    item: &glib::Object,
-    commands: async_channel::Sender<BusCommand>,
-    model: Rc<ScannerListModel>,
-) -> gtk::Widget {
-    let scanner = item
-        .clone()
-        .downcast::<ScannerObject>()
-        .expect("preferences group model should contain ScannerObject");
-
-    let title = gtk::Label::new(None);
-    title.set_xalign(0.0);
-    title.add_css_class("heading");
-    scanner
-        .bind_property("name", &title, "label")
-        .sync_create()
-        .build();
-
-    let subtitle = gtk::Label::new(None);
-    subtitle.set_xalign(0.0);
-    subtitle.add_css_class("dim-label");
-    scanner
-        .bind_property("status-line", &subtitle, "label")
-        .sync_create()
-        .build();
-
-    let text = gtk::Box::new(gtk::Orientation::Vertical, 4);
-    text.append(&title);
-    text.append(&subtitle);
-
-    let pair_button = gtk::Button::with_label("Pair");
-    pair_button.set_valign(gtk::Align::Center);
-
-    let spinner = gtk::Spinner::new();
-    spinner.set_halign(gtk::Align::Start);
-
-    let progress_label = gtk::Label::new(None);
-    progress_label.set_xalign(0.0);
-    progress_label.add_css_class("dim-label");
-    progress_label.set_wrap(true);
-
-    let progress_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    progress_box.append(&spinner);
-    progress_box.append(&progress_label);
-
-    let confirm_label = gtk::Label::new(Some("Confirm on your device"));
-    confirm_label.set_xalign(0.0);
-
-    let code_label = gtk::Label::new(None);
-    code_label.add_css_class("title-2");
-    code_label.add_css_class("monospace");
-    code_label.set_xalign(0.0);
-
-    let confirm_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
-    confirm_box.append(&confirm_label);
-    confirm_box.append(&code_label);
-
-    let failure_message = gtk::Label::new(None);
-    let failure_banner = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    failure_banner.add_css_class("error");
-    failure_banner.add_css_class("card");
-    failure_banner.set_margin_top(6);
-    failure_banner.set_margin_bottom(6);
-    failure_banner.set_margin_start(12);
-    failure_banner.set_margin_end(12);
-    failure_message.set_wrap(true);
-    failure_message.set_xalign(0.0);
-    failure_message.set_margin_top(10);
-    failure_message.set_margin_bottom(10);
-    failure_message.set_margin_start(10);
-    failure_message.set_margin_end(10);
-    failure_banner.append(&failure_message);
-
-    let failure_details_label = gtk::Label::new(None);
-    failure_details_label.set_selectable(true);
-    failure_details_label.set_wrap(true);
-    failure_details_label.set_xalign(0.0);
-
-    let failure_details = gtk::Expander::new(Some("Details"));
-    failure_details.set_child(Some(&failure_details_label));
-    failure_details.set_expanded(false);
-
-    let failure_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
-    failure_box.append(&failure_banner);
-    failure_box.append(&failure_details);
-
-    let state_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    state_box.append(&progress_box);
-    state_box.append(&confirm_box);
-    state_box.append(&failure_box);
-    pair_button.connect_clicked({
-        let scanner = scanner.clone();
-        move |_| {
-            let path = scanner.path();
-            match scanner.pairing_state().as_str() {
-                "pairing" | "installing_backend" | "awaiting_confirmation" => {
-                    let _ = commands.try_send(BusCommand::CancelPairing { path });
-                }
-                _ => {
-                    let _ = commands.try_send(BusCommand::Pair { path });
-                }
-            }
-        }
-    });
-
-    let row_box = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-    row_box.append(&text);
-    row_box.append(&gtk::Box::builder().hexpand(true).build());
-    row_box.append(&pair_button);
-
-    let outer = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    outer.set_margin_top(12);
-    outer.set_margin_bottom(12);
-    outer.set_margin_start(12);
-    outer.set_margin_end(12);
-    outer.append(&row_box);
-    outer.append(&state_box);
-
-    let update_row = {
-        let scanner = scanner.clone();
-        let pair_button = pair_button.clone();
-        let spinner = spinner.clone();
-        let progress_box = progress_box.clone();
-        let progress_label = progress_label.clone();
-        let confirm_box = confirm_box.clone();
-        let code_label = code_label.clone();
-        let failure_box = failure_box.clone();
-        let failure_banner = failure_banner.clone();
-        let failure_message = failure_message.clone();
-        let failure_details_label = failure_details_label.clone();
-        move || {
-            let paired = scanner.paired();
-            let pairing = scanner.pairing_state();
-            let code = scanner.pairing_code();
-            let error = scanner.pairing_error();
-
-            pair_button.set_visible(!paired);
-            pair_button.set_sensitive(!paired || pairing == "failed");
-
-            progress_box.set_visible(false);
-            confirm_box.set_visible(false);
-            failure_box.set_visible(false);
-            spinner.set_visible(false);
-            spinner.set_spinning(false);
-            failure_banner.set_visible(false);
-
-            match pairing.as_str() {
-                "pairing" => {
-                    pair_button.set_label("Cancel");
-                    progress_box.set_visible(true);
-                    spinner.set_visible(true);
-                    spinner.set_spinning(true);
-                    progress_label.set_label("Pairing in progress");
-                }
-                "installing_backend" => {
-                    pair_button.set_label("Cancel");
-                    progress_box.set_visible(true);
-                    spinner.set_visible(true);
-                    spinner.set_spinning(true);
-                    progress_label.set_label(&format!(
-                        "Installing {} backend…",
-                        humanize_backend(&scanner.backend())
-                    ));
-                }
-                "awaiting_confirmation" => {
-                    pair_button.set_label("Cancel");
-                    confirm_box.set_visible(true);
-                    code_label.set_label(&code);
-                }
-                "failed" => {
-                    pair_button.set_label("Try again");
-                    failure_box.set_visible(true);
-                    failure_banner.set_visible(true);
-                    failure_message.set_label("Pairing failed");
-                    failure_details_label.set_label(&error);
-                }
-                _ => {
-                    pair_button.set_label("Pair");
-                }
-            }
-        }
-    };
-
-    update_row();
-    scanner.connect_notify_local(None, move |_, _| update_row());
-
-    let row = gtk::ListBoxRow::new();
-    row.set_child(Some(&outer));
-    row.set_selectable(true);
-    row.set_activatable(true);
-    row.set_widget_name(&scanner.path());
-    row.connect_activate({
-        let path = scanner.path();
-        move |_| model.set_selected_path(Some(path.clone()))
-    });
-    row.upcast()
 }
 
 fn pairing_state_name(state: &PairingState) -> &'static str {
@@ -1129,5 +1051,251 @@ mod tests {
         assert_eq!(humanize_backend("brother-skey"), "Brother");
         assert_eq!(humanize_backend("hplip"), "HPLIP");
         assert_eq!(humanize_backend("mobile"), "Mobile");
+    }
+}
+
+/// The Scanners pane's half of the one GTK test — see [`crate::gtk_tests`].
+///
+/// Two instantiations, and the second is the reason the first is here: `ScannersPane`
+/// fills its `#[template_child]`s from `scanners-pane.blp`, and every `ScannerRow` the
+/// two `bind_model` factories build fills its own from `scanner-row.blp`. An id renamed
+/// or dropped in either fails here rather than on a pane a user opens.
+///
+/// The store is driven with wire dicts rather than with `ScannerEntry` literals: it is
+/// the same path a running daemon takes, so a decode this crate gets wrong is a failure
+/// here too — the argument `options.rs` makes for its own fixtures.
+#[cfg(all(test, feature = "gtk-tests"))]
+pub(crate) mod widget_checks {
+    use scanbus_core::{ScannerId, path};
+    use zbus::zvariant::{OwnedValue, Value as ZValue};
+
+    use super::*;
+    use crate::store::{Dict, SCANNER_INTERFACE};
+
+    fn owned(value: ZValue<'_>) -> OwnedValue {
+        OwnedValue::try_from(value).expect("the fixture must be a D-Bus value")
+    }
+
+    fn scanner_id(address: &str) -> ScannerId {
+        ScannerId::from_backend("mock", address).expect("a well-formed mock id")
+    }
+
+    /// A `Scanner1` property set, as `Properties.GetAll` would answer it.
+    fn scanner_dict(address: &str, name: &str, paired: bool) -> Dict {
+        HashMap::from([
+            (
+                "Id".to_owned(),
+                owned(ZValue::from(scanner_id(address).as_str())),
+            ),
+            ("Name".to_owned(), owned(ZValue::from(name))),
+            (
+                "Backend".to_owned(),
+                owned(ZValue::from("proprietary:brother")),
+            ),
+            ("Address".to_owned(), owned(ZValue::from(address))),
+            (
+                "Capabilities".to_owned(),
+                owned(ZValue::from(HashMap::<String, OwnedValue>::new())),
+            ),
+            (
+                "SupportedProfiles".to_owned(),
+                owned(ZValue::from(vec!["document".to_owned()])),
+            ),
+            ("Paired".to_owned(), owned(ZValue::from(paired))),
+            // Connected only where paired: an unpaired scanner has nothing to connect
+            // with, and the status line says so.
+            ("Connected".to_owned(), owned(ZValue::from(paired))),
+            ("Status".to_owned(), owned(ZValue::from("online"))),
+            ("DefaultProfile".to_owned(), owned(ZValue::from("document"))),
+            ("PairingState".to_owned(), owned(ZValue::from("none"))),
+            ("PairingError".to_owned(), owned(ZValue::from(""))),
+            (
+                "PairingInfo".to_owned(),
+                owned(ZValue::from(HashMap::<String, OwnedValue>::new())),
+            ),
+        ])
+    }
+
+    fn snapshot(scanners: &[(&str, &str, bool)]) -> StoreEvent {
+        StoreEvent::Replace(
+            scanners
+                .iter()
+                .map(|(address, name, paired)| {
+                    (
+                        path::scanner(&scanner_id(address)),
+                        HashMap::from([(
+                            SCANNER_INTERFACE.to_owned(),
+                            scanner_dict(address, name, *paired),
+                        )]),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    fn row_at(list: &gtk::ListBox, index: i32) -> ScannerRow {
+        list.row_at_index(index)
+            .unwrap_or_else(|| panic!("no row at index {index}"))
+            .downcast::<ScannerRow>()
+            .expect("the factories build `ScannerRow`s, and a `Gtk.ListBox` wraps nothing else")
+    }
+
+    pub(crate) fn run() {
+        let model = Rc::new(ScannerListModel::new());
+        // The receiver is kept: a dropped one closes the channel, and every `try_send` in
+        // this file and in `scanner_row.rs` ignores its error, so the buttons below would
+        // still look as though they had sent something.
+        let (commands, sent) = async_channel::unbounded();
+        let pane = ScannersPane::new(Rc::clone(&model), commands);
+        let imp = pane.imp();
+
+        // A store that has answered nothing yet. `new` calls `render` once, so the empty
+        // state is on screen rather than the content page the template happens to declare
+        // first.
+        assert_eq!(
+            imp.scanners_stack.visible_child_name().unwrap_or_default(),
+            "empty"
+        );
+        assert!(!imp.paired_group.get_visible());
+        assert!(!imp.discovered_group.get_visible());
+        assert_eq!(
+            imp.detail_stack.visible_child_name().unwrap_or_default(),
+            "placeholder"
+        );
+        assert!(!imp.service_banner.reveals_child());
+
+        // The banner is the daemon's absence and nothing else: Unknown above is "not
+        // asked yet", which is not something to warn about.
+        model
+            .apply_event(StoreEvent::ServiceState(ServiceState::Absent))
+            .expect("a service state carries nothing to decode");
+        assert!(imp.service_banner.reveals_child());
+        model
+            .apply_event(StoreEvent::ServiceState(ServiceState::Running))
+            .expect("a service state carries nothing to decode");
+        assert!(!imp.service_banner.reveals_child());
+
+        // One of each, which is what the two `CustomFilter`s are for: one store list,
+        // two views of it, and a group visible only where its view has something in it.
+        model
+            .apply_event(snapshot(&[
+                ("usb:001:002", "Brother MFC-L2710DW", true),
+                ("usb:001:003", "Brother DCP-1610W", false),
+            ]))
+            .expect("the fixture is the wire shape §3 fixes");
+
+        assert_eq!(
+            imp.scanners_stack.visible_child_name().unwrap_or_default(),
+            "content"
+        );
+        assert!(imp.paired_group.get_visible());
+        assert!(imp.discovered_group.get_visible());
+
+        let paired_row = row_at(&imp.paired_list, 0);
+        let discovered_row = row_at(&imp.discovered_list, 0);
+        assert!(
+            imp.paired_list.row_at_index(1).is_none()
+                && imp.discovered_list.row_at_index(1).is_none(),
+            "each filter should have taken exactly one of the two scanners"
+        );
+        assert_eq!(
+            paired_row.scanner().expect("the row's scanner").name(),
+            "Brother MFC-L2710DW"
+        );
+        assert_eq!(
+            discovered_row.scanner().expect("the row's scanner").name(),
+            "Brother DCP-1610W"
+        );
+
+        // Selecting through the list box, which is what a pointer does: the handler is a
+        // `#[template_callback]`, so this is also the check that `swapped` is still on
+        // `row-selected` in the `.blp`.
+        imp.paired_list.select_row(Some(&paired_row));
+        let paired_path = paired_row.scanner().expect("the row's scanner").path();
+        assert_eq!(model.selected_path().as_deref(), Some(paired_path.as_str()));
+        assert_eq!(
+            imp.detail_stack.visible_child_name().unwrap_or_default(),
+            "details",
+            "a selection should leave the placeholder"
+        );
+
+        // The invariant of §3, and the one this issue could break: a `Status` change
+        // repaints the row that is already there. A rebuilt row would be a different
+        // widget, and the selection and the detail pane would have gone with the old one.
+        model
+            .apply_event(StoreEvent::PropertiesChanged {
+                path: paired_path.clone(),
+                interface: SCANNER_INTERFACE.to_owned(),
+                changed: HashMap::from([("Status".to_owned(), owned(ZValue::from("busy")))]),
+                invalidated: Vec::new(),
+            })
+            .expect("a `Status` of `busy` is one §3 fixes");
+        assert_eq!(
+            row_at(&imp.paired_list, 0),
+            paired_row,
+            "a status change rebuilt the row instead of repainting it"
+        );
+        assert_eq!(
+            paired_row
+                .scanner()
+                .expect("the row's scanner")
+                .status_line(),
+            "Busy • Connected",
+            "the subtitle binding should have followed the store"
+        );
+        assert_eq!(model.selected_path().as_deref(), Some(paired_path.as_str()));
+        assert_eq!(
+            imp.detail_stack.visible_child_name().unwrap_or_default(),
+            "details"
+        );
+
+        // Selecting in the other list clears this one, and the guard in the handler pair
+        // is what stops the `unselect_all` that does it from erasing the selection being
+        // made: the store ends up with the row just clicked, not with `None`.
+        imp.discovered_list.select_row(Some(&discovered_row));
+        let discovered_path = discovered_row.scanner().expect("the row's scanner").path();
+        assert!(imp.paired_list.selected_row().is_none());
+        assert_eq!(
+            model.selected_path().as_deref(),
+            Some(discovered_path.as_str()),
+            "the mirror handler erased the selection it was told about"
+        );
+
+        // Deselecting everything empties the detail stack rather than leaving the last
+        // scanner on screen.
+        imp.discovered_list.unselect_all();
+        assert_eq!(model.selected_path(), None);
+        assert_eq!(
+            imp.detail_stack.visible_child_name().unwrap_or_default(),
+            "placeholder"
+        );
+
+        // The caption is the discovered group's description, so there is no caption
+        // widget to look at — this is the whole of where that string reaches the screen.
+        assert_eq!(imp.discovered_group.description(), None);
+        model.mark_discovery_active();
+        assert_eq!(
+            imp.discovered_group.description().unwrap_or_default(),
+            "Finding scanners... 1 scanner found"
+        );
+        model.mark_discovery_idle();
+        assert_eq!(imp.discovered_group.description(), None);
+
+        // The row's own checks, on a row this pane's factory built — see the note there
+        // on why they are not a `run()` of their own in `gtk_tests.rs`.
+        crate::scanner_row::widget_checks::run(&discovered_row, &sent);
+
+        // A scanner that stops being exported takes its row with it, and the selection
+        // the row check just made with it.
+        model
+            .apply_event(snapshot(&[("usb:001:002", "Brother MFC-L2710DW", true)]))
+            .expect("the fixture is the wire shape §3 fixes");
+        assert!(imp.discovered_list.row_at_index(0).is_none());
+        assert!(!imp.discovered_group.get_visible());
+        assert_eq!(model.selected_path(), None);
+        assert_eq!(
+            imp.detail_stack.visible_child_name().unwrap_or_default(),
+            "placeholder"
+        );
     }
 }

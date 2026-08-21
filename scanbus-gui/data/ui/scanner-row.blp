@@ -1,10 +1,17 @@
-// One row in either scanner list — `scanners.rs` `scanner_row`, built once per model
-// item. Mockup: ../../../docs/design/main.png, the rows of the two lists.
+// One row in either scanner list — `scanner_row.rs` `ScannerRow`, instantiated once per
+// model item by the `bind_model` factory of each list.
+// Mockup: ../../../docs/design/main.png, the rows of the two lists.
 //
 // The row's widget name is the scanner's object path, which is how selection is reported
 // back to the store, so it is set per item and not declared here. Title and subtitle are
-// bound to the ScannerObject properties; the three pairing sub-boxes are shown one at a
-// time by PairingState, and all three are hidden when the scanner is not pairing.
+// bound to the ScannerObject properties — with `bind_property` in `ScannerRow::new` and
+// not with a `bind` expression here, because the object arrives after construction and a
+// binding declared against a property that is not set yet is a silent empty label rather
+// than an error. The three pairing sub-boxes are shown one at a time by PairingState, and
+// all three are hidden when the scanner is not pairing.
+//
+// Both `=>` below are `swapped`, as in window.blp: the row is `self` and the emitting
+// widget is the argument that gets dropped.
 
 using Gtk 4.0;
 using Adw 1;
@@ -14,7 +21,7 @@ template $ScannerRow : Gtk.ListBoxRow {
   activatable: true;
 
   // Activation selects: the row's widget name is the object path the store is told.
-  activate => $on_scanner_row_activate();
+  activate => $on_scanner_row_activate() swapped;
 
   child: Gtk.Box {
     orientation: vertical;
@@ -59,7 +66,7 @@ template $ScannerRow : Gtk.ListBoxRow {
         // while pairing, "Try again" after a failure), and the handler reads the
         // scanner's PairingState rather than the label to decide. Hidden entirely once
         // the scanner is paired.
-        clicked => $on_pair_clicked();
+        clicked => $on_pair_clicked() swapped;
       }
     }
 
@@ -109,7 +116,7 @@ template $ScannerRow : Gtk.ListBoxRow {
 
         // Shown and hidden separately from `failure_box`, because the expander below it
         // carries the error text whether or not the banner is up.
-        // An Adw.Bin where scanners.rs builds a vertical Gtk.Box: it wraps one label to
+        // An Adw.Bin where scanners.rs built a vertical Gtk.Box: it wraps one label to
         // give it the `error card` background, and never gets a second child.
         Adw.Bin failure_banner {
           margin-top: 6;

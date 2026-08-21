@@ -1,6 +1,12 @@
-// The Scanners page — `scanners.rs` `ScannersPane::new`, which returns this box.
+// The Scanners page — `scanners.rs` `ScannersPane`.
 // Mockup: ../../../docs/design/main.png — the two lists on the left, the detail pane
 // on the right.
+//
+// Every `=>` below is `swapped`, for the reason window.blp gives at length: a template
+// handler is invoked with the emitting widget first and the template instance last, and
+// `swapped` exchanges the two, so the Rust side writes `fn on_paired_selected(&self, …)`
+// with the pane as `self` and reaches the store and the bus channel through
+// `self.imp()`.
 
 using Gtk 4.0;
 using Adw 1;
@@ -17,7 +23,7 @@ template $ScannersPane : Gtk.Box {
     transition-type: slide_down;
     reveal-child: false;
 
-    // An Adw.Bin where scanners.rs builds a horizontal Gtk.Box: the box exists only to
+    // An Adw.Bin where scanners.rs built a horizontal Gtk.Box: the box existed only to
     // carry the `toolbar` style and the margins around one label, and `Adw.Bin` is what
     // blueprint-compiler's lint wants for a single-child wrapper. Behaviour is
     // identical; the port changes the type here rather than keeping a box that never
@@ -38,8 +44,8 @@ template $ScannersPane : Gtk.Box {
   }
 
   // ---- Content / empty -----------------------------------------------------
-  // scanners.rs `stack`. Switched by `has_scanners`, not by discovery state: a stopped
-  // discovery that found something keeps its results on screen.
+  // Switched by `has_scanners`, not by discovery state: a stopped discovery that found
+  // something keeps its results on screen.
   Gtk.Stack scanners_stack {
     vexpand: true;
 
@@ -67,9 +73,7 @@ template $ScannersPane : Gtk.Box {
 
             // Both groups are hidden while their filtered model is empty, and the
             // discovered group's *description* is where the "Finding scanners… N found"
-            // caption is written. scanners.rs also builds a `discovery_caption` label
-            // for that text and never parents it; only its string reaches the screen,
-            // through `set_description`, so there is nothing to declare for it here.
+            // caption is written — there is no caption widget of its own.
             Adw.PreferencesGroup paired_group {
               title: _("Paired scanners");
 
@@ -80,7 +84,7 @@ template $ScannersPane : Gtk.Box {
                 // The two lists clear each other's selection, so one scanner is selected
                 // across both; the selected row's widget name is the path handed to the
                 // store.
-                row-selected => $on_paired_selected();
+                row-selected => $on_paired_selected() swapped;
 
                 styles ["boxed-list"]
               }
@@ -93,7 +97,7 @@ template $ScannersPane : Gtk.Box {
                 selection-mode: single;
 
                 // Mirror of `paired_list`.
-                row-selected => $on_discovered_selected();
+                row-selected => $on_discovered_selected() swapped;
 
                 styles ["boxed-list"]
               }
@@ -106,6 +110,13 @@ template $ScannersPane : Gtk.Box {
         }
 
         // ---- Right-hand pane -----------------------------------------------
+        // Only the placeholder is declared. The other two pages hold `DetailsPane` and
+        // `ButtonsPage`, which are not template classes yet — [10.21] and [10.24] — and
+        // a `Gtk.StackPage` here has to name a child *class* the type system already
+        // knows, or the whole template fails to instantiate rather than just that page.
+        // `ScannersPane::new` adds both with `add_named`, which takes an instance; that
+        // does not change when they become subclasses, because each is built with the
+        // bus channel a builder-instantiated child could not be given.
         Gtk.Stack detail_stack {
           visible-child-name: "placeholder";
 
@@ -114,29 +125,6 @@ template $ScannersPane : Gtk.Box {
             child: Adw.StatusPage {
               title: _("No scanner selected");
               description: _("Select a scanner to inspect it");
-            };
-          }
-
-          Gtk.StackPage {
-            name: "details";
-            child: Gtk.ScrolledWindow {
-              hscrollbar-policy: never;
-              min-content-width: 360;
-
-              // scanners.rs `details`.
-              child: $DetailsPane details_pane {};
-            };
-          }
-
-          Gtk.StackPage {
-            name: "buttons";
-            child: Gtk.ScrolledWindow {
-              hscrollbar-policy: never;
-              min-content-width: 360;
-
-              // scanners.rs `buttons_page`. Reached from the detail pane's Configure
-              // row, and left again as soon as the scanner stops being paired.
-              child: $ButtonsPage buttons_page {};
             };
           }
         }

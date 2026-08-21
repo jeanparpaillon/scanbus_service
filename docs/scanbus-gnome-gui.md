@@ -135,7 +135,7 @@ carrying a `template $Class` no other file declares:
 | `window.blp` | `$ScanbusWindow` | window.rs — window, header, sidebar, page stack, app menu |
 | `settings-page.blp` | `$SettingsPage` | settings.rs — split out of window.rs `settings_page` |
 | `scanners-pane.blp` | `$ScannersPane` | scanners.rs — banner, the two lists, empty state, detail stack |
-| `scanner-row.blp` | `$ScannerRow` | scanners.rs `scanner_row` |
+| `scanner-row.blp` | `$ScannerRow` | scanner_row.rs — split out of scanners.rs `scanner_row` |
 | `details-pane.blp` | `$DetailsPane` | details.rs |
 | `details-fact-row.blp` | `$DetailsFactRow` | details.rs `fact_row` |
 | `unpair-dialog.blp` | `$UnpairDialog` | scanners.rs |

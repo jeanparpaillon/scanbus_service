@@ -9,6 +9,7 @@ mod lifecycle;
 mod notify;
 mod options;
 mod profiles;
+mod scanner_row;
 mod scanners;
 mod settings;
 mod store;
