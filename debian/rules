@@ -1,90 +1,22 @@
 #!/usr/bin/make -f
+export CARGO_ENV := release
 
-PACKAGE_NAME := scanbus
-FRONTEND_PACKAGE := scanbus-frontend
-BACKEND_PACKAGE := scanbus-backend
-VERSION := $(shell ./scripts/version.sh)
-DEB_ARCH := $(shell dpkg-architecture -qDEB_HOST_ARCH)
-DEB_STAGE_DIR := target/debian/$(PACKAGE_NAME)
-FRONTEND_STAGE_DIR := $(DEB_STAGE_DIR)/$(FRONTEND_PACKAGE)_$(VERSION)_$(DEB_ARCH)
-BACKEND_STAGE_DIR := $(DEB_STAGE_DIR)/$(BACKEND_PACKAGE)_$(VERSION)_$(DEB_ARCH)
-META_STAGE_DIR := $(DEB_STAGE_DIR)/$(PACKAGE_NAME)_$(VERSION)_all
-FRONTEND_ROOT := $(FRONTEND_STAGE_DIR)/pkg
-BACKEND_ROOT := $(BACKEND_STAGE_DIR)/pkg
-META_ROOT := $(META_STAGE_DIR)/pkg
-FRONTEND_SUBSTVARS := $(FRONTEND_STAGE_DIR)/substvars
-BACKEND_SUBSTVARS := $(BACKEND_STAGE_DIR)/substvars
-META_SUBSTVARS := $(META_STAGE_DIR)/substvars
+%:
+	dh $@
 
-CARGO_ENV := release
-export CARGO_ENV
-
-.PHONY: build build-arch build-indep binary binary-arch binary-indep clean install control
-
-build build-arch:
+override_dh_auto_build:
 	$(MAKE)
 
-build-indep: debian/scanbus-backend.manpages
+override_dh_auto_install:
+	$(MAKE) install DESTDIR=$(CURDIR)/debian/tmp
 
-debian/scanbus-backend.manpages: FORCE
-	rm -rf target/man
-	$(MAKE) manpages SCANBUS_MANPAGES=$(abspath target/man)
-	cd target/man && ls *.1 > $@
+execute_before_dh_installman:
+	$(MAKE) manpages
 
-install: build
-	rm -rf $(DEB_STAGE_DIR)
-	$(MAKE) install-frontend DESTDIR=$(abspath $(FRONTEND_ROOT))
-	$(MAKE) install-backend DESTDIR=$(abspath $(BACKEND_ROOT))
+override_dh_installman:
+	dh_installman --sourcedir=target/man
 
-	dh_installdocs -p$(FRONTEND_PACKAGE) -P$(FRONTEND_ROOT)
-	dh_installdocs -p$(BACKEND_PACKAGE) -P$(BACKEND_ROOT)
-	dh_installdocs -p$(PACKAGE_NAME) -P$(META_ROOT)
-
-	dh_installman -p$(BACKEND_PACKAGE) -P$(BACKEND_ROOT)
-	dh_compress -p$(BACKEND_PACKAGE) -P$(BACKEND_ROOT)
-
-control: install
-	# Gen control for frontend package
-	dpkg-shlibdeps -T$(FRONTEND_SUBSTVARS) \
-		$(FRONTEND_ROOT)/usr/bin/scanbus-gui
-	dpkg-gencontrol \
-		-p$(FRONTEND_PACKAGE) \
-		-P$(FRONTEND_ROOT) \
-		-cdebian/control \
-	 	-T$(FRONTEND_SUBSTVARS) \
-		-v$(VERSION)
-
-	# Gen control for backend package
-	dpkg-shlibdeps -T$(BACKEND_SUBSTVARS) \
-		$(BACKEND_ROOT)/usr/bin/scanbus \
-		$(BACKEND_ROOT)/usr/bin/scanbus-daemon
-	dpkg-gencontrol \
-		-p$(BACKEND_PACKAGE) \
-		-P$(BACKEND_ROOT) \
-		-cdebian/control \
-		-T$(BACKEND_SUBSTVARS) \
-		-v$(VERSION)
-
-	# Gen control for meta package
-	dpkg-gencontrol \
-		-p$(PACKAGE_NAME) \
-		-P$(META_ROOT) \
-		-cdebian/control \
-		-T$(META_SUBSTVARS) \
-		-v$(VERSION)
-
-binary: binary-arch binary-indep
-
-binary-arch: control
-	dpkg-deb --root-owner-group --build $(FRONTEND_ROOT) \
-		$(FRONTEND_STAGE_DIR)/$(FRONTEND_PACKAGE)_$(VERSION)_$(DEB_ARCH).deb
-	dpkg-deb --root-owner-group --build $(BACKEND_ROOT) \
-		$(BACKEND_STAGE_DIR)/$(BACKEND_PACKAGE)_$(VERSION)_$(DEB_ARCH).deb
-
-binary-indep: control
-	dpkg-deb --root-owner-group --build $(META_ROOT) \
-		$(META_STAGE_DIR)/$(PACKAGE_NAME)_$(VERSION)_all.deb
-
-clean:
+override_dh_auto_clean:
 	$(MAKE) clean
-	rm -rf target/debian
+	rm -rf target/man
+	dh_auto_clean

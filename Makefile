@@ -83,11 +83,11 @@ install-frontend:
 		"$(DESTDIR)$(AUTOSTART_DIR)/org.scanbus.Gui.desktop"
 
 manpages:
-	"$(TARGET_DIR)/scanbus" manpage --output-dir target/man
+	"$(TARGET_DIR)/scanbus" manpage --output-dir $(SCANBUS_MANPAGES)
 
 install-manpages:
 	install -d "$(DESTDIR)$(MANDIR)/man1"
-	cp -a target/man/* $(DESTDIR)$(MANDIR)/man1
+	cp -a $(SCANBUS_MANPAGES)/* $(DESTDIR)$(MANDIR)/man1
 	gzip -9n "$(DESTDIR)$(MANDIR)/man1"/*.1
 
 deb:

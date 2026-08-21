@@ -2,33 +2,45 @@ Source: scanbus
 Section: utils
 Priority: optional
 Maintainer: Jean Parpaillon <jean@parpaillon.info>
-Build-Depends: cargo,
+Build-Depends: 
+ debhelper-compat (= 13),
+ cargo,
  blueprint-compiler,
  rustc,
- make,
- dpkg-dev,
  pkgconf,
  libgtk-4-dev,
  libadwaita-1-dev (>= 1.4)
 Standards-Version: 4.7.0
+Rules-Requires-Root: no
+Homepage: https://scanbus.github.io/
+Vcs-Git: https://github.com/scanbus/scanbus.git
+Vcs-Browser: https://github.com/scanbus/scanbus
 
 Package: scanbus
 Architecture: all
-Depends: scanbus-frontend (= ${binary:Version}),
+Depends: 
+ ${misc:Depends},
+ scanbus-frontend (= ${binary:Version}),
  scanbus-backend (= ${binary:Version})
 Description: metapackage for the scanbus frontend and backend
  Installs both the GTK frontend and the backend components for scanbus.
 
 Package: scanbus-frontend
 Architecture: any
-Depends: ${shlibs:Depends}
+Depends: 
+ ${misc:Depends},
+ ${shlibs:Depends}
 Description: GTK frontend for scanbus
  The graphical scanbus application for browsing scanners and launching scans.
 
 Package: scanbus-backend
 Architecture: any
-Depends: ${shlibs:Depends}, sane-utils
-Suggests: hplip
+Depends: 
+ ${misc:Depends},
+ ${shlibs:Depends},
+ sane-utils
+Recommends: 
+ hplip
 Description: scanbus D-Bus service and command-line client
  A session-scoped D-Bus service for document scanners, installed with its
  user-level systemd unit, D-Bus activation file and stable scanimage helper.

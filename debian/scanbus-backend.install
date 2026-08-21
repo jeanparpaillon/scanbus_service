@@ -1,0 +1,6 @@
+# debian/scanbus-backend.install
+usr/bin/scanbus
+usr/bin/scanbus-daemon
+usr/libexec/scanbus/*
+usr/lib/systemd/user/*
+usr/share/dbus-1/services/*

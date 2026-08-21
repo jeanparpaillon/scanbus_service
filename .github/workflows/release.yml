@@ -74,85 +74,110 @@ jobs:
           path: dist/*.tar.gz
           if-no-files-found: error
 
-  deb:
-    name: debian packages
-    needs: version
+  build-deb:
+    name: ${{ matrix.name }}
     runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Ubuntu 24.04 LTS
+            image: ubuntu:24.04
+            artifact: ubuntu-24.04
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      # debian/control's Build-Depends, minus what the runner image already has.
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            dpkg-dev pkgconf libgtk-4-dev libadwaita-1-dev
-
-      - name: Install toolchain
-        run: |
-          rustup toolchain install "$RUST_VERSION" --profile minimal
-          rustup default "$RUST_VERSION"
-
-      - uses: actions/cache@v4
+      # --no-sign because the signature is applied by the next step instead, outside
+      # the container. The action builds an --env-file out of this step's entire
+      # environment and hands it to `docker run`, so a key put here would be readable
+      # by every build script cargo executes. Signing in-place would also fail open:
+      # dpkg-buildpackage only warns when it cannot sign, which is how a release goes
+      # out unsigned and green.
+      - name: Build Debian packages
+        id: build
+        uses: jtdor/build-deb-action@v1
+        env:
+          DEB_BUILD_OPTIONS: noautodbgsym
         with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            target
-          key: ${{ runner.os }}-release-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-release-${{ env.RUST_VERSION }}-
+          docker-image: ${{ matrix.image }}
+          buildpackage-opts: --build=binary --no-sign
+          artifacts-dir: artifacts
 
-      # `make deb`, i.e. debian/rules directly, not dpkg-buildpackage: these rules
-      # stage into target/debian and build with `dpkg-deb --root-owner-group` (so no
-      # fakeroot, and no root-owned files in the cache), where dpkg-buildpackage would
-      # look for the .debs in the parent directory and would run `clean` first,
-      # throwing away the cargo cache this job restores.
-      - name: Build packages
-        run: make deb
-
-      - name: Collect packages
+      # `gpg --clearsign` over the .changes is exactly what dpkg-buildpackage's own
+      # signing does. The .buildinfo is left unsigned: the .changes carries its
+      # checksum, so the one signature already covers it.
+      #
+      # debian/scanbus-ci.pub.asc is the key users verify with, which makes it the
+      # authority on what CI may sign with — the wrong secret has to fail the build
+      # rather than ship a signature nobody can check.
+      - name: Sign .changes
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
         run: |
-          mkdir -p dist
-          find target/debian -name '*.deb' -exec cp -t dist {} +
-          ls -l dist
+          set -euo pipefail
 
-      # Catches a staging path that silently produced nothing, and a package whose
-      # dependencies dpkg-shlibdeps failed to fill in.
-      - name: Inspect packages
-        run: |
-          count=$(find dist -name '*.deb' | wc -l)
-          if [ "$count" -ne 3 ]; then
-            echo "::error::expected 3 packages (frontend, backend, meta), got $count"
+          if [ -z "${GPG_PRIVATE_KEY:-}" ]; then
+            echo "::error::GPG_PRIVATE_KEY is empty — refusing to ship unsigned packages"
             exit 1
           fi
-          for deb in dist/*.deb; do
-            echo "== $deb"
-            dpkg-deb --info "$deb" | sed -n '/^ Package:/,$p'
-            dpkg-deb --contents "$deb"
-            case "$(dpkg-deb --field "$deb" Depends)" in
-              *'${'*)
-                echo "::error::unsubstituted substvar in $deb's Depends"
-                exit 1
-                ;;
-            esac
+
+          GNUPGHOME=$(mktemp -d)
+          export GNUPGHOME
+          chmod 700 "$GNUPGHOME"
+          trap 'gpgconf --kill all >/dev/null 2>&1 || true; rm -rf "$GNUPGHOME"' EXIT
+
+          expected=$(gpg --batch --show-keys --with-colons debian/scanbus-ci.pub.asc |
+            awk -F: '/^pub:/ { print $5; exit }')
+
+          printf '%s\n' "$GPG_PRIVATE_KEY" | gpg --batch --quiet --import
+          keyid=$(gpg --batch --list-secret-keys --with-colons |
+            awk -F: '/^sec:/ { print $5; exit }')
+
+          if [ "$keyid" != "$expected" ]; then
+            echo "::error::GPG_PRIVATE_KEY is key $keyid, but debian/scanbus-ci.pub.asc is $expected"
+            exit 1
+          fi
+
+          for changes in artifacts/*.changes; do
+            gpg --batch --yes --local-user "$keyid" \
+              --clearsign --output "$changes.signed" "$changes"
+            mv "$changes.signed" "$changes"
+            gpg --batch --verify "$changes"
+            echo "signed $(basename "$changes") with $keyid"
           done
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
         with:
-          name: debian
-          path: dist/*.deb
+          name: scanbus-${{ matrix.artifact }}
+          path: |
+            artifacts/*.deb
+            artifacts/*.changes
+            artifacts/*.buildinfo
           if-no-files-found: error
 
   publish:
     name: publish release
-    needs: [version, source, deb]
+    needs: [version, source, build-deb]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      # Downloaded by name rather than "everything", so an artifact added to this run
+      # later — an apt-repo dists/ and pool/ tree, say — does not silently become a
+      # release asset by way of `gh release create dist/*`.
       - uses: actions/download-artifact@v4
         with:
+          name: source
+          path: dist
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: scanbus-*
           path: dist
           merge-multiple: true
 

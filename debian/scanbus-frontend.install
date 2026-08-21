@@ -1,0 +1,4 @@
+# debian/scanbus-frontend.install
+usr/bin/scanbus-gui
+usr/share/applications/*
+etc/xdg/autostart/*

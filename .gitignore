@@ -1,4 +1,12 @@
 /target
 /.worktrees
 /debian/files
-/debian/scanbus-backend.manpages
+/debian/.debhelper
+/debian/debhelper-build-stamp
+/debian/tmp
+/debian/scanbus
+/debian/scanbus-backend
+/debian/scanbus-frontend
+/debian/*.debhelper.log
+/debian/*.debhelper
+/debian/*.substvars
