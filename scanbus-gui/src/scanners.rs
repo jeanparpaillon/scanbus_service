@@ -1105,6 +1105,15 @@ pub(crate) mod widget_checks {
         )
     }
 
+    /// The group's description, flattened to a string.
+    ///
+    /// `set_description(None)` reads back as `None` on the libadwaita 1.9 of a
+    /// development machine and as `Some("")` on the 1.5 of CI's `ubuntu-latest`, so "no
+    /// caption" is the empty string here and the check means the same thing on both.
+    fn caption_of(group: &adw::PreferencesGroup) -> String {
+        group.description().unwrap_or_default().into()
+    }
+
     fn row_at(list: &gtk::ListBox, index: i32) -> ScannerRow {
         list.row_at_index(index)
             .unwrap_or_else(|| panic!("no row at index {index}"))
@@ -1244,14 +1253,14 @@ pub(crate) mod widget_checks {
 
         // The caption is the discovered group's description, so there is no caption
         // widget to look at — this is the whole of where that string reaches the screen.
-        assert_eq!(imp.discovered_group.description(), None);
+        assert_eq!(caption_of(&imp.discovered_group), "");
         model.mark_discovery_active();
         assert_eq!(
-            imp.discovered_group.description().unwrap_or_default(),
+            caption_of(&imp.discovered_group),
             "Finding scanners... 1 scanner found"
         );
         model.mark_discovery_idle();
-        assert_eq!(imp.discovered_group.description(), None);
+        assert_eq!(caption_of(&imp.discovered_group), "");
 
         // The row's own checks, on a row this pane's factory built — see the note there
         // on why they are not a `run()` of their own in `gtk_tests.rs`.
