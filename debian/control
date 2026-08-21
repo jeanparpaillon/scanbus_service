@@ -28,12 +28,7 @@ Description: GTK frontend for scanbus
 Package: scanbus-backend
 Architecture: any
 Depends: ${shlibs:Depends}, sane-utils
-Suggests: hplip-gui
+Suggests: hplip
 Description: scanbus D-Bus service and command-line client
  A session-scoped D-Bus service for document scanners, installed with its
  user-level systemd unit, D-Bus activation file and stable scanimage helper.
- .
- The HP backend needs hplip-gui: it owns /usr/bin/hp-systray, the only process
- that claims com.hplip.StatusService, which is where HPLIP walk-up scan events
- arrive. It is suggested rather than depended on because the Brother and mobile
- backends do not need HPLIP at all.

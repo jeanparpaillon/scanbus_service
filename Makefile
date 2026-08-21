@@ -13,6 +13,7 @@ endif
 DESTDIR ?=
 PREFIX ?= /usr
 BINDIR ?= $(PREFIX)/bin
+SCANBUS_MANPAGES ?= target/man
 SYSTEMD_USER_DIR ?= $(PREFIX)/lib/systemd/user
 DBUS_SERVICE_DIR ?= $(PREFIX)/share/dbus-1/services
 LIBEXECDIR ?= $(PREFIX)/libexec/scanbus
@@ -54,16 +55,13 @@ $(TARGET_DIR)/scanbus-daemon: FORCE
 $(TARGET_DIR)/scanbus-gui: FORCE
 	cargo build --package scanbus-gui --bin $(notdir $@) $(profile_opt)
 
-install: install-backend install-frontend install-services install-doc install-license
+install: install-backend install-frontend
 
-# Debian wants the license under the policy-mandated name `copyright`, with the
-# copyright holder stated — the bare Apache text does not carry one — so the deb
-# ships debian/copyright and everyone else gets LICENSE verbatim.
-install-license:
-	install -D -m 0644 LICENSE "$(DESTDIR)$(DOCDIR)/$(DOC_PACKAGE)/LICENSE"
-
-install-copyright:
-	install -D -m 0644 debian/copyright "$(DESTDIR)$(DOCDIR)/$(DOC_PACKAGE)/copyright"
+install-backend: install-services
+	install -D -m 0755 "$(TARGET_DIR)/scanbus" "$(DESTDIR)$(BINDIR)/scanbus"
+	install -D -m 0755 "$(TARGET_DIR)/scanbus-daemon" "$(DESTDIR)$(BINDIR)/scanbus-daemon"
+	install -D -m 0755 packaging/libexec/scanbus/scanbus-scanimage \
+		"$(DESTDIR)$(LIBEXECDIR)/scanbus-scanimage"
 
 install-services: $(hplip_services)
 	install -D -m 0644 packaging/systemd/user/scanbus.service \
@@ -84,21 +82,14 @@ install-frontend:
 	install -D -m 0644 packaging/autostart/org.scanbus.Gui.desktop \
 		"$(DESTDIR)$(AUTOSTART_DIR)/org.scanbus.Gui.desktop"
 
-install-backend:
-	install -D -m 0755 "$(TARGET_DIR)/scanbus" "$(DESTDIR)$(BINDIR)/scanbus"
-	install -D -m 0755 "$(TARGET_DIR)/scanbus-daemon" "$(DESTDIR)$(BINDIR)/scanbus-daemon"
-	install -D -m 0755 packaging/libexec/scanbus/scanbus-scanimage \
-		"$(DESTDIR)$(LIBEXECDIR)/scanbus-scanimage"
+manpages:
+	"$(TARGET_DIR)/scanbus" manpage --output-dir target/man
 
-# One page per command, not just scanbus.1: the SUBCOMMANDS section of scanbus(1) is a
-# list of scanbus-scan(1)-style references that `man` resolves against installed files,
-# so shipping the top page alone leaves every one of them a dead link.
-install-doc:
+install-manpages:
 	install -d "$(DESTDIR)$(MANDIR)/man1"
-	"$(TARGET_DIR)/scanbus" manpage --output-dir "$(DESTDIR)$(MANDIR)/man1"
+	cp -a target/man/* $(DESTDIR)$(MANDIR)/man1
+	gzip -9n "$(DESTDIR)$(MANDIR)/man1"/*.1
 
-# The packaged build, and the entry point the release workflow uses. debian/rules
-# recurses back into `make release` here and stages under target/debian.
 deb:
 	$(MAKE) -f debian/rules binary
 
@@ -131,7 +122,7 @@ clean:
 	cargo clean ${profile_opt}
 
 .PHONY: all release debug 
-.PHONY: install install-backend install-frontend install-services install-doc
-.PHONY: install-license install-copyright install-hplip-services
+.PHONY: install install-backend install-frontend install-services manpages
+.PHONY: install-hplip-services
 .PHONY: deb version version-check version-sync
 .PHONY: reload test clean lint FORCE

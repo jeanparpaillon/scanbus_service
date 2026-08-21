@@ -3,7 +3,6 @@
 PACKAGE_NAME := scanbus
 FRONTEND_PACKAGE := scanbus-frontend
 BACKEND_PACKAGE := scanbus-backend
-CARGO_ENV := release
 VERSION := $(shell ./scripts/version.sh)
 DEB_ARCH := $(shell dpkg-architecture -qDEB_HOST_ARCH)
 DEB_STAGE_DIR := target/debian/$(PACKAGE_NAME)
@@ -13,56 +12,78 @@ META_STAGE_DIR := $(DEB_STAGE_DIR)/$(PACKAGE_NAME)_$(VERSION)_all
 FRONTEND_ROOT := $(FRONTEND_STAGE_DIR)/pkg
 BACKEND_ROOT := $(BACKEND_STAGE_DIR)/pkg
 META_ROOT := $(META_STAGE_DIR)/pkg
-FRONTEND_OUTPUT := $(FRONTEND_STAGE_DIR)/$(FRONTEND_PACKAGE)_$(VERSION)_$(DEB_ARCH).deb
-BACKEND_OUTPUT := $(BACKEND_STAGE_DIR)/$(BACKEND_PACKAGE)_$(VERSION)_$(DEB_ARCH).deb
-META_OUTPUT := $(META_STAGE_DIR)/$(PACKAGE_NAME)_$(VERSION)_all.deb
 FRONTEND_SUBSTVARS := $(FRONTEND_STAGE_DIR)/substvars
 BACKEND_SUBSTVARS := $(BACKEND_STAGE_DIR)/substvars
 META_SUBSTVARS := $(META_STAGE_DIR)/substvars
 
+CARGO_ENV := release
+export CARGO_ENV
+
 .PHONY: build build-arch build-indep binary binary-arch binary-indep clean install control
 
 build build-arch:
-	$(MAKE) release
+	$(MAKE)
 
-build-indep:
+build-indep: debian/scanbus-backend.manpages
+
+debian/scanbus-backend.manpages: FORCE
+	rm -rf target/man
+	$(MAKE) manpages SCANBUS_MANPAGES=$(abspath target/man)
+	cd target/man && ls *.1 > $@
 
 install: build
 	rm -rf $(DEB_STAGE_DIR)
-	mkdir -p $(FRONTEND_ROOT)/DEBIAN $(BACKEND_ROOT)/DEBIAN $(META_ROOT)/DEBIAN
 	$(MAKE) install-frontend DESTDIR=$(abspath $(FRONTEND_ROOT))
-	$(MAKE) install-backend install-services DESTDIR=$(abspath $(BACKEND_ROOT))
-	# The man pages document `scanbus`, which is this package's binary; the frontend
-	# ships none. Policy 12.1 wants them compressed, which `make install` does not do —
-	# an uncompressed page is correct for a plain install and a lintian error in a deb.
-	$(MAKE) install-doc DESTDIR=$(abspath $(BACKEND_ROOT))
-	gzip -9n $(BACKEND_ROOT)/usr/share/man/man1/*.1
-	install -D -m 0755 debian/postinst "$(BACKEND_ROOT)/DEBIAN/postinst"
-	# Policy 12.5: every binary package carries its own /usr/share/doc/<pkg>/copyright,
-	# including the metapackage, which installs no files otherwise.
-	$(MAKE) install-copyright DESTDIR=$(abspath $(FRONTEND_ROOT)) DOC_PACKAGE=$(FRONTEND_PACKAGE)
-	$(MAKE) install-copyright DESTDIR=$(abspath $(BACKEND_ROOT)) DOC_PACKAGE=$(BACKEND_PACKAGE)
-	$(MAKE) install-copyright DESTDIR=$(abspath $(META_ROOT)) DOC_PACKAGE=$(PACKAGE_NAME)
+	$(MAKE) install-backend DESTDIR=$(abspath $(BACKEND_ROOT))
+
+	dh_installdocs -p$(FRONTEND_PACKAGE) -P$(FRONTEND_ROOT)
+	dh_installdocs -p$(BACKEND_PACKAGE) -P$(BACKEND_ROOT)
+	dh_installdocs -p$(PACKAGE_NAME) -P$(META_ROOT)
+
+	dh_installman -p$(BACKEND_PACKAGE) -P$(BACKEND_ROOT)
+	dh_compress -p$(BACKEND_PACKAGE) -P$(BACKEND_ROOT)
 
 control: install
-	dpkg-shlibdeps -T$(FRONTEND_SUBSTVARS) $(FRONTEND_ROOT)/usr/bin/scanbus-gui
+	# Gen control for frontend package
+	dpkg-shlibdeps -T$(FRONTEND_SUBSTVARS) \
+		$(FRONTEND_ROOT)/usr/bin/scanbus-gui
+	dpkg-gencontrol \
+		-p$(FRONTEND_PACKAGE) \
+		-P$(FRONTEND_ROOT) \
+		-cdebian/control \
+	 	-T$(FRONTEND_SUBSTVARS) \
+		-v$(VERSION)
+
+	# Gen control for backend package
 	dpkg-shlibdeps -T$(BACKEND_SUBSTVARS) \
 		$(BACKEND_ROOT)/usr/bin/scanbus \
 		$(BACKEND_ROOT)/usr/bin/scanbus-daemon
-	dpkg-gencontrol -p$(FRONTEND_PACKAGE) -P$(FRONTEND_ROOT) -cdebian/control -T$(FRONTEND_SUBSTVARS) -v$(VERSION)
-	dpkg-gencontrol -p$(BACKEND_PACKAGE) -P$(BACKEND_ROOT) -cdebian/control -T$(BACKEND_SUBSTVARS) -v$(VERSION)
-	dpkg-gencontrol -p$(PACKAGE_NAME) -P$(META_ROOT) -cdebian/control -T$(META_SUBSTVARS) -v$(VERSION)
+	dpkg-gencontrol \
+		-p$(BACKEND_PACKAGE) \
+		-P$(BACKEND_ROOT) \
+		-cdebian/control \
+		-T$(BACKEND_SUBSTVARS) \
+		-v$(VERSION)
+
+	# Gen control for meta package
+	dpkg-gencontrol \
+		-p$(PACKAGE_NAME) \
+		-P$(META_ROOT) \
+		-cdebian/control \
+		-T$(META_SUBSTVARS) \
+		-v$(VERSION)
 
 binary: binary-arch binary-indep
 
 binary-arch: control
-	dpkg-deb --root-owner-group --build $(FRONTEND_ROOT) $(FRONTEND_OUTPUT)
-	dpkg-deb --root-owner-group --build $(BACKEND_ROOT) $(BACKEND_OUTPUT)
-	@printf '%s\n' "$(FRONTEND_OUTPUT)" "$(BACKEND_OUTPUT)"
+	dpkg-deb --root-owner-group --build $(FRONTEND_ROOT) \
+		$(FRONTEND_STAGE_DIR)/$(FRONTEND_PACKAGE)_$(VERSION)_$(DEB_ARCH).deb
+	dpkg-deb --root-owner-group --build $(BACKEND_ROOT) \
+		$(BACKEND_STAGE_DIR)/$(BACKEND_PACKAGE)_$(VERSION)_$(DEB_ARCH).deb
 
 binary-indep: control
-	dpkg-deb --root-owner-group --build $(META_ROOT) $(META_OUTPUT)
-	@printf '%s\n' "$(META_OUTPUT)"
+	dpkg-deb --root-owner-group --build $(META_ROOT) \
+		$(META_STAGE_DIR)/$(PACKAGE_NAME)_$(VERSION)_all.deb
 
 clean:
 	$(MAKE) clean
