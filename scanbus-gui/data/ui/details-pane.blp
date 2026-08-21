@@ -1,4 +1,4 @@
-// The right-hand detail pane — `details.rs` `DetailsPane::new`, which returns this box.
+// The right-hand detail pane — the template `details.rs` `DetailsPane` is bound to.
 // Mockup: ../../../docs/design/main.png — identity, facts, actions, separated by rules.
 //
 // Every value here is written by `DetailsPane::render` from one ScannerEntry, so the
@@ -6,8 +6,11 @@
 // render (`success` / `warning` / `error`), which is why none is declared.
 //
 // The five facts are $DetailsFactRow instances — see details-fact-row.blp for why they
-// are a template and not five copies of one box. `details.rs` holds the five *value*
-// labels; the port holds the five rows and reaches `value` through each.
+// are a template and not five copies of one box. `DetailsPane` holds the five rows and
+// reaches each one's `value` label through it.
+//
+// Every `=>` below is `swapped`, for the reason window.blp gives at length: the pane is
+// `self` and the emitting widget is the argument that gets dropped.
 
 using Gtk 4.0;
 using Adw 1;
@@ -126,7 +129,7 @@ template $DetailsPane : Gtk.Box {
       // `row-activated` for the click, with no Adw.PreferencesGroup in between to
       // forward it to the row's own activation. Switches `detail_stack` to "buttons",
       // only for a scanner that is still paired.
-      row-activated => $on_configure_activated();
+      row-activated => $on_configure_activated() swapped;
 
       styles ["boxed-list"]
 
@@ -164,7 +167,7 @@ template $DetailsPane : Gtk.Box {
       label: _("Unpair");
       halign: fill;
 
-      clicked => $on_unpair_clicked();
+      clicked => $on_unpair_clicked() swapped;
 
       styles ["destructive-action"]
     }

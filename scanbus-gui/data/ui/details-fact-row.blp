@@ -1,8 +1,8 @@
-// One fact in the detail pane's middle section — `details.rs` `fact_row`, which the pane
-// calls once per entry of a five-row table. Mockup: ../../../docs/design/main.png.
+// One fact in the detail pane's middle section — the template `details_fact_row.rs`
+// `DetailsFactRow` is bound to. Mockup: ../../../docs/design/main.png.
 //
-// Its own file for the same reason $ScannerRow has one: it is a shape the pane builds n
-// of, so an id in details-pane.blp would name exactly one of the five.
+// Its own file for the same reason $ScannerRow has one: it is a shape the pane holds
+// five of, so an id in details-pane.blp would name exactly one of them.
 //
 // The three things that differ between the five are properties of this class rather than
 // ids, so details-pane.blp can declare them and the pane keeps one template child per

@@ -22,6 +22,7 @@ use crate::scanner_row::ScannerRow;
 use crate::store::{
     DiscoveryState, ProfileEntry, ScannerEntry, ServiceDetails, ServiceState, Store, StoreEvent,
 };
+use crate::unpair_dialog::UnpairDialog;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToastAction {
@@ -500,11 +501,13 @@ mod scanners_pane {
         pub paired_model: OnceCell<gtk::FilterListModel>,
         pub discovered_model: OnceCell<gtk::FilterListModel>,
 
-        /// The two panes `detail_stack` shows, which are not template classes yet
-        /// ([10.21] and [10.24]). Held rather than looked up out of the stack, because
-        /// `render` calls `render`/`clear` on each — methods the stack's `gtk::Widget`
-        /// does not have.
-        pub details: OnceCell<Rc<DetailsPane>>,
+        /// The two panes `detail_stack` shows. Held rather than looked up out of the
+        /// stack, because `render` calls `render`/`clear` on each — methods the stack's
+        /// `gtk::Widget` does not have.
+        ///
+        /// `ButtonsPage` is not a template class yet ([10.24]), which is why one of the
+        /// two is still an `Rc` around a plain struct.
+        pub details: OnceCell<DetailsPane>,
         pub buttons_page: OnceCell<Rc<ButtonsPage>>,
     }
 
@@ -600,15 +603,17 @@ impl ScannersPane {
         );
 
         // The two pages `scanners-pane.blp` leaves out, added by instance for the reason
-        // the `.blp` gives there: neither class exists to the builder yet, and both are
-        // built with the bus channel a builder-instantiated child could not be given.
-        let details = Rc::new(DetailsPane::new());
+        // the `.blp` gives there: `ButtonsPage` is not a class the builder knows yet, and
+        // it is built with the bus channel a builder-instantiated child could not be
+        // given. `DetailsPane` needs neither, and is still added here because the
+        // Gtk.ScrolledWindow each page is wrapped in is assembled here.
+        let details = DetailsPane::new();
         let buttons_page = Rc::new(ButtonsPage::new(commands));
         imp.detail_stack.add_named(
             &gtk::ScrolledWindow::builder()
                 .hscrollbar_policy(gtk::PolicyType::Never)
                 .min_content_width(360)
-                .child(details.widget())
+                .child(&details)
                 .build(),
             Some("details"),
         );
@@ -626,16 +631,17 @@ impl ScannersPane {
             "buttons page set twice"
         );
 
-        // The three callbacks the two sub-panes raise. Each holds a weak handle: this pane
-        // owns both sub-panes through the cells just filled, and each sub-pane keeps every
-        // callback it is given for its own lifetime, so a strong `self` would be a cycle
-        // and the pane would never be finalised.
+        // The three things the two sub-panes raise: two signals on `DetailsPane` and the
+        // one remaining plain callback on `ButtonsPage`. Each handler holds a weak handle:
+        // this pane owns both sub-panes through the cells just filled, and a signal
+        // connection lives as long as the object it is on, so a strong `self` would be a
+        // cycle and the pane would never be finalised.
         {
             let weak = pane.downgrade();
             imp.details
                 .get()
                 .expect("details set just above")
-                .connect_configure(move || {
+                .connect_configure_requested(move || {
                     let Some(pane) = weak.upgrade() else {
                         return;
                     };
@@ -671,7 +677,7 @@ impl ScannersPane {
             imp.details
                 .get()
                 .expect("details set just above")
-                .connect_unpair(move || {
+                .connect_unpair_requested(move || {
                     if let Some(pane) = weak.upgrade() {
                         pane.confirm_unpair();
                     }
@@ -766,12 +772,12 @@ impl ScannersPane {
         });
     }
 
-    /// The confirmation the detail pane's *Unpair* row raises.
+    /// The confirmation the detail pane's *Unpair* button raises.
     ///
-    /// Still built by hand rather than from `unpair-dialog.blp`: its body names the
-    /// scanner, and the whole dialog exists only for the length of one answer. The
-    /// transient parent is looked up through `self.root()`, which is why this is a method
-    /// on the pane and not a free function.
+    /// A method on the pane rather than a free function because both of the things the
+    /// dialog cannot know are the pane's: which scanner is selected, and which window to
+    /// be transient for. Everything after that — including sending the command — belongs
+    /// to [`UnpairDialog`], so nothing here waits for an answer.
     fn confirm_unpair(&self) {
         let imp = self.imp();
         let model = imp.model.get().expect("model set in `new`");
@@ -784,47 +790,13 @@ impl ScannersPane {
             return;
         };
 
-        let window = gtk::Window::builder()
-            .modal(true)
-            .title("Unpair scanner?")
-            .build();
-        let body = gtk::Label::new(Some(&format!(
-            "Unpairing {} removes its saved pairing information.",
-            scanner.state.name
-        )));
-        body.set_wrap(true);
-        body.set_xalign(0.0);
-        body.set_margin_top(18);
-        body.set_margin_bottom(18);
-        body.set_margin_start(18);
-        body.set_margin_end(18);
-
-        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-        actions.set_halign(gtk::Align::End);
-        let cancel = gtk::Button::with_label("Cancel");
-        let destructive = gtk::Button::with_label("Unpair");
-        destructive.add_css_class("destructive-action");
-        actions.append(&cancel);
-        actions.append(&destructive);
-
-        let content = gtk::Box::new(gtk::Orientation::Vertical, 18);
-        content.append(&body);
-        content.append(&actions);
-        window.set_child(Some(&content));
-        window.set_transient_for(self.root().and_downcast_ref::<gtk::Window>());
-
-        cancel.connect_clicked({
-            let window = window.clone();
-            move |_| window.close()
-        });
-        destructive.connect_clicked({
-            let window = window.clone();
-            move |_| {
-                let _ = commands.try_send(BusCommand::Unpair { path: path.clone() });
-                window.close();
-            }
-        });
-        window.present();
+        UnpairDialog::new(
+            self.root().and_downcast_ref::<gtk::Window>(),
+            &scanner.state.name,
+            path,
+            commands,
+        )
+        .present();
     }
 }
 

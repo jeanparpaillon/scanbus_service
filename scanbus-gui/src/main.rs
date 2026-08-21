@@ -2,6 +2,7 @@ mod autostart;
 mod bus;
 mod buttons;
 mod details;
+mod details_fact_row;
 mod error;
 #[cfg(all(test, feature = "gtk-tests"))]
 mod gtk_tests;
@@ -13,6 +14,7 @@ mod scanner_row;
 mod scanners;
 mod settings;
 mod store;
+mod unpair_dialog;
 mod window;
 
 use std::rc::Rc;

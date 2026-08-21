@@ -111,12 +111,13 @@ template $ScannersPane : Gtk.Box {
 
         // ---- Right-hand pane -----------------------------------------------
         // Only the placeholder is declared. The other two pages hold `DetailsPane` and
-        // `ButtonsPage`, which are not template classes yet — [10.21] and [10.24] — and
-        // a `Gtk.StackPage` here has to name a child *class* the type system already
+        // `ButtonsPage`; `ButtonsPage` is not a template class yet — [10.24] — and a
+        // `Gtk.StackPage` here has to name a child *class* the type system already
         // knows, or the whole template fails to instantiate rather than just that page.
-        // `ScannersPane::new` adds both with `add_named`, which takes an instance; that
-        // does not change when they become subclasses, because each is built with the
-        // bus channel a builder-instantiated child could not be given.
+        // `ScannersPane::new` adds both with `add_named`, which takes an instance. That
+        // stays true for $DetailsPane now that it is one: each page is wrapped in a
+        // Gtk.ScrolledWindow built there, and `ButtonsPage` is built with the bus channel
+        // a builder-instantiated child could not be given.
         Gtk.Stack detail_stack {
           visible-child-name: "placeholder";
 

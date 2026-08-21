@@ -1,9 +1,12 @@
-// The unpair confirmation — `scanners.rs`, raised by the detail pane's Unpair button.
-// No mockup: §7 of the GUI design owes the destructive action a confirmation, and this
-// is it.
+// The unpair confirmation — the template `unpair_dialog.rs` `UnpairDialog` is bound to,
+// raised by the detail pane's Unpair button. No mockup: §7 of the GUI design owes the
+// destructive action a confirmation, and this is it.
 //
-// Transient for the window and modal. The body text names the scanner, so it is written
-// before presenting.
+// Modal here; the transient parent is set by `UnpairDialog::new`, because it is the
+// window this particular dialog was raised over. The body text names the scanner, so it
+// is written there too.
+//
+// Both `=>` below are `swapped`: the dialog is `self`, and it is what closes.
 
 using Gtk 4.0;
 
@@ -32,14 +35,15 @@ template $UnpairDialog : Gtk.Window {
       Gtk.Button cancel {
         label: _("Cancel");
 
-        clicked => $on_unpair_cancel();
+        clicked => $on_unpair_cancel() swapped;
       }
 
-      // scanners.rs `destructive`. Sends Unpair, then closes.
+      // Sends Unpair, then closes. `scanners.rs` is not told: there is nothing left for
+      // the pane to decide once this has been clicked.
       Gtk.Button confirm {
         label: _("Unpair");
 
-        clicked => $on_unpair_confirm();
+        clicked => $on_unpair_confirm() swapped;
 
         styles ["destructive-action"]
       }

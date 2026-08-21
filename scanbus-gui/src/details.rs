@@ -1,17 +1,21 @@
-//! The right-hand pane: what one scanner is, and where its keys are configured.
+//! The right-hand pane: what one scanner is, and where its keys are configured — the
+//! composite-template subclass `details-pane.blp` declares.
 //!
 //! The layout is `docs/design/main.png` — three sections separated by rules. Identity at
 //! the top (icon, name, the one-line summary the list row also shows), the facts in the
-//! middle as icon / label / value, and the full-width **Configure buttons** row at the
-//! bottom. Every fact is a row of the same shape, so the pane is a fixed set of labels
-//! that [`DetailsPane::render`] fills from the store rather than widgets built per
-//! scanner: the selection changes far more often than the shape of the pane does.
+//! middle as [`DetailsFactRow`]s, and the full-width **Configure buttons** row at the
+//! bottom. The pane is a fixed set of labels that [`DetailsPane::render`] fills from the
+//! store rather than widgets built per scanner: the selection changes far more often than
+//! the shape of the pane does, which is also why the whole shape is now in the `.blp` and
+//! what is left here is three functions of a `Status` and two methods that write labels.
 
+use gtk::{CompositeTemplate, TemplateChild, glib};
 use gtk4 as gtk;
-use libadwaita as adw;
 use libadwaita::prelude::*;
+use libadwaita::subclass::prelude::*;
 use scanbus_core::Status;
 
+use crate::details_fact_row::DetailsFactRow;
 use crate::scanners::{
     connection_value, default_profile_label, humanize_backend, status_summary, status_value,
 };
@@ -22,6 +26,10 @@ use crate::store::ScannerEntry;
 /// `Offline` is deliberately uncoloured: the design gives green to *Online* and leaves
 /// the absence of a scanner as plain text, so the pane reads as one accent rather than a
 /// row of traffic lights.
+///
+/// Stays in Rust rather than moving to the `.blp` with the rest of the shape: a class
+/// applied *because of a property value* is content, and §3's "online is the only green"
+/// is a unit test over this function.
 fn status_css_class(status: Status) -> Option<&'static str> {
     match status {
         Status::Online => Some("success"),
@@ -43,49 +51,106 @@ fn identity_icon_name(backend: &str) -> &'static str {
     }
 }
 
-fn value_label() -> gtk::Label {
-    let label = gtk::Label::new(None);
-    label.set_xalign(1.0);
-    label.set_halign(gtk::Align::End);
-    label.set_wrap(true);
-    label
+mod imp {
+    use std::sync::OnceLock;
+
+    use glib::subclass::Signal;
+
+    use super::*;
+
+    #[derive(Default, CompositeTemplate)]
+    #[template(resource = "/org/scanbus/Gui/ui/details-pane.ui")]
+    pub struct DetailsPane {
+        #[template_child]
+        pub icon: TemplateChild<gtk::Image>,
+        #[template_child]
+        pub name: TemplateChild<gtk::Label>,
+        /// The status word of the summary line — the half that carries the colour.
+        #[template_child]
+        pub summary_status: TemplateChild<gtk::Label>,
+        /// The rest of the summary line, which never does.
+        #[template_child]
+        pub summary_rest: TemplateChild<gtk::Label>,
+
+        /// The five facts. Each row's icon and title are set by `details-pane.blp`; what
+        /// a render touches is the `value` label reached through it.
+        #[template_child]
+        pub status_row: TemplateChild<DetailsFactRow>,
+        #[template_child]
+        pub connection_row: TemplateChild<DetailsFactRow>,
+        #[template_child]
+        pub address_row: TemplateChild<DetailsFactRow>,
+        #[template_child]
+        pub backend_row: TemplateChild<DetailsFactRow>,
+        #[template_child]
+        pub default_profile_row: TemplateChild<DetailsFactRow>,
+
+        /// The bottom section, hidden whole for a scanner that is not paired yet: both
+        /// actions in it are pairing-only, and a lone rule over empty space is not a
+        /// section. Rule and box are shown together, so both are held.
+        #[template_child]
+        pub actions_separator: TemplateChild<gtk::Separator>,
+        #[template_child]
+        pub actions: TemplateChild<gtk::Box>,
+        #[template_child]
+        pub configure_list: TemplateChild<gtk::ListBox>,
+        #[template_child]
+        pub unpair: TemplateChild<gtk::Button>,
+    }
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for DetailsPane {
+        /// Must match `template $DetailsPane` in `details-pane.blp`.
+        const NAME: &'static str = "DetailsPane";
+        type Type = super::DetailsPane;
+        type ParentType = gtk::Box;
+
+        fn class_init(klass: &mut Self::Class) {
+            // `details-pane.blp` names `$DetailsFactRow` five times and GtkBuilder
+            // resolves that to a GType *by name*, so the class has to be registered
+            // before this template is instantiated. Nothing else in the crate mentions
+            // the type, so nothing else would register it.
+            DetailsFactRow::ensure_type();
+
+            klass.bind_template();
+            // Instance callbacks, as in `window.rs`: the `#[gtk::template_callbacks]`
+            // block is on the wrapper type.
+            klass.bind_template_instance_callbacks();
+        }
+
+        fn instance_init(obj: &glib::subclass::InitializingObject<Self>) {
+            obj.init_template();
+        }
+    }
+
+    impl ObjectImpl for DetailsPane {
+        /// The two things the pane asks its owner for, as real signals rather than the
+        /// `RefCell<Option<Box<dyn Fn>>>` slots this file used to hold.
+        ///
+        /// Neither can be a `#[template_callback]` on the pane alone: switching
+        /// `detail_stack` and raising the confirmation are both `ScannersPane`'s to do,
+        /// and it is the pane that knows whether the selected scanner is still paired.
+        /// A signal is how a template subclass says "something happened here" without
+        /// knowing who is listening.
+        fn signals() -> &'static [Signal] {
+            static SIGNALS: OnceLock<Vec<Signal>> = OnceLock::new();
+            SIGNALS.get_or_init(|| {
+                vec![
+                    Signal::builder("configure-requested").build(),
+                    Signal::builder("unpair-requested").build(),
+                ]
+            })
+        }
+    }
+    impl WidgetImpl for DetailsPane {}
+    impl BoxImpl for DetailsPane {}
 }
 
-/// One middle-section row: icon, label, and the value pushed to the right margin.
-fn fact_row(icon_name: &str, title: &str, value: &gtk::Label) -> gtk::Box {
-    let icon = gtk::Image::from_icon_name(icon_name);
-    icon.add_css_class("dim-label");
-
-    let title_label = gtk::Label::new(Some(title));
-    title_label.set_xalign(0.0);
-
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-    row.append(&icon);
-    row.append(&title_label);
-    row.append(&gtk::Box::builder().hexpand(true).build());
-    row.append(value);
-    row
-}
-
-pub struct DetailsPane {
-    root: gtk::Box,
-    icon: gtk::Image,
-    name: gtk::Label,
-    /// The status word of the summary line — the half that carries the colour.
-    summary_status: gtk::Label,
-    /// The rest of the summary line, which never does.
-    summary_rest: gtk::Label,
-    status: gtk::Label,
-    connection: gtk::Label,
-    address: gtk::Label,
-    backend: gtk::Label,
-    default_profile: gtk::Label,
-    configure_list: gtk::ListBox,
-    unpair: gtk::Button,
-    /// The bottom section, hidden whole for a scanner that is not paired yet: both
-    /// actions in it are pairing-only, and a lone rule over empty space is not a section.
-    actions: gtk::Box,
-    actions_separator: gtk::Separator,
+glib::wrapper! {
+    /// The detail pane, built from `details-pane.blp` and written from the store.
+    pub struct DetailsPane(ObjectSubclass<imp::DetailsPane>)
+        @extends gtk::Box, gtk::Widget,
+        @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget, gtk::Orientable;
 }
 
 impl Default for DetailsPane {
@@ -96,181 +161,111 @@ impl Default for DetailsPane {
 
 impl DetailsPane {
     pub fn new() -> Self {
-        let icon = gtk::Image::from_icon_name(identity_icon_name(""));
-        icon.set_pixel_size(80);
-        icon.set_halign(gtk::Align::Center);
-
-        let name = gtk::Label::new(None);
-        name.add_css_class("title-2");
-        name.set_wrap(true);
-        name.set_justify(gtk::Justification::Center);
-
-        let summary_status = gtk::Label::new(None);
-        let summary_rest = gtk::Label::new(None);
-        let summary = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        summary.set_halign(gtk::Align::Center);
-        summary.append(&summary_status);
-        summary.append(&summary_rest);
-
-        // The box fills the pane so a long name has the full width to wrap into; each
-        // child centres itself.
-        let identity = gtk::Box::new(gtk::Orientation::Vertical, 12);
-        identity.append(&icon);
-        identity.append(&name);
-        identity.append(&summary);
-
-        let status = value_label();
-        let connection = value_label();
-        let address = value_label();
-        address.set_selectable(true);
-        let backend = value_label();
-        let default_profile = value_label();
-
-        let facts = gtk::Box::new(gtk::Orientation::Vertical, 18);
-        let rows = [
-            (
-                "network-cellular-signal-excellent-symbolic",
-                "Status",
-                &status,
-            ),
-            (
-                "network-wireless-hotspot-symbolic",
-                "Connection",
-                &connection,
-            ),
-            ("network-wired-symbolic", "Address", &address),
-            ("application-x-sharedlib-symbolic", "Backend", &backend),
-            (
-                "text-x-generic-symbolic",
-                "Default profile",
-                &default_profile,
-            ),
-        ];
-        for (icon_name, title, value) in rows {
-            facts.append(&fact_row(icon_name, title, value));
-        }
-
-        // `boxed-list` is what gives the row the lighter-than-the-pane background the
-        // paired scanner list already has; a plain button would sit on the pane colour.
-        let configure = adw::ActionRow::builder()
-            .title("Configure buttons")
-            .activatable(true)
-            .build();
-        configure.add_prefix(&gtk::Image::from_icon_name("preferences-other-symbolic"));
-        configure.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
-
-        let configure_list = gtk::ListBox::new();
-        configure_list.add_css_class("boxed-list");
-        configure_list.set_selection_mode(gtk::SelectionMode::None);
-        configure_list.append(&configure);
-
-        // Not in the mockup, and kept anyway: unpairing is reachable from nowhere else in
-        // the window, and §7 of the GUI design owes it a confirmation dialog. It sits
-        // below the row rather than in the same list so a mis-aimed click cannot land on
-        // the irreversible half of the section.
-        let unpair = gtk::Button::with_label("Unpair");
-        unpair.add_css_class("destructive-action");
-        unpair.set_halign(gtk::Align::Fill);
-
-        let actions = gtk::Box::new(gtk::Orientation::Vertical, 12);
-        actions.append(&configure_list);
-        actions.append(&unpair);
-        actions.set_visible(false);
-
-        let actions_separator = gtk::Separator::new(gtk::Orientation::Horizontal);
-        actions_separator.set_visible(false);
-
-        let root = gtk::Box::new(gtk::Orientation::Vertical, 24);
-        root.set_margin_top(24);
-        root.set_margin_bottom(24);
-        root.set_margin_start(24);
-        root.set_margin_end(24);
-        root.append(&identity);
-        root.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-        root.append(&facts);
-        root.append(&actions_separator);
-        root.append(&actions);
-
-        Self {
-            root,
-            icon,
-            name,
-            summary_status,
-            summary_rest,
-            status,
-            connection,
-            address,
-            backend,
-            default_profile,
-            configure_list,
-            unpair,
-            actions,
-            actions_separator,
-        }
+        glib::Object::new()
     }
 
-    pub fn widget(&self) -> &gtk::Box {
-        &self.root
-    }
-
-    pub fn connect_configure<F>(&self, callback: F)
+    /// *Configure buttons* was activated. The pane does not switch the stack itself —
+    /// see [`imp::DetailsPane::signals`].
+    pub fn connect_configure_requested<F>(&self, callback: F) -> glib::SignalHandlerId
     where
         F: Fn() + 'static,
     {
-        // Wired on the list rather than on the row: `row-activated` is what a plain
-        // `GtkListBox` emits for a click, with no `AdwPreferencesGroup` in between to
-        // forward it to the row's own activation.
-        self.configure_list
-            .connect_row_activated(move |_, _| callback());
+        self.connect_local("configure-requested", false, move |_| {
+            callback();
+            None
+        })
     }
 
-    pub fn connect_unpair<F>(&self, callback: F)
+    /// *Unpair* was clicked. Nothing has been sent yet: the confirmation is the
+    /// listener's to raise.
+    pub fn connect_unpair_requested<F>(&self, callback: F) -> glib::SignalHandlerId
     where
         F: Fn() + 'static,
     {
-        self.unpair.connect_clicked(move |_| callback());
+        self.connect_local("unpair-requested", false, move |_| {
+            callback();
+            None
+        })
     }
 
+    /// Writes the pane from one store entry: labels, the two visibilities, and the status
+    /// classes. Everything else about the pane is in `details-pane.blp`.
     pub fn render(&self, scanner: &ScannerEntry) {
+        let imp = self.imp();
         let state = &scanner.state;
 
-        self.icon
+        imp.icon
             .set_icon_name(Some(identity_icon_name(&state.backend)));
-        self.name.set_label(&state.name);
+        imp.name.set_label(&state.name);
 
         let (lead, rest) = status_summary(state.status, state.connected, state.paired);
-        self.summary_status.set_label(lead);
-        self.summary_rest.set_label(rest);
+        imp.summary_status.set_label(lead);
+        imp.summary_rest.set_label(rest);
         // An unpaired scanner leads with "Discovered", which is not a status and takes no
         // colour even when the device itself is online.
-        set_status_class(&self.summary_status, state.paired.then_some(state.status));
+        set_status_class(&imp.summary_status, state.paired.then_some(state.status));
 
-        self.status.set_label(status_value(state.status));
-        set_status_class(&self.status, Some(state.status));
-        self.connection.set_label(connection_value(state.connected));
-        self.address.set_label(&state.address);
-        self.backend.set_label(&humanize_backend(&state.backend));
-        self.default_profile
+        let status = imp.status_row.value();
+        status.set_label(status_value(state.status));
+        set_status_class(&status, Some(state.status));
+
+        imp.connection_row
+            .value()
+            .set_label(connection_value(state.connected));
+        imp.address_row.value().set_label(&state.address);
+        imp.backend_row
+            .value()
+            .set_label(&humanize_backend(&state.backend));
+        imp.default_profile_row
+            .value()
             .set_label(&default_profile_label(state.default_profile));
 
-        self.actions.set_visible(state.paired);
-        self.actions_separator.set_visible(state.paired);
+        imp.actions.set_visible(state.paired);
+        imp.actions_separator.set_visible(state.paired);
     }
 
+    /// Empties the pane, so a deselection does not leave the last scanner on screen.
     pub fn clear(&self) {
-        self.icon.set_icon_name(Some(identity_icon_name("")));
-        self.name.set_label("");
-        self.summary_status.set_label("");
-        self.summary_rest.set_label("");
-        set_status_class(&self.summary_status, None);
-        self.status.set_label("");
-        set_status_class(&self.status, None);
-        self.connection.set_label("");
-        self.address.set_label("");
-        self.backend.set_label("");
-        self.default_profile.set_label("");
-        self.actions.set_visible(false);
-        self.actions_separator.set_visible(false);
+        let imp = self.imp();
+
+        imp.icon.set_icon_name(Some(identity_icon_name("")));
+        imp.name.set_label("");
+        imp.summary_status.set_label("");
+        imp.summary_rest.set_label("");
+        set_status_class(&imp.summary_status, None);
+
+        let status = imp.status_row.value();
+        status.set_label("");
+        set_status_class(&status, None);
+
+        imp.connection_row.value().set_label("");
+        imp.address_row.value().set_label("");
+        imp.backend_row.value().set_label("");
+        imp.default_profile_row.value().set_label("");
+
+        imp.actions.set_visible(false);
+        imp.actions_separator.set_visible(false);
+    }
+}
+
+/// The two handlers `details-pane.blp` names, in the order the template mentions them.
+///
+/// Both are declared `swapped` there, which is what puts the pane in `&self`; each is one
+/// emission, because what to do about it is not this pane's decision.
+#[gtk::template_callbacks]
+impl DetailsPane {
+    /// Wired on the list rather than on the row: `row-activated` is what a plain
+    /// `GtkListBox` emits for a click, with no `AdwPreferencesGroup` in between to
+    /// forward it to the row's own activation. The row it hands over is dropped — the
+    /// list holds exactly one.
+    #[template_callback]
+    fn on_configure_activated(&self) {
+        self.emit_by_name::<()>("configure-requested", &[]);
+    }
+
+    #[template_callback]
+    fn on_unpair_clicked(&self) {
+        self.emit_by_name::<()>("unpair-requested", &[]);
     }
 }
 
@@ -310,7 +305,9 @@ mod tests {
 /// The detail pane's half of the one GTK test — see [`crate::gtk_tests`].
 #[cfg(all(test, feature = "gtk-tests"))]
 pub(crate) mod widget_checks {
+    use std::cell::Cell;
     use std::collections::BTreeMap;
+    use std::rc::Rc;
 
     use scanbus_client::ScannerState;
     use scanbus_core::{Capabilities, PairingState, ProfileKind, ScannerId};
@@ -341,55 +338,99 @@ pub(crate) mod widget_checks {
 
     pub(crate) fn run() {
         let pane = DetailsPane::new();
+        let imp = pane.imp();
 
         pane.render(&scanner("proprietary:brother", Status::Online, true, true));
 
-        assert_eq!(pane.icon.icon_name().as_deref(), Some("printer-symbolic"));
-        assert_eq!(pane.name.label(), "Brother MFC-L2710DW");
-        assert_eq!(pane.summary_status.label(), "Online");
-        assert_eq!(pane.summary_rest.label(), " • Connected");
+        assert_eq!(imp.icon.icon_name().as_deref(), Some("printer-symbolic"));
+        assert_eq!(imp.name.label(), "Brother MFC-L2710DW");
+        assert_eq!(imp.summary_status.label(), "Online");
+        assert_eq!(imp.summary_rest.label(), " • Connected");
         assert!(
-            pane.summary_status.has_css_class("success"),
+            imp.summary_status.has_css_class("success"),
             "the design gives the online summary its one accent"
         );
-        assert_eq!(pane.status.label(), "Online");
-        assert_eq!(pane.connection.label(), "Connected");
-        assert_eq!(pane.address.label(), "192.168.1.23");
-        assert_eq!(pane.backend.label(), "Brother");
-        assert_eq!(pane.default_profile.label(), "Document");
+        assert_eq!(imp.status_row.value().label(), "Online");
+        assert_eq!(imp.connection_row.value().label(), "Connected");
+        assert_eq!(imp.address_row.value().label(), "192.168.1.23");
+        assert_eq!(imp.backend_row.value().label(), "Brother");
+        assert_eq!(imp.default_profile_row.value().label(), "Document");
 
         // Paired is what the bottom section is for; nothing to configure otherwise.
-        assert!(pane.configure_list.is_visible());
-        assert!(pane.unpair.is_visible());
+        assert!(imp.configure_list.is_visible());
+        assert!(imp.unpair.is_visible());
+
+        // Both actions, driven through the template rather than by calling the handlers:
+        // this is the check that `swapped` is still on the two `=>` in `details-pane.blp`
+        // — without it the emitting widget would be `self` and the pane would have no way
+        // to reach `emit_by_name`. The counters are separate because two signals that
+        // both fire on either action would pass a single-flag check.
+        let configure_asked = Rc::new(Cell::new(0u32));
+        let unpair_asked = Rc::new(Cell::new(0u32));
+        pane.connect_configure_requested({
+            let asked = Rc::clone(&configure_asked);
+            move || asked.set(asked.get() + 1)
+        });
+        pane.connect_unpair_requested({
+            let asked = Rc::clone(&unpair_asked);
+            move || asked.set(asked.get() + 1)
+        });
+
+        // Emitted on the list, which is both where a click lands and where the `.blp`
+        // wires the handler; driving the row's own `activate` instead would be asserting
+        // against Adw.ActionRow's forwarding rather than against this pane.
+        let configure_row = imp
+            .configure_list
+            .row_at_index(0)
+            .expect("details-pane.blp puts the Configure buttons row in this list");
+        imp.configure_list
+            .emit_by_name::<()>("row-activated", &[&configure_row]);
+        assert_eq!(
+            (configure_asked.get(), unpair_asked.get()),
+            (1, 0),
+            "activating the row should have asked the pane to configure, and only that"
+        );
+
+        // Unpair asks; it does not unpair. The confirmation is `UnpairDialog`, and
+        // `ScannersPane` is what raises it.
+        imp.unpair.emit_clicked();
+        assert_eq!(
+            (configure_asked.get(), unpair_asked.get()),
+            (1, 1),
+            "the Unpair button should have asked the pane to confirm"
+        );
 
         // Offline drops the accent rather than turning it another colour.
         pane.render(&scanner("hplip", Status::Offline, false, true));
-        assert_eq!(pane.summary_status.label(), "Offline");
-        assert_eq!(pane.summary_rest.label(), "");
-        assert!(!pane.summary_status.has_css_class("success"));
-        assert!(!pane.status.has_css_class("success"));
-        assert_eq!(pane.connection.label(), "Disconnected");
-        assert_eq!(pane.backend.label(), "HPLIP");
+        assert_eq!(imp.summary_status.label(), "Offline");
+        assert_eq!(imp.summary_rest.label(), "");
+        assert!(!imp.summary_status.has_css_class("success"));
+        assert!(!imp.status_row.value().has_css_class("success"));
+        assert_eq!(imp.connection_row.value().label(), "Disconnected");
+        assert_eq!(imp.backend_row.value().label(), "HPLIP");
 
         // A discovered scanner leads with a word that is not a status, so it takes no
         // colour even though the device is online, and offers neither action.
         pane.render(&scanner("mobile", Status::Online, false, false));
-        assert_eq!(pane.icon.icon_name().as_deref(), Some("phone-symbolic"));
-        assert_eq!(pane.summary_status.label(), "Discovered");
-        assert_eq!(pane.summary_rest.label(), " • Not paired");
-        assert!(!pane.summary_status.has_css_class("success"));
-        assert!(pane.status.has_css_class("success"), "the device is online");
-        assert_eq!(pane.backend.label(), "Mobile");
-        assert!(!pane.configure_list.is_visible());
-        assert!(!pane.unpair.is_visible());
+        assert_eq!(imp.icon.icon_name().as_deref(), Some("phone-symbolic"));
+        assert_eq!(imp.summary_status.label(), "Discovered");
+        assert_eq!(imp.summary_rest.label(), " • Not paired");
+        assert!(!imp.summary_status.has_css_class("success"));
+        assert!(
+            imp.status_row.value().has_css_class("success"),
+            "the device is online"
+        );
+        assert_eq!(imp.backend_row.value().label(), "Mobile");
+        assert!(!imp.configure_list.is_visible());
+        assert!(!imp.unpair.is_visible());
 
         // Deselection empties the pane instead of leaving the last scanner on screen.
         pane.clear();
-        assert_eq!(pane.name.label(), "");
-        assert_eq!(pane.summary_status.label(), "");
-        assert_eq!(pane.status.label(), "");
-        assert_eq!(pane.address.label(), "");
-        assert!(!pane.configure_list.is_visible());
-        assert!(!pane.unpair.is_visible());
+        assert_eq!(imp.name.label(), "");
+        assert_eq!(imp.summary_status.label(), "");
+        assert_eq!(imp.status_row.value().label(), "");
+        assert_eq!(imp.address_row.value().label(), "");
+        assert!(!imp.configure_list.is_visible());
+        assert!(!imp.unpair.is_visible());
     }
 }

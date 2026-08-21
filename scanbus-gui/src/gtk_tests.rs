@@ -25,6 +25,7 @@ fn the_widget_layer_binds_to_the_store() {
     // Also runs `scanner_row.rs`'s checks, on rows its own factories built.
     crate::scanners::widget_checks::run();
     crate::settings::widget_checks::run();
+    crate::unpair_dialog::widget_checks::run();
     // Last, because it is the only one that needs a registered `adw::Application`
     // and it instantiates every pane the stack holds, this page included.
     crate::window::widget_checks::run();
