@@ -1,4 +1,4 @@
-// The window — `window.rs` `build_window`.
+// The window — `window.rs` `ScanbusWindow`.
 // Mockup: ../../../docs/design/main.png (the sidebar and header bar it frames).
 //
 // GActions the widgets here name rather than connect to, reconciled against the code:
@@ -16,6 +16,12 @@
 // All seven still exist. The last two are named where they are installed, because the
 // group they belong to is inserted on a widget below this one.
 
+// Every `=>` below is `swapped`. A template handler is invoked with the emitting widget
+// first and the template instance last; `swapped` exchanges the two, which is what lets
+// the Rust side write `fn on_find_clicked(&self)` with the window as `self` and reach
+// the store, the bus channel and the lifecycle through `self.imp()`. Without it `self`
+// would be the button, and none of the three would be reachable.
+
 using Gtk 4.0;
 using Adw 1;
 
@@ -32,10 +38,11 @@ template $ScanbusWindow : Adw.ApplicationWindow {
 
   // Stops discovery, then destroys instead of closing while the background hold is
   // taken, so the app keeps running without a window.
-  close-request => $on_close_request();
+  close-request => $on_close_request() swapped;
 
-  // window.rs `overlay`. Held past construction: `ScannerListModel::connect_toast`
-  // adds to it, and the settings page reaches it to report a failed autostart write.
+  // Held past construction: `ScannerListModel::connect_toast` adds to it through
+  // `ScanbusWindow::add_toast`, and the settings page reaches the same accessor to
+  // report a failed autostart write.
   content: Adw.ToastOverlay toast_overlay {
     child: Gtk.Box {
       orientation: vertical;
@@ -62,7 +69,7 @@ template $ScanbusWindow : Adw.ApplicationWindow {
 
           // One button for both directions: starts discovery when idle, stops it
           // while it runs, and does nothing while a stop is in flight.
-          clicked => $on_find_clicked();
+          clicked => $on_find_clicked() swapped;
         }
       }
 
@@ -87,7 +94,7 @@ template $ScanbusWindow : Adw.ApplicationWindow {
 
             // Clears the footer's selection, then switches `page_stack` to the row's
             // name.
-            row-selected => $on_section_selected();
+            row-selected => $on_section_selected() swapped;
 
             styles ["navigation-sidebar"]
 
@@ -131,7 +138,7 @@ template $ScanbusWindow : Adw.ApplicationWindow {
             selection-mode: single;
 
             // Mirror of `sections`: clears that selection, then switches `page_stack`.
-            row-selected => $on_footer_selected();
+            row-selected => $on_footer_selected() swapped;
 
             styles ["navigation-sidebar"]
 
@@ -156,24 +163,18 @@ template $ScanbusWindow : Adw.ApplicationWindow {
 
         // -- Pages ----------------------------------------------------------
         // Named pages, because the sidebar switches by name and not by index.
+        //
+        // Empty on purpose, and staying that way. A `Gtk.StackPage` here has to name
+        // a child *class*, and a class the type system does not know yet stops the
+        // whole template instantiating — not just that page. `$SettingsPage` exists
+        // now, but a child the builder instantiates gets no constructor arguments, and
+        // all three pages are handed the store and the bus channel when they are built.
+        // So `ScanbusWindow::new` fills this stack with `add_named`, which takes an
+        // instance and so does not care what class it is. [10.20] and [10.23] turn the
+        // other two panes into subclasses; that does not change this.
         Gtk.Stack page_stack {
           hexpand: true;
           vexpand: true;
-
-          Gtk.StackPage {
-            name: "scanners";
-            child: $ScannersPane scanners_pane {};
-          }
-
-          Gtk.StackPage {
-            name: "profiles";
-            child: $ProfilesPage profiles_page {};
-          }
-
-          Gtk.StackPage {
-            name: "settings";
-            child: $SettingsPage settings_page {};
-          }
         }
       }
     };

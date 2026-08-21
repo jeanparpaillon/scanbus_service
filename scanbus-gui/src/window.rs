@@ -1,163 +1,357 @@
+use std::cell::OnceCell;
 use std::rc::Rc;
 
 use async_channel::Sender;
-use gtk::gio;
-use gtk::glib;
 use gtk::glib::variant::ToVariant;
+use gtk::{CompositeTemplate, TemplateChild, gio, glib};
 use gtk4 as gtk;
 use libadwaita as adw;
 use libadwaita::prelude::*;
+// Brings in gtk4's subclass prelude as well, so `WidgetImpl` and friends arrive with
+// `AdwApplicationWindowImpl` rather than from a second import.
+use libadwaita::subclass::prelude::*;
 
-use crate::autostart;
 use crate::bus::BusCommand;
 use crate::lifecycle::AppLifecycle;
 use crate::profiles::ProfilesPage;
 use crate::scanners::{ScannerListModel, ScannersPane, ToastAction};
-use crate::store::{DiscoveryState, ServiceState};
+use crate::settings::SettingsPage;
+use crate::store::DiscoveryState;
 
-pub fn build_window(
-    app: &adw::Application,
-    scanners: Rc<ScannerListModel>,
-    commands: Sender<BusCommand>,
-    lifecycle: Rc<AppLifecycle>,
-) -> adw::ApplicationWindow {
-    let find_button = gtk::Button::with_label("Find scanners…");
-    let spinner = gtk::Spinner::new();
-    spinner.set_spinning(false);
-    spinner.set_visible(false);
-    let pane_commands = commands.clone();
-    let app_menu = gio::Menu::new();
-    app_menu.append(Some("Quit"), Some("app.quit"));
-    let menu_button = gtk::MenuButton::builder()
-        .icon_name("open-menu-symbolic")
-        .menu_model(&app_menu)
-        .build();
+/// The private instance struct GObject owns; [`ScanbusWindow`] is the handle everything
+/// else holds.
+mod imp {
+    use super::*;
 
-    let header = adw::HeaderBar::new();
-    header.pack_end(&menu_button);
-    header.pack_end(&spinner);
-    header.pack_end(&find_button);
+    // No `Debug`: two of the three handles below are plain Rust types that do not
+    // derive it, and a window's interesting state is the store's, not this struct's.
+    #[derive(Default, CompositeTemplate)]
+    #[template(resource = "/org/scanbus/Gui/ui/window.ui")]
+    pub struct ScanbusWindow {
+        /// `ScannerListModel::connect_toast` adds to this, and the settings page
+        /// reaches it to report a failed autostart write.
+        #[template_child]
+        pub toast_overlay: TemplateChild<adw::ToastOverlay>,
+        #[template_child]
+        pub spinner: TemplateChild<gtk::Spinner>,
+        #[template_child]
+        pub find_button: TemplateChild<gtk::Button>,
+        #[template_child]
+        pub sections: TemplateChild<gtk::ListBox>,
+        /// Selected at the end of construction, which is what makes Scanners the page
+        /// the window opens on.
+        #[template_child]
+        pub scanners_row: TemplateChild<gtk::ListBoxRow>,
+        #[template_child]
+        pub footer: TemplateChild<gtk::ListBox>,
+        #[template_child]
+        pub page_stack: TemplateChild<gtk::Stack>,
 
-    let sections = gtk::ListBox::new();
-    sections.add_css_class("navigation-sidebar");
-    sections.set_selection_mode(gtk::SelectionMode::Single);
-    let scanners_row = row("Scanners", "scanners");
-    let profiles_row = row("Profiles", "profiles");
-    sections.append(&scanners_row);
-    sections.append(&profiles_row);
-
-    let footer = gtk::ListBox::new();
-    footer.add_css_class("navigation-sidebar");
-    footer.set_selection_mode(gtk::SelectionMode::Single);
-    let settings_row = row("Settings", "settings");
-    footer.append(&settings_row);
-
-    let sidebar = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    let spacer = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    spacer.set_vexpand(true);
-    sidebar.set_margin_top(18);
-    sidebar.set_margin_bottom(18);
-    sidebar.set_margin_start(18);
-    sidebar.set_margin_end(18);
-    sidebar.set_size_request(220, -1);
-    sidebar.append(&sections);
-    sidebar.append(&spacer);
-    sidebar.append(&footer);
-
-    let scanners_pane = ScannersPane::new(Rc::clone(&scanners), pane_commands);
-    let profiles_page = Rc::new(ProfilesPage::new(commands.clone()));
-
-    let page_stack = gtk::Stack::new();
-    page_stack.set_hexpand(true);
-    page_stack.set_vexpand(true);
-    page_stack.add_named(scanners_pane.widget(), Some("scanners"));
-    page_stack.add_named(profiles_page.widget(), Some("profiles"));
-
-    {
-        let model = Rc::clone(&scanners);
-        let profiles_page = Rc::clone(&profiles_page);
-        let render = move || {
-            profiles_page.render(&model.profiles(), &model.service_details().profile_types);
-        };
-        render();
-        scanners.connect_changed(render);
+        /// The three non-GObject handles the callbacks and the store registrations
+        /// need.
+        ///
+        /// They are cells set after construction rather than construct properties
+        /// because none of the three is a `glib::Value`: making them properties would
+        /// mean a boxed GObject wrapper per handle, and a `#[template_callback]`
+        /// reaches them through `self.imp()` either way.
+        pub scanners: OnceCell<Rc<ScannerListModel>>,
+        pub commands: OnceCell<Sender<BusCommand>>,
+        pub lifecycle: OnceCell<Rc<AppLifecycle>>,
     }
 
-    let content = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    content.append(&sidebar);
-    content.append(&gtk::Separator::new(gtk::Orientation::Vertical));
-    content.append(&page_stack);
+    #[glib::object_subclass]
+    impl ObjectSubclass for ScanbusWindow {
+        /// Must match `template $ScanbusWindow` in `window.blp` exactly: this is the
+        /// name the builder resolves the template against, so the two are one string
+        /// spelled in two files.
+        const NAME: &'static str = "ScanbusWindow";
+        type Type = super::ScanbusWindow;
+        type ParentType = adw::ApplicationWindow;
 
-    let overlay = adw::ToastOverlay::new();
-    let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    root.append(&header);
-    root.append(&content);
-    overlay.set_child(Some(&root));
+        fn class_init(klass: &mut Self::Class) {
+            klass.bind_template();
+            // `bind_template_instance_callbacks`, not `bind_template_callbacks`: the
+            // `#[gtk::template_callbacks]` block is on the wrapper type, so that the
+            // handlers read the same `self.imp()` the rest of `window.rs` does.
+            klass.bind_template_instance_callbacks();
+        }
 
-    let window = adw::ApplicationWindow::builder()
-        .application(app)
-        .title("Scanbus")
-        .default_width(1180)
-        .default_height(720)
-        .content(&overlay)
-        .build();
-
-    page_stack.add_named(
-        &settings_page(
-            &window,
-            &page_stack,
-            Rc::clone(&scanners),
-            commands.clone(),
-            &overlay,
-        ),
-        Some("settings"),
-    );
-
-    {
-        let footer = footer.clone();
-        let page_stack = page_stack.clone();
-        sections.connect_row_selected(move |_, row| {
-            let Some(row) = row else {
-                return;
-            };
-            footer.unselect_all();
-            page_stack.set_visible_child_name(row.widget_name().as_str());
-        });
+        fn instance_init(obj: &glib::subclass::InitializingObject<Self>) {
+            obj.init_template();
+        }
     }
 
-    {
-        let sections = sections.clone();
-        let page_stack = page_stack.clone();
-        footer.connect_row_selected(move |_, row| {
-            let Some(row) = row else {
-                return;
+    impl ObjectImpl for ScanbusWindow {}
+    impl WidgetImpl for ScanbusWindow {}
+    impl WindowImpl for ScanbusWindow {}
+    impl ApplicationWindowImpl for ScanbusWindow {}
+    impl AdwApplicationWindowImpl for ScanbusWindow {}
+}
+
+glib::wrapper! {
+    /// The composite-template subclass `window.blp` declares, and the only place the
+    /// window's widget tree is named.
+    ///
+    /// Nothing in `imp` is constructed by Rust: `init_template` fills each
+    /// `#[template_child]` from the id of the same name in the compiled `.ui`, so a
+    /// field with no matching id — or an id whose type has drifted — fails at
+    /// instantiation rather than leaving a widget that silently never appears. That is
+    /// the drift check §10 of the design doc asks for.
+    pub struct ScanbusWindow(ObjectSubclass<imp::ScanbusWindow>)
+        @extends adw::ApplicationWindow, gtk::ApplicationWindow, gtk::Window, gtk::Widget,
+        @implements gio::ActionGroup, gio::ActionMap, gtk::Accessible, gtk::Buildable,
+                    gtk::ConstraintTarget, gtk::Native, gtk::Root, gtk::ShortcutManager;
+}
+
+impl ScanbusWindow {
+    /// Builds the window and hands it the three non-GObject handles its callbacks need.
+    ///
+    /// The one entry point `main.rs` has, and the only place this window is built.
+    /// The cells are filled here, once, before the window has been presented or
+    /// returned, so a `#[template_callback]` may read them as already set — nothing can
+    /// reach a callback before `new` gives the window back.
+    pub fn new(
+        app: &adw::Application,
+        scanners: Rc<ScannerListModel>,
+        commands: Sender<BusCommand>,
+        lifecycle: Rc<AppLifecycle>,
+    ) -> Self {
+        let window: Self = glib::Object::builder().property("application", app).build();
+
+        // Every cell is empty: the object was built two lines up and this is its only
+        // constructor, so `set` cannot fail. The asserts say that rather than dropping a
+        // handle on the floor should it ever stop being true — and `Rc<ScannerListModel>`
+        // is not `Debug`, so `expect` is not available here anyway.
+        let imp = window.imp();
+        assert!(imp.scanners.set(scanners).is_ok(), "scanners set twice");
+        assert!(imp.commands.set(commands).is_ok(), "commands set twice");
+        assert!(imp.lifecycle.set(lifecycle).is_ok(), "lifecycle set twice");
+
+        // `win.retry-pair` stays what it is today: a runtime `SimpleAction` with a string
+        // target, added to the window rather than declared in `window.blp`. Blueprint can
+        // name an action a widget activates, but it cannot install one — and nothing here
+        // activates it from a widget anyway: the only emitter is the toast raised below,
+        // which carries the scanner's object path as the action target.
+        //
+        // The closure captures a clone of the command channel and not the window. A
+        // strong `self` would be a cycle — the window owns its action map, which owns the
+        // action, which owns this closure — and the sender is all the handler needs.
+        {
+            let commands = imp.commands.get().expect("commands set just above").clone();
+            let retry_pair =
+                gio::SimpleAction::new("retry-pair", Some(&String::static_variant_type()));
+            retry_pair.connect_activate(move |_, parameter| {
+                let Some(parameter) = parameter else {
+                    return;
+                };
+                let Some(path) = parameter.get::<String>() else {
+                    return;
+                };
+                let _ = commands.try_send(BusCommand::Pair { path });
+            });
+            window.add_action(&retry_pair);
+        }
+
+        // The three pages of `page_stack`, added by instance because `window.blp`
+        // declares the stack empty: a `Gtk.StackPage` there has to name a child *class*,
+        // and only Settings has one — the two panes below become subclasses with [10.20]
+        // and [10.23]. `add_named` takes an instance and so does not care what class it
+        // is, which is what lets the stack be filled before they land.
+        let model = Rc::clone(imp.scanners.get().expect("scanners set just above"));
+        let commands = imp.commands.get().expect("commands set just above").clone();
+
+        let scanners_pane = ScannersPane::new(Rc::clone(&model), commands.clone());
+        let profiles_page = Rc::new(ProfilesPage::new(commands.clone()));
+        imp.page_stack
+            .add_named(scanners_pane.widget(), Some("scanners"));
+        imp.page_stack
+            .add_named(profiles_page.widget(), Some("profiles"));
+        imp.page_stack.add_named(
+            &SettingsPage::new(Rc::clone(&model), commands),
+            Some("settings"),
+        );
+
+        // Selecting the row is what opens the window on Scanners: the template's own
+        // `row-selected` handler switches the stack. It has to follow the `add_named`
+        // calls above — `set_visible_child_name` for a child the stack does not have yet
+        // does nothing, and the window would come up on an empty pane.
+        imp.sections.select_row(Some(&*imp.scanners_row));
+
+        // The Profiles page renders from the store like every other page, but it is not
+        // a subclass yet, so its registration stays here instead of moving into its own
+        // constructor with [10.23]. It captures the page, which has no other owner, and
+        // the model — but not the window, which is the one that has to stay finalisable.
+        {
+            let model = Rc::clone(&model);
+            let profiles_page = Rc::clone(&profiles_page);
+            let render = move || {
+                profiles_page.render(&model.profiles(), &model.service_details().profile_types);
             };
-            sections.unselect_all();
-            page_stack.set_visible_child_name(row.widget_name().as_str());
-        });
+            render();
+            imp.scanners
+                .get()
+                .expect("scanners set just above")
+                .connect_changed(render);
+        }
+
+        // Registered once, here, rather than from a `#[template_callback]`: `render` is
+        // driven by the store rather than by a signal on any widget. The closure holds a
+        // weak reference because `ScannerListModel` keeps every callback it is given for
+        // its own lifetime, and the model is held in `imp` above — a strong `self` would
+        // be a cycle through the store, and the window would never be finalised.
+        let weak = window.downgrade();
+        imp.scanners
+            .get()
+            .expect("scanners set just above")
+            .connect_changed(move || {
+                if let Some(window) = weak.upgrade() {
+                    window.render();
+                }
+            });
+
+        // The toast wiring, also unchanged in substance: `ScannerListModel` raises a spec
+        // and this turns it into an `adw::Toast` on the overlay. It cannot move into the
+        // `.blp` either — the message, the button label and the action target are all
+        // written per toast from the store.
+        //
+        // It goes through `add_toast` on a weak handle rather than capturing the overlay
+        // widget, for the same reason the render registration above does: `connect_toast`
+        // keeps every callback for the model's lifetime, so a captured overlay would
+        // outlive the window that owns it.
+        let weak_for_toast = window.downgrade();
+        imp.scanners
+            .get()
+            .expect("scanners set just above")
+            .connect_toast(move |toast| {
+                let Some(window) = weak_for_toast.upgrade() else {
+                    return;
+                };
+                let toast_widget = adw::Toast::new(&toast.message);
+                if let Some(label) = &toast.button_label {
+                    toast_widget.set_button_label(Some(label));
+                }
+                if let Some(action) = &toast.action {
+                    match action {
+                        ToastAction::RetryPair { path } => {
+                            toast_widget.set_action_name(Some("win.retry-pair"));
+                            toast_widget.set_action_target_value(Some(&path.to_variant()));
+                        }
+                    }
+                }
+                window.add_toast(toast_widget);
+            });
+
+        // Nothing rendered the header bar before it was presented until now: the
+        // hand-built button this replaces already carried the Idle label the template
+        // declares. It matters when a window is built while discovery is already running
+        // — a `--background` close and a later re-activation — where the store is ahead
+        // of the template.
+        window.render();
+
+        window
     }
 
-    sections.select_row(Some(&scanners_row));
+    /// Writes the header bar from the store: the spinner, and the find button's label
+    /// and sensitivity.
+    ///
+    /// The whole of what this window renders itself — every page in the stack renders
+    /// its own content. It is one button because it is one action in both directions:
+    /// the label is what says which direction the next click takes.
+    fn render(&self) {
+        let imp = self.imp();
+        let state = imp
+            .scanners
+            .get()
+            .expect("scanners set in `new`")
+            .discovery_state();
 
-    {
-        let commands = commands.clone();
-        let retry_pair = gio::SimpleAction::new("retry-pair", Some(&String::static_variant_type()));
-        retry_pair.connect_activate(move |_, parameter| {
-            let Some(parameter) = parameter else {
-                return;
-            };
-            let Some(path) = parameter.get::<String>() else {
-                return;
-            };
-            let _ = commands.try_send(BusCommand::Pair { path });
-        });
-        window.add_action(&retry_pair);
+        let busy = !matches!(state, DiscoveryState::Idle);
+        imp.spinner.set_visible(busy);
+        imp.spinner.set_spinning(busy);
+
+        match state {
+            DiscoveryState::Idle => {
+                imp.find_button.set_label("Find scanners…");
+                imp.find_button.set_sensitive(true);
+            }
+            DiscoveryState::Starting | DiscoveryState::Active => {
+                imp.find_button.set_label("Stop");
+                imp.find_button.set_sensitive(true);
+            }
+            // A stop is in flight: the label still says what is being waited for, and
+            // the button refuses further clicks until the daemon answers.
+            DiscoveryState::Stopping => {
+                imp.find_button.set_label("Stop");
+                imp.find_button.set_sensitive(false);
+            }
+        }
     }
 
-    {
-        let scanners = Rc::clone(&scanners);
-        let commands = commands.clone();
-        find_button.connect_clicked(move |_| match scanners.discovery_state() {
+    /// Switches the page stack by name, leaving both sidebar selections alone.
+    ///
+    /// What the settings page's two output rows call to jump to Profiles. Not touching
+    /// the selection is deliberate: the closure this replaces did not either, so the
+    /// footer's Settings row stays selected over the Profiles page exactly as today.
+    // Reached only from `settings.rs`, whose caller is a template callback.
+    pub(crate) fn show_page(&self, name: &str) {
+        self.imp().page_stack.set_visible_child_name(name);
+    }
+
+    /// Raises a toast on the window's overlay.
+    ///
+    /// The overlay is a `#[template_child]` of this window, so a page inside it — the
+    /// settings page reporting a failed autostart write — asks the window rather than
+    /// holding the overlay itself.
+    pub(crate) fn add_toast(&self, toast: adw::Toast) {
+        self.imp().toast_overlay.add_toast(toast);
+    }
+}
+
+/// The four handlers `window.blp` names, in the order the template mentions them.
+///
+/// Each is declared `swapped` in the `.blp`, which is what puts the window in `&self`:
+/// GtkBuilder hands a template handler the emitting widget first and the template
+/// instance last, and `swapped` exchanges the two. So every emitter here — the button,
+/// either list box — is the argument that gets dropped, and the state comes off
+/// `self.imp()` instead of out of a captured `Rc`.
+#[gtk::template_callbacks]
+impl ScanbusWindow {
+    /// Stops discovery, then destroys instead of closing while the background hold is
+    /// taken.
+    ///
+    /// Returning `Propagation::Stop` after `destroy()` is what §4 rests on: the default
+    /// handler would close the window *and* let the application drop its last window,
+    /// ending the process. Destroying by hand and stopping the emission leaves the
+    /// process alive with no window, which is what `--background` means.
+    #[template_callback]
+    fn on_close_request(&self) -> glib::Propagation {
+        let imp = self.imp();
+        let scanners = imp.scanners.get().expect("scanners set in `new`");
+        let commands = imp.commands.get().expect("commands set in `new`");
+        let lifecycle = imp.lifecycle.get().expect("lifecycle set in `new`");
+
+        if scanners.begin_discovery_stop() {
+            let _ = commands.try_send(BusCommand::StopDiscovery { quiet: true });
+        }
+        if lifecycle.is_background_held() {
+            self.destroy();
+            return glib::Propagation::Stop;
+        }
+        glib::Propagation::Proceed
+    }
+
+    /// One button for both directions: starts discovery when idle, stops it while it
+    /// runs, and does nothing while a stop is already in flight.
+    ///
+    /// The `begin_*` calls are the store's own guard against a second command for a
+    /// transition already under way, so the button never has to track that itself.
+    #[template_callback]
+    fn on_find_clicked(&self) {
+        let imp = self.imp();
+        let scanners = imp.scanners.get().expect("scanners set in `new`");
+        let commands = imp.commands.get().expect("commands set in `new`");
+
+        match scanners.discovery_state() {
             DiscoveryState::Idle => {
                 if scanners.begin_discovery_start() {
                     let _ = commands.try_send(BusCommand::StartDiscovery);
@@ -169,324 +363,157 @@ pub fn build_window(
                 }
             }
             DiscoveryState::Stopping => {}
-        });
-    }
-
-    {
-        let scanners = Rc::clone(&scanners);
-        let find_button = find_button.clone();
-        let spinner = spinner.clone();
-        let model = Rc::clone(&scanners);
-        scanners.connect_changed(move || {
-            let state = model.discovery_state();
-            let busy = !matches!(state, DiscoveryState::Idle);
-            spinner.set_visible(busy);
-            spinner.set_spinning(busy);
-
-            match state {
-                DiscoveryState::Idle => {
-                    find_button.set_label("Find scanners…");
-                    find_button.set_sensitive(true);
-                }
-                DiscoveryState::Starting | DiscoveryState::Active => {
-                    find_button.set_label("Stop");
-                    find_button.set_sensitive(true);
-                }
-                DiscoveryState::Stopping => {
-                    find_button.set_label("Stop");
-                    find_button.set_sensitive(false);
-                }
-            }
-        });
-    }
-
-    {
-        let overlay = overlay.clone();
-        scanners.connect_toast(move |toast| {
-            let toast_widget = adw::Toast::new(&toast.message);
-            if let Some(label) = &toast.button_label {
-                toast_widget.set_button_label(Some(label));
-            }
-            if let Some(action) = &toast.action {
-                match action {
-                    ToastAction::RetryPair { path } => {
-                        toast_widget.set_action_name(Some("win.retry-pair"));
-                        toast_widget.set_action_target_value(Some(&path.to_variant()));
-                    }
-                }
-            }
-            overlay.add_toast(toast_widget);
-        });
-    }
-
-    {
-        let scanners = Rc::clone(&scanners);
-        let commands = commands.clone();
-        let lifecycle = Rc::clone(&lifecycle);
-        window.connect_close_request(move |window| {
-            if scanners.begin_discovery_stop() {
-                let _ = commands.try_send(BusCommand::StopDiscovery { quiet: true });
-            }
-            if lifecycle.is_background_held() {
-                window.destroy();
-                return glib::Propagation::Stop;
-            }
-            glib::Propagation::Proceed
-        });
-    }
-
-    window
-}
-
-fn settings_page(
-    window: &adw::ApplicationWindow,
-    page_stack: &gtk::Stack,
-    model: Rc<ScannerListModel>,
-    commands: Sender<BusCommand>,
-    overlay: &adw::ToastOverlay,
-) -> gtk::ScrolledWindow {
-    let page = adw::PreferencesPage::new();
-    let daemon_group = adw::PreferencesGroup::builder()
-        .title("Daemon")
-        .description("Read the scanbus daemon state without starting it, then start it explicitly when it is only activatable.")
-        .build();
-
-    let daemon_row = adw::ActionRow::builder().title("Service").build();
-    let start_button = gtk::Button::with_label("Start");
-    start_button.set_valign(gtk::Align::Center);
-    daemon_row.add_suffix(&start_button);
-    daemon_group.add(&daemon_row);
-
-    let version_row = adw::ActionRow::builder().title("Version").build();
-    daemon_group.add(&version_row);
-
-    let backends_row = adw::ActionRow::builder().title("Backends").build();
-    daemon_group.add(&backends_row);
-
-    let profiles_row = adw::ActionRow::builder().title("Profile types").build();
-    daemon_group.add(&profiles_row);
-    page.add(&daemon_group);
-
-    let output_group = adw::PreferencesGroup::builder()
-        .title("Default output folders")
-        .description("These folders are read-only here. Use Profiles to change them.")
-        .build();
-    let image_row = profile_folder_row("Image");
-    let document_row = profile_folder_row("Document");
-    output_group.add(&image_row);
-    output_group.add(&document_row);
-    page.add(&output_group);
-
-    let group = adw::PreferencesGroup::builder()
-        .title("Background mode")
-        .description("The packaged GNOME session starts scanbus-gui in the background at login through XDG autostart.")
-        .build();
-
-    let row = adw::ActionRow::builder()
-        .title("Start in the background at login")
-        .build();
-    let toggle = gtk::Switch::new();
-    toggle.set_valign(gtk::Align::Center);
-    row.set_activatable_widget(Some(&toggle));
-    row.add_suffix(&toggle);
-    group.add(&row);
-    page.add(&group);
-
-    match autostart::is_enabled() {
-        Ok(enabled) => {
-            toggle.set_active(enabled);
-            row.set_subtitle(&autostart_subtitle(enabled));
-        }
-        Err(error) => {
-            toggle.set_sensitive(false);
-            row.set_subtitle(&format!("Could not read the autostart override: {error}"));
         }
     }
 
-    let about_group = adw::PreferencesGroup::builder().title("About").build();
-    let about_row = adw::ActionRow::builder()
-        .title("About Scanbus")
-        .subtitle("GUI version, daemon version, repository and licence")
-        .activatable(true)
-        .build();
-    about_row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
-    about_group.add(&about_row);
-    page.add(&about_group);
-
-    {
-        let commands = commands.clone();
-        start_button.connect_clicked(move |_| {
-            let _ = commands.try_send(BusCommand::StartService);
-        });
-    }
-
-    {
-        let page_stack = page_stack.clone();
-        image_row.connect_activated(move |_| {
-            page_stack.set_visible_child_name("profiles");
-        });
-    }
-
-    {
-        let page_stack = page_stack.clone();
-        document_row.connect_activated(move |_| {
-            page_stack.set_visible_child_name("profiles");
-        });
-    }
-
-    {
-        let row = row.clone();
-        let overlay = overlay.clone();
-        let syncing = Rc::new(std::cell::Cell::new(false));
-        let syncing_for_cb = Rc::clone(&syncing);
-        toggle.connect_active_notify(move |toggle| {
-            if syncing_for_cb.get() {
-                return;
-            }
-
-            let enabled = toggle.is_active();
-            if let Err(error) = autostart::set_enabled(enabled) {
-                syncing_for_cb.set(true);
-                toggle.set_active(!enabled);
-                syncing_for_cb.set(false);
-                overlay.add_toast(adw::Toast::new(&format!(
-                    "Could not update the autostart override: {error}"
-                )));
-                return;
-            }
-
-            row.set_subtitle(&autostart_subtitle(enabled));
-        });
-    }
-
-    {
-        let window = window.clone();
-        let model = Rc::clone(&model);
-        about_row.connect_activated(move |_| {
-            let details = model.service_details();
-            let daemon_version = details.version.unwrap_or_else(|| "unknown".to_owned());
-            let about = gtk::AboutDialog::builder()
-                .program_name("Scanbus")
-                .logo_icon_name("org.scanbus.Gui")
-                .version(env!("CARGO_PKG_VERSION"))
-                .website(env!("CARGO_PKG_REPOSITORY"))
-                .website_label("Repository")
-                .license_type(gtk::License::Unknown)
-                .comments(format!(
-                    "GUI version: {}.\nDaemon version: {}.\nLicence: Unknown.",
-                    env!("CARGO_PKG_VERSION"),
-                    daemon_version
-                ))
-                .transient_for(&window)
-                .modal(true)
-                .build();
-            about.present();
-        });
-    }
-
-    {
-        let model = Rc::clone(&model);
-        let refresh_model = Rc::clone(&model);
-        let daemon_row = daemon_row.clone();
-        let start_button = start_button.clone();
-        let version_row = version_row.clone();
-        let backends_row = backends_row.clone();
-        let profiles_row = profiles_row.clone();
-        let image_row = image_row.clone();
-        let document_row = document_row.clone();
-        let refresh = move || {
-            let details = refresh_model.service_details();
-            match refresh_model.service_state() {
-                ServiceState::Running => {
-                    daemon_row.set_subtitle("Running");
-                    start_button.set_visible(false);
-                }
-                ServiceState::Activatable => {
-                    daemon_row.set_subtitle("Installed, but not running");
-                    start_button.set_visible(true);
-                    start_button.set_sensitive(true);
-                }
-                ServiceState::Absent => {
-                    daemon_row.set_subtitle("Absent from this session bus");
-                    start_button.set_visible(false);
-                }
-                ServiceState::Unknown => {
-                    daemon_row.set_subtitle("Checking the bus…");
-                    start_button.set_visible(false);
-                }
-            }
-
-            version_row.set_subtitle(details.version.as_deref().unwrap_or("Unknown"));
-            backends_row.set_subtitle(&joined(&details.backends));
-            profiles_row.set_subtitle(&joined(&details.profile_types));
-            set_folder_row(
-                &image_row,
-                details
-                    .output_folders
-                    .get(&scanbus_core::ProfileKind::Image),
-            );
-            set_folder_row(
-                &document_row,
-                details
-                    .output_folders
-                    .get(&scanbus_core::ProfileKind::Document),
-            );
+    /// Clears the footer's selection, then switches `page_stack` to the row's name.
+    ///
+    /// `row-selected` fires with `None` when a list box is unselected, including the
+    /// `unselect_all` its mirror below calls — so the early return is what stops the two
+    /// handlers driving each other in a loop.
+    #[template_callback]
+    fn on_section_selected(&self, row: Option<gtk::ListBoxRow>) {
+        let Some(row) = row else {
+            return;
         };
-        refresh();
-        model.connect_changed(refresh);
+        let imp = self.imp();
+        imp.footer.unselect_all();
+        imp.page_stack
+            .set_visible_child_name(row.widget_name().as_str());
     }
 
-    let scroller = gtk::ScrolledWindow::new();
-    scroller.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
-    scroller.set_child(Some(&page));
-    scroller
-}
-
-fn autostart_subtitle(enabled: bool) -> String {
-    if enabled {
-        format!(
-            "Enabled. Turn this off by writing {} with Hidden=true.",
-            autostart::DESKTOP_FILE_NAME
-        )
-    } else {
-        format!(
-            "Disabled through ~/.config/autostart/{}. Turn it back on to use the packaged GNOME autostart entry again.",
-            autostart::DESKTOP_FILE_NAME
-        )
+    /// Mirror of [`Self::on_section_selected`]: clears that selection, then switches
+    /// `page_stack`.
+    #[template_callback]
+    fn on_footer_selected(&self, row: Option<gtk::ListBoxRow>) {
+        let Some(row) = row else {
+            return;
+        };
+        let imp = self.imp();
+        imp.sections.unselect_all();
+        imp.page_stack
+            .set_visible_child_name(row.widget_name().as_str());
     }
 }
 
-fn joined(values: &[String]) -> String {
-    if values.is_empty() {
-        "-".to_owned()
-    } else {
-        values.join(", ")
+/// The window's half of the one GTK test — see [`crate::gtk_tests`].
+///
+/// The instantiation is the point §10 of the design doc makes: `init_template` fills
+/// every `#[template_child]` in `imp` from the id of the same name in the compiled
+/// `.ui`, so a child renamed or dropped in `window.blp` fails on the `new` below rather
+/// than at the first `present()` on someone's machine. What follows it is the wiring
+/// that only exists once there is a template instance: the `swapped` handlers, and the
+/// store registrations `new` makes.
+#[cfg(all(test, feature = "gtk-tests"))]
+pub(crate) mod widget_checks {
+    use super::*;
+
+    pub(crate) fn run() {
+        // A `GtkApplicationWindow` refuses to be added to an application that has not
+        // registered — a `g_critical`, not an error a caller could see — so the test
+        // application registers first. `NON_UNIQUE` because two runs of the suite must
+        // not talk to each other, and registration falls back to a private application
+        // when there is no session bus, so this holds on a bus-less runner too.
+        let app = adw::Application::builder()
+            .application_id("org.scanbus.GuiTests")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE)
+            .expect("register the test application");
+
+        let model = Rc::new(ScannerListModel::new());
+        // The receiver is kept: a dropped one closes the channel, and every `try_send`
+        // in this file ignores its error, so the callbacks below would still look as
+        // though they had sent something.
+        let (commands, sent) = async_channel::unbounded();
+        let window = ScanbusWindow::new(
+            &app,
+            Rc::clone(&model),
+            commands,
+            Rc::new(AppLifecycle::default()),
+        );
+        let imp = window.imp();
+
+        // `new` fills the stack `window.blp` declares empty, and then selects the
+        // Scanners row. The order is what this asserts: `set_visible_child_name` for a
+        // child the stack does not have yet does nothing, so a window built the other way
+        // round comes up on an empty pane.
+        for name in ["scanners", "profiles", "settings"] {
+            assert!(
+                imp.page_stack.child_by_name(name).is_some(),
+                "no `{name}` page in the stack"
+            );
+        }
+        assert_eq!(
+            imp.page_stack
+                .visible_child_name()
+                .unwrap_or_default()
+                .as_str(),
+            "scanners",
+            "the window should open on Scanners"
+        );
+
+        // The header bar is written by `render`, which `new` calls once. The template's
+        // own label is the Idle one, so only a store that has moved says whether the
+        // `connect_changed` registration is really there.
+        assert_eq!(
+            imp.find_button.label().unwrap_or_default().as_str(),
+            "Find scanners…"
+        );
+        assert!(!imp.spinner.get_visible());
+
+        model.mark_discovery_active();
+        assert_eq!(imp.find_button.label().unwrap_or_default().as_str(), "Stop");
+        assert!(imp.spinner.get_visible() && imp.spinner.is_spinning());
+
+        // A stop in flight keeps the label — it says what is being waited for — and
+        // refuses further clicks.
+        assert!(model.begin_discovery_stop());
+        assert_eq!(imp.find_button.label().unwrap_or_default().as_str(), "Stop");
+        assert!(!imp.find_button.get_sensitive());
+
+        // `on_find_clicked` through the template, which is the check that `swapped` is
+        // still on the handler in the `.blp`: without it `self` would be the button and
+        // the store would never be reached.
+        model.mark_discovery_idle();
+        assert!(imp.find_button.get_sensitive());
+        imp.find_button.emit_clicked();
+        assert!(
+            matches!(sent.try_recv(), Ok(BusCommand::StartDiscovery)),
+            "the find button should have asked the bus thread to start discovery"
+        );
+        assert!(matches!(model.discovery_state(), DiscoveryState::Starting));
+        model.mark_discovery_idle();
+
+        // The two sidebar list boxes: each switches the stack to the selected row's
+        // widget name, and clears the other's selection.
+        let settings_row = imp
+            .footer
+            .row_at_index(0)
+            .expect("the footer's Settings row");
+        imp.footer.select_row(Some(&settings_row));
+        assert_eq!(
+            imp.page_stack
+                .visible_child_name()
+                .unwrap_or_default()
+                .as_str(),
+            "settings"
+        );
+        assert!(imp.sections.selected_row().is_none());
+
+        imp.sections.select_row(Some(&*imp.scanners_row));
+        assert_eq!(
+            imp.page_stack
+                .visible_child_name()
+                .unwrap_or_default()
+                .as_str(),
+            "scanners"
+        );
+        assert!(imp.footer.selected_row().is_none());
+
+        // Destroyed rather than left in the application's window list, since the suite
+        // goes on to instantiate more widgets. `destroy` does not emit `close-request`,
+        // so this is not `on_close_request` in disguise.
+        window.destroy();
     }
-}
-
-fn profile_folder_row(title: &str) -> adw::ActionRow {
-    let row = adw::ActionRow::builder()
-        .title(title)
-        .activatable(true)
-        .build();
-    row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
-    row
-}
-
-fn set_folder_row(row: &adw::ActionRow, folder: Option<&String>) {
-    row.set_subtitle(folder.map(String::as_str).unwrap_or("Unknown"));
-}
-
-fn row(title: &str, page: &str) -> gtk::ListBoxRow {
-    let label = gtk::Label::new(Some(title));
-    label.set_xalign(0.0);
-    label.set_margin_top(12);
-    label.set_margin_bottom(12);
-    label.set_margin_start(12);
-    label.set_margin_end(12);
-
-    let row = gtk::ListBoxRow::new();
-    row.set_widget_name(page);
-    row.set_child(Some(&label));
-    row
 }

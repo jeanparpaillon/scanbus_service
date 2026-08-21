@@ -133,7 +133,7 @@ carrying a `template $Class` no other file declares:
 | File | Template | Module |
 |---|---|---|
 | `window.blp` | `$ScanbusWindow` | window.rs — window, header, sidebar, page stack, app menu |
-| `settings-page.blp` | `$SettingsPage` | window.rs `settings_page` |
+| `settings-page.blp` | `$SettingsPage` | settings.rs — split out of window.rs `settings_page` |
 | `scanners-pane.blp` | `$ScannersPane` | scanners.rs — banner, the two lists, empty state, detail stack |
 | `scanner-row.blp` | `$ScannerRow` | scanners.rs `scanner_row` |
 | `details-pane.blp` | `$DetailsPane` | details.rs |

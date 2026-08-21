@@ -10,6 +10,7 @@ mod notify;
 mod options;
 mod profiles;
 mod scanners;
+mod settings;
 mod store;
 mod window;
 
@@ -118,13 +119,17 @@ fn main() -> glib::ExitCode {
                 return;
             }
 
-            let window = window::build_window(
+            let window = window::ScanbusWindow::new(
                 app,
                 Rc::clone(&scanners),
                 bus.commands(),
                 Rc::clone(&lifecycle),
             );
-            lifecycle.track_window(&window);
+            // `AppLifecycle` tracks the window as the parent a notification is
+            // transient for, which is the base class's job — so it keeps holding an
+            // `adw::ApplicationWindow` and this upcasts rather than spreading the
+            // subclass through `lifecycle.rs` and `notify.rs`.
+            lifecycle.track_window(window.upcast_ref::<adw::ApplicationWindow>());
             window.present();
         });
     }
@@ -200,8 +205,9 @@ mod resources {
     use super::register_resources;
 
     /// `build.rs`'s own `RESOURCE_PREFIX`, which is where the bundle puts every `.ui`.
-    /// It lives here rather than beside [`register_resources`] because nothing outside
-    /// this test looks a template up yet; the first port issue lifts it out.
+    /// It stays a copy rather than something the widget modules share: `#[template(
+    /// resource = "…")]` takes a string literal, so each subclass spells its own path
+    /// out and this test is the thing that says all of them agree with the bundle.
     const UI_RESOURCE_PREFIX: &str = "/org/scanbus/Gui/ui";
 
     /// The class a `.blp` declares, out of its `template $Class : Parent` line.

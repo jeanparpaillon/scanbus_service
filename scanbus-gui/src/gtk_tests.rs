@@ -22,4 +22,8 @@ fn the_widget_layer_binds_to_the_store() {
     crate::details::widget_checks::run();
     crate::options::widget_checks::run();
     crate::profiles::widget_checks::run();
+    crate::settings::widget_checks::run();
+    // Last, because it is the only one that needs a registered `adw::Application`
+    // and it instantiates every pane the stack holds, this page included.
+    crate::window::widget_checks::run();
 }
