@@ -11,10 +11,6 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  CARGO_TERM_COLOR: always
-  RUST_VERSION: 1.93.1
-
 jobs:
   # The artifacts are named after VERSION, not after the tag: debian/rules reads the
   # same file, so anything else would name the .debs one thing and the tarball another.
@@ -35,6 +31,10 @@ jobs:
           version=$(./scripts/version.sh)
           if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
             echo "::error::tag $GITHUB_REF_NAME does not match VERSION ($version)"
+            exit 1
+          fi
+          if ! ./scripts/changes.sh "$version" >/dev/null; then
+            echo "::error::CHANGES.md has no entry for v$version"
             exit 1
           fi
           echo "version=$version" >>"$GITHUB_OUTPUT"
@@ -101,7 +101,6 @@ jobs:
           buildpackage-opts: --build=binary --no-sign
           artifacts-dir: artifacts
           extra-build-deps: curl xz-utils ca-certificates
-          before-build-hook: /github/workspace/scripts/install-rust.sh ${{ env.RUST_VERSION }}
 
       - name: Sign .changes
         env:
@@ -126,6 +125,11 @@ jobs:
     permissions:
       contents: write
     steps:
+      # The notes come out of CHANGES.md, so this job needs the tree too. It has to
+      # run before the downloads: checkout cleans the workspace, which would take
+      # dist/ with it.
+      - uses: actions/checkout@v7
+
       # Downloaded by name rather than "everything", so an artifact added to this run
       # later — an apt-repo dists/ and pool/ tree, say — does not silently become a
       # release asset by way of `gh release create dist/*`.
@@ -145,6 +149,20 @@ jobs:
         run: |
           sha256sum ./*.tar.gz ./*.deb | tee SHA256SUMS
 
+      # The notes are the CHANGES.md entry for this exact version, not
+      # --generate-notes: the changelog is written for users, while generated notes
+      # are a commit list. changes.sh exits non-zero when the version has no entry,
+      # which fails the release rather than publishing it with empty notes.
+      - name: Release notes
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          if ! ./scripts/changes.sh "$VERSION" >dist/notes.md; then
+            echo "::error::CHANGES.md has no entry for v$VERSION"
+            exit 1
+          fi
+          cat dist/notes.md
+
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -154,5 +172,5 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --title "scanbus $VERSION" \
             --verify-tag \
-            --generate-notes \
-            dist/*
+            --notes-file dist/notes.md \
+            dist/*.tar.gz dist/*.deb dist/*.changes dist/*.buildinfo dist/SHA256SUMS
