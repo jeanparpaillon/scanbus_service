@@ -27,7 +27,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - id: version
         run: |
@@ -45,7 +45,7 @@ jobs:
     needs: version
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # `git archive` of the checked-out commit: the tarball is exactly the tracked
       # tree, so it cannot pick up target/, .worktrees/ or anything else a build left
@@ -68,7 +68,7 @@ jobs:
             "scanbus-$VERSION/debian/rules" \
             "scanbus-$VERSION/Cargo.lock" >/dev/null
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: source
           path: dist/*.tar.gz
@@ -82,20 +82,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: Ubuntu 24.04 LTS
-            image: ubuntu:24.04
-            artifact: ubuntu-24.04
+          - name: Ubuntu 26.04 LTS
+            image: ubuntu:26.04
+            artifact: ubuntu-26.04
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
-      # --no-sign because the signature is applied by the next step instead, outside
-      # the container. The action builds an --env-file out of this step's entire
-      # environment and hands it to `docker run`, so a key put here would be readable
-      # by every build script cargo executes. Signing in-place would also fail open:
-      # dpkg-buildpackage only warns when it cannot sign, which is how a release goes
-      # out unsigned and green.
+      # --no-sign because the signature is applied by the next step instead
       - name: Build Debian packages
         id: build
         uses: jtdor/build-deb-action@v1
@@ -105,52 +100,16 @@ jobs:
           docker-image: ${{ matrix.image }}
           buildpackage-opts: --build=binary --no-sign
           artifacts-dir: artifacts
+          extra-build-deps: curl xz-utils ca-certificates
+          before-build-hook: /github/workspace/scripts/install-rust.sh ${{ env.RUST_VERSION }}
 
-      # `gpg --clearsign` over the .changes is exactly what dpkg-buildpackage's own
-      # signing does. The .buildinfo is left unsigned: the .changes carries its
-      # checksum, so the one signature already covers it.
-      #
-      # debian/scanbus-ci.pub.asc is the key users verify with, which makes it the
-      # authority on what CI may sign with — the wrong secret has to fail the build
-      # rather than ship a signature nobody can check.
       - name: Sign .changes
         env:
           GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
-        run: |
-          set -euo pipefail
-
-          if [ -z "${GPG_PRIVATE_KEY:-}" ]; then
-            echo "::error::GPG_PRIVATE_KEY is empty — refusing to ship unsigned packages"
-            exit 1
-          fi
-
-          GNUPGHOME=$(mktemp -d)
-          export GNUPGHOME
-          chmod 700 "$GNUPGHOME"
-          trap 'gpgconf --kill all >/dev/null 2>&1 || true; rm -rf "$GNUPGHOME"' EXIT
-
-          expected=$(gpg --batch --show-keys --with-colons debian/scanbus-ci.pub.asc |
-            awk -F: '/^pub:/ { print $5; exit }')
-
-          printf '%s\n' "$GPG_PRIVATE_KEY" | gpg --batch --quiet --import
-          keyid=$(gpg --batch --list-secret-keys --with-colons |
-            awk -F: '/^sec:/ { print $5; exit }')
-
-          if [ "$keyid" != "$expected" ]; then
-            echo "::error::GPG_PRIVATE_KEY is key $keyid, but debian/scanbus-ci.pub.asc is $expected"
-            exit 1
-          fi
-
-          for changes in artifacts/*.changes; do
-            gpg --batch --yes --local-user "$keyid" \
-              --clearsign --output "$changes.signed" "$changes"
-            mv "$changes.signed" "$changes"
-            gpg --batch --verify "$changes"
-            echo "signed $(basename "$changes") with $keyid"
-          done
+        run: ./scripts/sign-changes.sh artifacts
 
       - name: Upload packages
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: scanbus-${{ matrix.artifact }}
           path: |
@@ -170,12 +129,12 @@ jobs:
       # Downloaded by name rather than "everything", so an artifact added to this run
       # later — an apt-repo dists/ and pool/ tree, say — does not silently become a
       # release asset by way of `gh release create dist/*`.
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: source
           path: dist
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: scanbus-*
           path: dist
