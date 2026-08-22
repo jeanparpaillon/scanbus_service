@@ -11,10 +11,10 @@
 // instead would make a daemon-side extension look like data loss, which is why §3 of the
 // GUI design has it name the type it could not draw.
 //
-// One divergence worth recording: `undeclared_row` builds an origin label and never
-// parents it — it does not go through `finish_row`, which is what hangs the suffix off
-// the row — so the pill is invisible on an undeclared key today. This template gives
-// both cases the same suffix, which is what `Unknown` already has.
+// One divergence worth recording: before the port, `undeclared_row` built an origin label
+// and never parented it — it did not go through `finish_row`, which is what hung the
+// suffix off the row — so the pill was invisible on an undeclared key. This template gives
+// both cases the same suffix, which is what `Unknown` already had.
 
 using Gtk 4.0;
 using Adw 1;

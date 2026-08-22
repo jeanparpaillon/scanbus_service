@@ -9,6 +9,10 @@
 // No `notify` handler: the chooser is what commits, so there is nothing to watch. Two
 // suffixes, in this order — the origin pill and Reset first, then the chooser, so the
 // button the user reaches for sits at the outer edge.
+//
+// Every `=>` below is `swapped`, for the reason window.blp gives at length: the row is
+// `self`, and both emitters here are buttons, so without it a handler would be handed a
+// button and could not reach the row it has to write.
 
 using Gtk 4.0;
 using Adw 1;
@@ -31,7 +35,7 @@ template $OptionRowFolder : Adw.ActionRow {
       valign: center;
       visible: false;
 
-      clicked => $on_option_reset();
+      clicked => $on_option_reset() swapped;
 
       styles ["flat"]
     }
@@ -43,7 +47,7 @@ template $OptionRowFolder : Adw.ActionRow {
     valign: center;
 
     // Runs the folder chooser, then commits the path it returns.
-    clicked => $on_choose_folder();
+    clicked => $on_choose_folder() swapped;
 
     styles ["flat"]
   }

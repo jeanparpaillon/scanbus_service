@@ -9,6 +9,10 @@
 //
 // The one row that does not commit on change: Adw.EntryRow's own apply button is the
 // commit, because every keystroke would otherwise be a write to the daemon.
+//
+// Every `=>` below is `swapped`, for the reason window.blp gives at length: the row is
+// `self`, and Reset is a button, so without it the handler would be handed the button
+// and could not reach the row it has to clear.
 
 using Gtk 4.0;
 using Adw 1;
@@ -16,7 +20,7 @@ using Adw 1;
 template $OptionRowText : Adw.EntryRow {
   show-apply-button: true;
 
-  apply => $on_text_applied();
+  apply => $on_text_applied() swapped;
 
   [suffix]
   Gtk.Box {
@@ -35,7 +39,7 @@ template $OptionRowText : Adw.EntryRow {
       valign: center;
       visible: false;
 
-      clicked => $on_option_reset();
+      clicked => $on_option_reset() swapped;
 
       styles ["flat"]
     }

@@ -1,27 +1,31 @@
 // One option whose schema declares a bounded integer — `options.rs` `build_row`, the
 // `Integer { min, max }` arm.
 //
+// An Adw.ActionRow carrying a Gtk.SpinButton, and *not* the Adw.SpinRow `build_row`
+// builds today: `adw-spin-row.h` declares it with `G_DECLARE_FINAL_TYPE`, so GObject
+// refuses to derive from it and a composite template on it never registers its class.
+// AdwSpinRow is an AdwActionRow with a GtkSpinButton in its suffix, so that is what is
+// written out here. See option-row-flag.blp, which has the same problem for the same
+// reason.
+//
 // Nothing about the adjustment is shape: `build_row` computes lower and upper from the
 // schema entry's min and max, and the value comes from the store. It is declared at zero
-// anyway so Adw.SpinRow has an object to hang them on, and the port writes this one per
-// render rather than constructing a second.
+// anyway so the spin button has an object to hang them on, and the port writes this one
+// per render rather than constructing a second.
 //
 // The step and page increments — 1 and 10 — are *not* declared with it, though they are
 // constants: blueprint-compiler's `adjustment-prop-order` rule accepts a Gtk.Adjustment
 // holding exactly lower, upper and value and warns on anything else in it. So they stay
 // beside the bounds in `build_row`, which is the one place the whole adjustment is set.
+//
+// Every `=>` below is `swapped`, for the reason window.blp gives at length: the row is
+// `self`, and both emitters here are children of it.
 
 using Gtk 4.0;
 using Adw 1;
 
-template $OptionRowNumber : Adw.SpinRow {
-  adjustment: Gtk.Adjustment {
-    lower: 0;
-    upper: 0;
-    value: 0;
-  };
-
-  notify::value => $on_number_changed();
+template $OptionRowNumber : Adw.ActionRow {
+  activatable-widget: spin;
 
   [suffix]
   Gtk.Box {
@@ -40,9 +44,26 @@ template $OptionRowNumber : Adw.SpinRow {
       valign: center;
       visible: false;
 
-      clicked => $on_option_reset();
+      clicked => $on_option_reset() swapped;
 
       styles ["flat"]
     }
+  }
+
+  // Outside the suffix box, so the spin button keeps the row's outer edge where AdwSpinRow
+  // puts it. `numeric` is what stops a typed letter reaching the adjustment at all; the
+  // bounds are what turn a typed 101 into 100.
+  [suffix]
+  Gtk.SpinButton spin {
+    valign: center;
+    numeric: true;
+
+    adjustment: Gtk.Adjustment {
+      lower: 0;
+      upper: 0;
+      value: 0;
+    };
+
+    notify::value => $on_number_changed() swapped;
   }
 }

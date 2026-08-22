@@ -4,6 +4,10 @@
 // Title, subtitle and the model's strings all come from the schema entry, so the model
 // is declared empty. The suffix is the same on every editable row: the origin pill, then
 // Reset. See option-row-read-only.blp for the row that has no Reset and why.
+//
+// Every `=>` below is `swapped`, for the reason window.blp gives at length: the row is
+// `self`, and Reset is a button, so without it the handler would be handed the button
+// and could not reach the row it has to clear.
 
 using Gtk 4.0;
 using Adw 1;
@@ -13,7 +17,7 @@ template $OptionRowChoice : Adw.ComboRow {
 
   // Every editable row commits on change — there is no separate Apply, except on the
   // text row, where Adw.EntryRow's own apply button is the commit.
-  notify::selected => $on_choice_changed();
+  notify::selected => $on_choice_changed() swapped;
 
   [suffix]
   Gtk.Box {
@@ -37,7 +41,7 @@ template $OptionRowChoice : Adw.ComboRow {
       // Every Reset is the same handler: clear the key at this editor's scope and let
       // the value fall back to what the pill says it inherits. Its tooltip names that
       // scope, so it is written per row.
-      clicked => $on_option_reset();
+      clicked => $on_option_reset() swapped;
 
       styles ["flat"]
     }

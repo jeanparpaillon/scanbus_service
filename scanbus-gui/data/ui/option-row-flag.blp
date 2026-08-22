@@ -1,11 +1,23 @@
 // One option whose schema declares a boolean — `options.rs` `build_row`, the `Boolean`
 // arm.
+//
+// An Adw.ActionRow carrying a Gtk.Switch, and *not* the Adw.SwitchRow `build_row` builds
+// today, for one reason: `adw-switch-row.h` declares it with `G_DECLARE_FINAL_TYPE`, so
+// GObject refuses to derive from it — a composite template on it never registers its
+// class and the row cannot be instantiated at all. The tree written out here is what
+// AdwSwitchRow *is*: an AdwActionRow with a GtkSwitch suffix and `activatable-widget`
+// pointing at it, which is what keeps a click anywhere on the row toggling the switch.
+// See option-row-number.blp, which has the same problem for the same reason.
+//
+// Every `=>` below is `swapped`, for the reason window.blp gives at length: the row is
+// `self`, and Reset is a button, so without it the handler would be handed the button
+// and could not reach the row it has to clear.
 
 using Gtk 4.0;
 using Adw 1;
 
-template $OptionRowFlag : Adw.SwitchRow {
-  notify::active => $on_flag_toggled();
+template $OptionRowFlag : Adw.ActionRow {
+  activatable-widget: toggle;
 
   [suffix]
   Gtk.Box {
@@ -13,6 +25,8 @@ template $OptionRowFlag : Adw.SwitchRow {
     spacing: 6;
     valign: center;
 
+    // Says which level the effective value comes from; hidden unless the key is set at
+    // this scope, or the scope is Button, where "inherited" is worth saying out loud.
     Gtk.Label origin {
       valign: center;
 
@@ -24,9 +38,20 @@ template $OptionRowFlag : Adw.SwitchRow {
       valign: center;
       visible: false;
 
-      clicked => $on_option_reset();
+      clicked => $on_option_reset() swapped;
 
       styles ["flat"]
     }
+  }
+
+  // Outside the suffix box, so the switch keeps the row's outer edge where AdwSwitchRow
+  // puts it — the same order the folder row's chooser is in.
+  [suffix]
+  Gtk.Switch toggle {
+    valign: center;
+
+    // Every editable row commits on change — there is no separate Apply, except on the
+    // text row, where Adw.EntryRow's own apply button is the commit.
+    notify::active => $on_flag_toggled() swapped;
   }
 }

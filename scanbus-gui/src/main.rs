@@ -8,6 +8,7 @@ mod error;
 mod gtk_tests;
 mod lifecycle;
 mod notify;
+mod option_rows;
 mod options;
 mod profiles;
 mod scanner_row;

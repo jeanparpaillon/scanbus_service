@@ -37,6 +37,17 @@
 //! inherited value back, because those differ: a written-back value stops tracking the
 //! profile (or the daemon's computed `output_folder`) from that moment on.
 //!
+//! # Every widget is a template, the choice between them is not
+//!
+//! [`OptionsEditor`] is the subclass `options-editor.blp` declares — an
+//! `AdwPreferencesGroup` whose one declared child is the "No options" row, which a render
+//! shows or hides rather than builds — and [`build_row`] instantiates one of the six
+//! subclasses of [`crate::option_rows`] rather than assembling an Adw row and bolting a
+//! suffix onto it. Everything that is *not* shape stays in this file: which of the six a
+//! `type` maps to, the strings spliced into a combo's model, the bounds written to a spin
+//! row's adjustment, the tooltip that names what **Reset** goes back to, and the
+//! `updating` guard.
+//!
 //! # The store stays the truth
 //!
 //! A row shows what the user picked as soon as they pick it — the widget moved, and
@@ -45,17 +56,24 @@
 //! and the next render puts the row back, the same deal the connection switch of
 //! [`crate::buttons`] makes.
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use gtk::gio;
+use gtk::{CompositeTemplate, TemplateChild, glib};
 use gtk4 as gtk;
 use libadwaita as adw;
 use libadwaita::prelude::*;
+use libadwaita::subclass::prelude::*;
 use scanbus_client::profile::is_unset;
 use scanbus_client::{OptionSchema, OptionType, OptionsSchema};
 use scanbus_core::Value;
+
+use crate::option_rows::{
+    OptionRowChoice, OptionRowFlag, OptionRowFolder, OptionRowNumber, OptionRowReadOnly,
+    OptionRowText,
+};
 
 /// Which of §6's two option maps an editor writes, and therefore what "unset" means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +128,22 @@ struct Core {
 }
 
 impl Core {
+    /// The state one editor shares with its rows, empty until the first render.
+    ///
+    /// A named constructor rather than the struct literal [`OptionsEditor::new`] used to
+    /// hold, because the editor is a template subclass now: it is built *after*
+    /// `glib::Object::new`, into the cell [`imp::OptionsEditor::core`] describes.
+    fn new(scope: Scope) -> Self {
+        Self {
+            scope,
+            schema: RefCell::new(OptionsSchema::default()),
+            stored: RefCell::new(BTreeMap::new()),
+            inherited: RefCell::new(BTreeMap::new()),
+            updating: Cell::new(false),
+            write: RefCell::new(None),
+        }
+    }
+
     /// §6's display rule down the whole chain: the edited map, then the level below it,
     /// then the schema's effective default.
     fn effective(&self, key: &str) -> Option<Value> {
@@ -156,54 +190,83 @@ impl Core {
     }
 }
 
-/// One `AdwPreferencesGroup` of option rows, rebuilt only when the schema's shape changes.
-pub struct OptionsEditor {
-    group: adw::PreferencesGroup,
-    core: Rc<Core>,
-    rows: RefCell<Vec<OptionRow>>,
-    /// `(key, type name)` per row — the only thing a render rebuilds for.
-    shape: RefCell<Vec<(String, String)>>,
-    /// Shown instead of the rows when a profile publishes no options at all.
-    empty: adw::ActionRow,
+mod imp {
+    use super::*;
+
+    /// No `Debug`: [`Core`] holds the write callback, which is a boxed closure.
+    #[derive(Default, CompositeTemplate)]
+    #[template(resource = "/org/scanbus/Gui/ui/options-editor.ui")]
+    pub struct OptionsEditor {
+        /// Shown instead of the rows when a profile publishes no options at all. It is
+        /// declared in the template and hidden there, so a render only ever flips it.
+        #[template_child]
+        pub empty: TemplateChild<adw::ActionRow>,
+
+        pub(super) core: OnceCell<Rc<Core>>,
+        pub(super) rows: RefCell<Vec<OptionRow>>,
+        /// `(key, type name)` per row — the only thing a render rebuilds for.
+        pub shape: RefCell<Vec<(String, String)>>,
+    }
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for OptionsEditor {
+        /// Must match `template $OptionsEditor` in `options-editor.blp`.
+        const NAME: &'static str = "OptionsEditor";
+        type Type = super::OptionsEditor;
+        type ParentType = adw::PreferencesGroup;
+
+        fn class_init(klass: &mut Self::Class) {
+            klass.bind_template();
+        }
+
+        fn instance_init(obj: &glib::subclass::InitializingObject<Self>) {
+            obj.init_template();
+        }
+    }
+
+    impl OptionsEditor {
+        /// The state this editor shares with its rows.
+        ///
+        /// A [`OnceCell`] rather than a plain field because a template subclass is
+        /// constructed by `g_object_new` and can take no argument of ours, while
+        /// [`Scope`] — which of §6's two maps is being edited — is not something the
+        /// editor can guess. [`super::OptionsEditor::new`] sets it immediately, so the
+        /// panic below can only be reached by an editor GtkBuilder made: today nothing
+        /// does, and when `options-dialog.blp`'s `$OptionsEditor editor {}` is wired up
+        /// it has to say which scope it opened with rather than inherit a default that
+        /// would quietly write a button's override into the profile.
+        pub(super) fn core(&self) -> &Rc<Core> {
+            self.core
+                .get()
+                .expect("an OptionsEditor GtkBuilder made has no Scope yet")
+        }
+    }
+
+    impl ObjectImpl for OptionsEditor {}
+    impl WidgetImpl for OptionsEditor {}
+    impl PreferencesGroupImpl for OptionsEditor {}
+}
+
+glib::wrapper! {
+    /// One `AdwPreferencesGroup` of option rows, rebuilt only when the schema's shape
+    /// changes — the subclass `options-editor.blp` declares.
+    pub struct OptionsEditor(ObjectSubclass<imp::OptionsEditor>)
+        @extends adw::PreferencesGroup, gtk::Widget,
+        @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget;
 }
 
 impl OptionsEditor {
     pub fn new(scope: Scope) -> Self {
-        let group = adw::PreferencesGroup::new();
-
-        let empty = adw::ActionRow::builder()
-            .title("No options")
-            .subtitle("This profile publishes no options for this version to edit.")
-            .build();
-        empty.set_visible(false);
-        group.add(&empty);
-
-        Self {
-            group,
-            core: Rc::new(Core {
-                scope,
-                schema: RefCell::new(OptionsSchema::default()),
-                stored: RefCell::new(BTreeMap::new()),
-                inherited: RefCell::new(BTreeMap::new()),
-                updating: Cell::new(false),
-                write: RefCell::new(None),
-            }),
-            rows: RefCell::new(Vec::new()),
-            shape: RefCell::new(Vec::new()),
-            empty,
+        let editor: Self = glib::Object::new();
+        if editor.imp().core.set(Rc::new(Core::new(scope))).is_err() {
+            unreachable!("nothing has asked for the core between construction and here");
         }
+        editor
     }
 
-    pub fn widget(&self) -> &adw::PreferencesGroup {
-        &self.group
-    }
-
-    pub fn set_title(&self, title: &str) {
-        self.group.set_title(title);
-    }
-
-    pub fn set_description(&self, description: Option<&str>) {
-        self.group.set_description(description);
+    /// The state shared with every row this editor built.
+    fn core(&self) -> &Rc<Core> {
+        self.imp().core()
     }
 
     /// What an edited row does. Replaces any previous callback.
@@ -211,7 +274,7 @@ impl OptionsEditor {
     where
         F: Fn(BTreeMap<String, Value>) + 'static,
     {
-        *self.core.write.borrow_mut() = Some(Rc::new(callback));
+        *self.core().write.borrow_mut() = Some(Rc::new(callback));
     }
 
     /// Renders `stored` against `schema`, with `inherited` as the level below it.
@@ -224,49 +287,53 @@ impl OptionsEditor {
         stored: &BTreeMap<String, Value>,
         inherited: &BTreeMap<String, Value>,
     ) {
-        *self.core.schema.borrow_mut() = schema.clone();
-        *self.core.stored.borrow_mut() = stored.clone();
-        *self.core.inherited.borrow_mut() = inherited.clone();
+        let core = self.core();
+        *core.schema.borrow_mut() = schema.clone();
+        *core.stored.borrow_mut() = stored.clone();
+        *core.inherited.borrow_mut() = inherited.clone();
 
         self.rebuild(schema, stored);
 
-        self.core.updating.set(true);
-        for row in self.rows.borrow().iter() {
-            row.update(&self.core);
+        core.updating.set(true);
+        for row in self.imp().rows.borrow().iter() {
+            row.update(core);
         }
-        self.core.updating.set(false);
+        core.updating.set(false);
 
-        let empty = self.rows.borrow().is_empty();
-        self.empty.set_visible(empty);
+        let empty = self.imp().rows.borrow().is_empty();
+        self.imp().empty.set_visible(empty);
     }
 
     /// Rebuilds the rows when — and only when — the set of keys or one of their types
     /// changed. An option whose *value* moved keeps its widget, so a `PropertiesChanged`
     /// does not close a dropdown the user has open.
     fn rebuild(&self, schema: &OptionsSchema, stored: &BTreeMap<String, Value>) {
+        let imp = self.imp();
         let wanted = shape_of(schema, stored);
-        if *self.shape.borrow() == wanted {
+        if *imp.shape.borrow() == wanted {
             return;
         }
 
-        for row in self.rows.borrow().iter() {
-            self.group.remove(row.widget());
+        for row in imp.rows.borrow().iter() {
+            self.remove(row.widget());
         }
-        self.rows.borrow_mut().clear();
+        imp.rows.borrow_mut().clear();
 
         let mut rows = Vec::with_capacity(wanted.len());
         for (key, _) in &wanted {
             let row = match schema.get(key) {
-                Some(entry) => build_row(&self.core, entry),
+                Some(entry) => build_row(self.core(), entry),
                 // Stored, undeclared: §6's read-only row, with no schema to describe it.
-                None => undeclared_row(key),
+                None => undeclared_row(self.core(), key),
             };
-            self.group.add(row.widget());
+            // The rows go after `empty`, which the template added first — see
+            // `options-editor.blp`.
+            self.add(row.widget());
             rows.push(row);
         }
 
-        *self.rows.borrow_mut() = rows;
-        *self.shape.borrow_mut() = wanted;
+        *imp.rows.borrow_mut() = rows;
+        *imp.shape.borrow_mut() = wanted;
     }
 }
 
@@ -275,7 +342,8 @@ impl OptionsEditor {
 impl OptionsEditor {
     /// The keys the editor built a row for, in display order.
     pub(crate) fn keys(&self) -> Vec<String> {
-        self.rows
+        self.imp()
+            .rows
             .borrow()
             .iter()
             .map(|row| row.key.clone())
@@ -289,7 +357,7 @@ impl OptionsEditor {
             RowKind::Number(_) => "spin",
             RowKind::Flag(_) => "switch",
             RowKind::Text(_) => "entry",
-            RowKind::Folder { .. } => "folder",
+            RowKind::Folder(_) => "folder",
             RowKind::ReadOnly(_) => "read-only",
         })
     }
@@ -310,9 +378,8 @@ impl OptionsEditor {
             RowKind::Number(row) => row.subtitle().map(|text| text.to_string()),
             RowKind::Flag(row) => row.subtitle().map(|text| text.to_string()),
             RowKind::Text(_) => None,
-            RowKind::Folder { row, .. } | RowKind::ReadOnly(row) => {
-                row.subtitle().map(|text| text.to_string())
-            }
+            RowKind::Folder(row) => row.subtitle().map(|text| text.to_string()),
+            RowKind::ReadOnly(row) => row.subtitle().map(|text| text.to_string()),
         })
         .flatten()
     }
@@ -372,7 +439,8 @@ impl OptionsEditor {
     }
 
     fn with_row<T>(&self, key: &str, visit: impl FnOnce(&OptionRow) -> T) -> Option<T> {
-        self.rows
+        self.imp()
+            .rows
             .borrow()
             .iter()
             .find(|row| row.key == key)
@@ -401,7 +469,7 @@ fn shape_of(schema: &OptionsSchema, stored: &BTreeMap<String, Value>) -> Vec<(St
 /// so it cannot collide with one.
 const UNDECLARED: &str = "\0undeclared";
 
-/// One option's widget, plus the two suffixes every editable row carries.
+/// One option's row, plus the two suffix widgets its template declared.
 struct OptionRow {
     key: String,
     kind: RowKind,
@@ -414,32 +482,71 @@ struct OptionRow {
 enum RowKind {
     /// A closed set of strings: `values` (§6), in the order the daemon published them.
     Choice {
-        row: adw::ComboRow,
+        row: OptionRowChoice,
         items: RefCell<Vec<String>>,
     },
     /// An integer within its published bounds — the bounds are the adjustment's, so a
     /// value outside them cannot be entered.
-    Number(adw::SpinRow),
-    Flag(adw::SwitchRow),
+    Number(OptionRowNumber),
+    Flag(OptionRowFlag),
     /// A string with no closed set.
-    Text(adw::EntryRow),
+    Text(OptionRowText),
     /// A path: the folder chooser §6 asks a `path` to be rendered with.
-    Folder {
-        row: adw::ActionRow,
-        chooser: gtk::Button,
-    },
+    Folder(OptionRowFolder),
     /// An unknown type, or a key the schema does not declare.
-    ReadOnly(adw::ActionRow),
+    ReadOnly(OptionRowReadOnly),
 }
 
 impl OptionRow {
+    /// What is left of `finish_row` now that the six `.blp`s declare the suffix: no widget
+    /// is built here. The origin pill and **Reset** come off the template, and the only
+    /// two things about them this editor decides are written on the way past — what the
+    /// tooltip says **Reset** goes back to, and what a click on it clears.
+    fn new(core: &Rc<Core>, key: String, kind: RowKind) -> Self {
+        // The click is the template's — each `.blp` names `on_option_reset`, swapped, so
+        // the row is what the callback gets — and what it *does* is this closure, the one
+        // thing about Reset the widget cannot know: which key, and which of §6's two maps
+        // to take it out of. The five `connect_reset`s are five inherent methods on five
+        // unrelated types, so there is nothing to call them through; the body is written
+        // once here and stamped per arm rather than being copied five times.
+        macro_rules! wire_reset {
+            ($row:expr) => {{
+                let button = $row.reset();
+                button.set_tooltip_text(Some(core.scope.reset_tooltip()));
+                let core = Rc::clone(core);
+                let key = key.clone();
+                $row.connect_reset(move |_| core.clear(&key));
+                ($row.origin(), Some(button))
+            }};
+        }
+
+        let (origin, reset) = match &kind {
+            RowKind::Choice { row, .. } => wire_reset!(row),
+            RowKind::Number(row) => wire_reset!(row),
+            RowKind::Flag(row) => wire_reset!(row),
+            RowKind::Text(row) => wire_reset!(row),
+            RowKind::Folder(row) => wire_reset!(row),
+            // §6's read-only row: nothing here can be written, so nothing can be cleared,
+            // and its `.blp` declares no Reset to hide.
+            RowKind::ReadOnly(row) => (row.origin(), None),
+        };
+
+        Self {
+            key,
+            kind,
+            origin,
+            reset,
+        }
+    }
+
     fn widget(&self) -> &adw::PreferencesRow {
         match &self.kind {
             RowKind::Choice { row, .. } => row.upcast_ref(),
             RowKind::Number(row) => row.upcast_ref(),
             RowKind::Flag(row) => row.upcast_ref(),
             RowKind::Text(row) => row.upcast_ref(),
-            RowKind::Folder { row, .. } | RowKind::ReadOnly(row) => row.upcast_ref(),
+            RowKind::Folder(row) => row.upcast_ref(),
+            RowKind::ReadOnly(row) => row.upcast_ref(),
         }
     }
 
@@ -453,9 +560,14 @@ impl OptionRow {
             RowKind::Choice { row, items } => {
                 let wanted = choices(core, &self.key, value.as_ref());
                 if *items.borrow() != wanted {
-                    row.set_model(Some(&gtk::StringList::new(
+                    // The model is the template's, so a render splices this render's
+                    // strings into it rather than hanging a second one on the row.
+                    let model = row.items();
+                    model.splice(
+                        0,
+                        model.n_items(),
                         &wanted.iter().map(String::as_str).collect::<Vec<_>>(),
-                    )));
+                    );
                     *items.borrow_mut() = wanted.clone();
                 }
                 let shown = value.as_ref().and_then(Value::as_str).unwrap_or_default();
@@ -474,7 +586,7 @@ impl OptionRow {
             RowKind::Text(row) => {
                 row.set_text(value.as_ref().and_then(Value::as_str).unwrap_or_default())
             }
-            RowKind::Folder { row, .. } => {
+            RowKind::Folder(row) => {
                 let path = value.as_ref().and_then(Value::as_str).unwrap_or_default();
                 row.set_subtitle(&shorten_path(path));
             }
@@ -537,20 +649,14 @@ fn build_row(core: &Rc<Core>, entry: &OptionSchema) -> OptionRow {
 
     let kind = match &entry.value {
         OptionType::Str { values } if !values.is_empty() => {
-            let row = adw::ComboRow::builder()
-                .title(&title)
-                .subtitle(&subtitle)
-                .build();
-            row.set_model(Some(&gtk::StringList::new(&[])));
+            let row = OptionRowChoice::new();
+            row.set_title(&title);
+            row.set_subtitle(&subtitle);
             {
                 let core = Rc::clone(core);
                 let key = key.clone();
-                row.connect_selected_notify(move |row| {
-                    let Some(item) = row
-                        .model()
-                        .and_downcast::<gtk::StringList>()
-                        .and_then(|model| model.string(row.selected()))
-                    else {
+                row.connect_changed(move |row| {
+                    let Some(item) = row.items().string(row.selected()) else {
                         return;
                     };
                     core.commit(&key, Value::Str(item.to_string()));
@@ -562,139 +668,85 @@ fn build_row(core: &Rc<Core>, entry: &OptionSchema) -> OptionRow {
             }
         }
         OptionType::Integer { min, max } => {
+            let row = OptionRowNumber::new();
+            row.set_title(&title);
+            row.set_subtitle(&subtitle);
+            // Before the handler is installed, not after: the template declares the
+            // adjustment at zero, so writing the bounds moves the spin button's value —
+            // and a row is built outside the `updating` guard, where a commit would go
+            // out as if the user had typed the bound.
             let (low, high) = bounds(*min, *max);
-            let row = adw::SpinRow::builder()
-                .title(&title)
-                .subtitle(&subtitle)
-                .adjustment(&gtk::Adjustment::new(low, low, high, 1.0, 10.0, 0.0))
-                .build();
+            row.adjustment().configure(low, low, high, 1.0, 10.0, 0.0);
             {
                 let core = Rc::clone(core);
                 let key = key.clone();
-                row.connect_value_notify(move |row| {
+                row.connect_changed(move |row| {
                     core.commit(&key, Value::I64(row.value() as i64));
                 });
             }
             RowKind::Number(row)
         }
         OptionType::Boolean => {
-            let row = adw::SwitchRow::builder()
-                .title(&title)
-                .subtitle(&subtitle)
-                .build();
+            let row = OptionRowFlag::new();
+            row.set_title(&title);
+            row.set_subtitle(&subtitle);
             {
                 let core = Rc::clone(core);
                 let key = key.clone();
-                row.connect_active_notify(move |row| {
+                row.connect_changed(move |row| {
                     core.commit(&key, Value::Bool(row.is_active()));
                 });
             }
             RowKind::Flag(row)
         }
         OptionType::Path => {
-            let row = adw::ActionRow::builder().title(&title).build();
+            let row = OptionRowFolder::new();
+            row.set_title(&title);
             row.set_tooltip_text(Some(&subtitle));
-            let chooser = gtk::Button::with_label("Choose…");
-            chooser.add_css_class("flat");
-            chooser.set_valign(gtk::Align::Center);
             {
                 let core = Rc::clone(core);
                 let key = key.clone();
-                chooser.connect_clicked(move |button| {
-                    choose_folder(button, &core, &key);
+                // `Choose…` is the template's button and `on_choose_folder` its callback;
+                // the dialog is here because it needs the value the row currently shows
+                // and the map to write back, neither of which a widget knows.
+                row.connect_choose(move |row| {
+                    choose_folder(&row.chooser(), &core, &key);
                 });
             }
-            RowKind::Folder { row, chooser }
+            RowKind::Folder(row)
         }
         // A `string` with no closed set, and every type this version cannot type.
         OptionType::Str { .. } => {
-            let row = adw::EntryRow::builder().title(&title).build();
+            let row = OptionRowText::new();
+            row.set_title(&title);
             row.set_tooltip_text(Some(&subtitle));
-            row.set_show_apply_button(true);
             {
                 let core = Rc::clone(core);
                 let key = key.clone();
-                row.connect_apply(move |row| {
+                row.connect_applied(move |row| {
                     core.commit(&key, Value::Str(row.text().to_string()));
                 });
             }
             RowKind::Text(row)
         }
         OptionType::Unknown { .. } => {
-            let row = adw::ActionRow::builder().title(&title).build();
+            let row = OptionRowReadOnly::new();
+            row.set_title(&title);
             row.set_tooltip_text(Some(&subtitle));
             RowKind::ReadOnly(row)
         }
     };
 
-    finish_row(core, key, kind)
+    OptionRow::new(core, key, kind)
 }
 
-/// The row for a key the map holds and the schema does not describe.
-fn undeclared_row(key: &str) -> OptionRow {
-    let row = adw::ActionRow::builder().title(humanize_key(key)).build();
-    OptionRow {
-        key: key.to_owned(),
-        kind: RowKind::ReadOnly(row),
-        origin: origin_label(),
-        reset: None,
-    }
-}
-
-/// Hangs the origin label and — for an editable row — **Reset** off the row's suffix.
-fn finish_row(core: &Rc<Core>, key: String, kind: RowKind) -> OptionRow {
-    let origin = origin_label();
-
-    let reset = match kind {
-        RowKind::ReadOnly(_) => None,
-        _ => {
-            let button = gtk::Button::with_label("Reset");
-            button.add_css_class("flat");
-            button.set_valign(gtk::Align::Center);
-            button.set_tooltip_text(Some(core.scope.reset_tooltip()));
-            button.set_visible(false);
-            {
-                let core = Rc::clone(core);
-                let key = key.clone();
-                button.connect_clicked(move |_| core.clear(&key));
-            }
-            Some(button)
-        }
-    };
-
-    let suffix = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    suffix.set_valign(gtk::Align::Center);
-    suffix.append(&origin);
-    if let Some(reset) = &reset {
-        suffix.append(reset);
-    }
-
-    match &kind {
-        RowKind::Choice { row, .. } => row.add_suffix(&suffix),
-        RowKind::Number(row) => row.add_suffix(&suffix),
-        RowKind::Flag(row) => row.add_suffix(&suffix),
-        RowKind::Text(row) => row.add_suffix(&suffix),
-        RowKind::Folder { row, chooser } => {
-            row.add_suffix(&suffix);
-            row.add_suffix(chooser);
-        }
-        RowKind::ReadOnly(row) => row.add_suffix(&suffix),
-    }
-
-    OptionRow {
-        key,
-        kind,
-        origin,
-        reset,
-    }
-}
-
-fn origin_label() -> gtk::Label {
-    let label = gtk::Label::new(None);
-    label.add_css_class("dim-label");
-    label.add_css_class("caption");
-    label.set_valign(gtk::Align::Center);
-    label
+/// The row for a key the map holds and the schema does not describe. The same subclass the
+/// `Unknown` arm builds, and — since the suffix is the template's now — the same pill: an
+/// undeclared key used to be the one row whose origin label was built and never parented.
+fn undeclared_row(core: &Rc<Core>, key: &str) -> OptionRow {
+    let row = OptionRowReadOnly::new();
+    row.set_title(&humanize_key(key));
+    OptionRow::new(core, key.to_owned(), RowKind::ReadOnly(row))
 }
 
 fn choose_folder(button: &gtk::Button, core: &Rc<Core>, key: &str) {
@@ -946,12 +998,118 @@ pub(crate) mod widget_checks {
     }
 
     pub(crate) fn run() {
+        every_row_template_binds_and_fires();
+        the_editor_is_a_template_too();
         every_declared_type_gets_its_widget();
         an_unknown_type_is_read_only_and_still_listed();
         a_new_schema_entry_appears_on_its_own();
         the_widget_refuses_what_the_daemon_would();
         a_write_replaces_the_map_it_was_given();
         reset_removes_the_key_instead_of_writing_the_inherited_value();
+    }
+
+    /// All six templates, instantiated directly rather than through a schema: each one
+    /// loads, binds the suffix the six `.blp`s declare, and delivers a click to the slot
+    /// the factory installs on it.
+    ///
+    /// The checks below reach the same six rows through [`OptionsEditor::render`], where a
+    /// template that stopped binding shows up as a mystery two assertions later — a
+    /// missing `#[template_child]` panics inside `origin()`, and a handler line dropped
+    /// from a `.blp` does not fail at all, it just stops working.
+    fn every_row_template_binds_and_fires() {
+        // `TemplateChild::get` panics on a child `init_template` did not fill, so reaching
+        // the suffix off a row is itself the check that its template loaded and that the
+        // names in the `.blp` still match the fields. The click is the other half: the
+        // button's `clicked` reaches `on_option_reset`, `swapped` so the row rather than
+        // the button is `&self`, and the row fires the closure `OptionRow::new` installed
+        // on it. A handler line dropped from a `.blp` does not fail to compile — it stops
+        // working, silently, which is what this catches.
+        macro_rules! check_row {
+            ($name:literal, $row:expr) => {{
+                let row = $row;
+                let (origin, reset) = (row.origin(), row.reset());
+                assert!(
+                    origin.is_ancestor(&row),
+                    "{}: the origin pill is not in the row — which is what `undeclared_row` \
+                     used to get wrong, building a label and never parenting it",
+                    $name
+                );
+                assert!(
+                    reset.is_ancestor(&row),
+                    "{}: Reset is not in the row",
+                    $name
+                );
+                assert!(
+                    !reset.is_visible(),
+                    "{}: Reset is on offer before any render decided the value is set at \
+                     this level",
+                    $name
+                );
+
+                let fired = Rc::new(Cell::new(false));
+                {
+                    let fired = Rc::clone(&fired);
+                    row.connect_reset(move |_| fired.set(true));
+                }
+                reset.emit_clicked();
+                assert!(fired.get(), "{}: Reset reached no slot", $name);
+                row
+            }};
+        }
+
+        check_row!("choice", OptionRowChoice::new());
+        check_row!("number", OptionRowNumber::new());
+        check_row!("flag", OptionRowFlag::new());
+        check_row!("text", OptionRowText::new());
+        let folder = check_row!("folder", OptionRowFolder::new());
+
+        // The sixth row has no Reset — nothing on it can be written — so it gets the half
+        // of the check that is about the pill. An undeclared key is drawn with this row,
+        // and before the port it was the one row whose origin label was built and never
+        // parented, which is the failure this line would have caught.
+        let read_only = OptionRowReadOnly::new();
+        assert!(
+            read_only.origin().is_ancestor(&read_only),
+            "read-only: the origin pill is not in the row"
+        );
+
+        // The chooser is the other click the factory hangs a closure on, and the only one
+        // no other check can reach: pressing it for real opens a `gtk::FileDialog`.
+        let chose = Rc::new(Cell::new(false));
+        {
+            let chose = Rc::clone(&chose);
+            folder.connect_choose(move |_| chose.set(true));
+        }
+        folder.chooser().emit_clicked();
+        assert!(
+            chose.get(),
+            "Choose… reached no slot, so the file dialog would never open"
+        );
+    }
+
+    /// The editor is a template as well, and its "No options" row is declared in it and
+    /// hidden there — a render only ever flips it.
+    fn the_editor_is_a_template_too() {
+        let (editor, _) = recording(Scope::Profile);
+        let empty = editor.imp().empty.get();
+        assert!(
+            !empty.is_visible(),
+            "the empty-state row must start hidden: an editor that has not rendered yet \
+             does not know whether the profile has options"
+        );
+
+        editor.render(&schema(vec![]), &BTreeMap::new(), &BTreeMap::new());
+        assert!(editor.keys().is_empty());
+        assert!(
+            empty.is_visible(),
+            "a profile that publishes no options must say so rather than show a blank group"
+        );
+
+        editor.render(&image_schema(), &BTreeMap::new(), &BTreeMap::new());
+        assert!(
+            !empty.is_visible(),
+            "the empty-state row must go once there are rows to show"
+        );
     }
 
     /// Acceptance: the exported profiles render as a combo, a spin row, a switch and a

@@ -131,7 +131,7 @@ impl ProfilesPage {
         }
 
         for (_, editor) in self.editors.borrow().iter() {
-            self.page.remove(editor.widget());
+            self.page.remove(editor);
         }
         self.editors.borrow_mut().clear();
 
@@ -155,7 +155,7 @@ impl ProfilesPage {
                 });
             }
 
-            self.page.add(editor.widget());
+            self.page.add(&editor);
             editors.push((kind, editor));
         }
 

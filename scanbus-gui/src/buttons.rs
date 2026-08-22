@@ -929,7 +929,7 @@ fn open_options(
     body.set_margin_bottom(18);
     body.set_margin_start(18);
     body.set_margin_end(18);
-    body.append(editor.widget());
+    body.append(&editor);
     body.append(&actions);
 
     window.set_child(Some(&body));

@@ -155,7 +155,11 @@ so the pane declares them and holds one template child per row instead of three.
 `$OptionsEditor` is declared *inside* `$OptionsDialog` rather than appended to its body
 per open, which is the one place the files depart from what the code does today. The
 window always holds exactly one editor above the actions row; only its `Scope` and its
-rows change, and `Scope` is content.
+rows change, and `Scope` is content. It is therefore not a construction argument once
+`$OptionsEditor` is a template subclass — GtkBuilder calls `g_object_new` and nothing
+else — so an editor the dialog declared has no scope until the dialog gives it one, and
+`OptionsEditor` refuses to render before that rather than guessing a level of §6's chain
+to write to.
 
 **`blueprint-compiler lint` is part of the build convention, and four of its rules
 decide things this document did not.** All of them apply to `data/ui/*.blp`, none to the
@@ -237,10 +241,17 @@ Two things this page must get right, and they are the reason it is its own issue
 
 One `AdwPreferencesGroup` per `Profile1` object, and every row in it comes from walking that
 profile's `OptionsSchema` (§11.1, now `Profile1.OptionsSchema` in API §6): a closed set of
-values is an `AdwComboRow`, a bounded integer an `AdwSpinRow`, a boolean an `AdwSwitchRow`, a
+values is an `AdwComboRow`, a bounded integer a spin row, a boolean a switch row, a
 `path` a folder chooser. Nothing in `profiles.rs` or `options.rs` names an option key or a
 profile kind, which is the point — an option the daemon adds to its table in
 `scanbus-daemon/src/profiles/options.rs` becomes a row here with no GUI change.
+
+The last two are *not* `AdwSpinRow` and `AdwSwitchRow`, though they look it. Each row kind is
+a composite template with the origin pill and **Reset** declared in its `.blp`, so each is a
+subclass — and both of those Adw classes are `G_DECLARE_FINAL_TYPE`, which GObject refuses to
+derive from. Both are an `AdwActionRow` with one widget in the suffix, so that is what
+`option-row-number.blp` and `option-row-flag.blp` declare: the same tree, the same
+`activatable-widget` behaviour, one class further down.
 
 Two cases the factory has to answer explicitly. A `type` this version has no widget for
 becomes a **read-only row naming the type**, because hiding it would make a daemon-side
