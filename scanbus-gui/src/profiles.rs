@@ -7,6 +7,11 @@
 //! is published as a property, so adding an option there makes a row appear here without
 //! a line changing in the GUI.
 //!
+//! `profiles-page.blp` holds the two groups whose count is fixed — the one shown when the
+//! daemon exports no profile, and the one listing advertised kinds with no object — and
+//! nothing else: the editors between them are one per exported profile, so they are built
+//! here.
+//!
 //! # A kind with no object is said out loud
 //!
 //! `Manager1.GetProfileTypes` and the exported `Profile1` objects are not the same list.
@@ -19,13 +24,16 @@
 //! find `ocr` has no way to tell "this build has no OCR" from "the GUI forgot to show it",
 //! and a daemon that starts exporting `ocr` tomorrow would need a GUI change to reveal it.
 
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::collections::BTreeMap;
 
 use async_channel::Sender;
+use gtk::glib;
+use gtk::{CompositeTemplate, TemplateChild};
 use gtk4 as gtk;
 use libadwaita as adw;
 use libadwaita::prelude::*;
+use libadwaita::subclass::prelude::*;
 use scanbus_client::convert;
 use scanbus_core::ProfileKind;
 
@@ -34,62 +42,83 @@ use crate::options::{OptionsEditor, Scope};
 use crate::scanners::humanize_profile;
 use crate::store::ProfileEntry;
 
-pub struct ProfilesPage {
-    root: gtk::ScrolledWindow,
-    page: adw::PreferencesPage,
-    /// One editor per exported `Profile1`, keyed the way the store keys them.
-    editors: RefCell<Vec<(ProfileKind, OptionsEditor)>>,
-    unimplemented: adw::PreferencesGroup,
-    unimplemented_rows: RefCell<Vec<adw::ActionRow>>,
-    /// The daemon is not running, or exports no profile at all.
-    absent: adw::PreferencesGroup,
-    commands: Sender<BusCommand>,
+/// The private instance struct GObject owns for the page; [`ProfilesPage`] is the handle
+/// `ScanbusWindow` holds.
+mod imp {
+    use super::*;
+
+    /// No `Debug`: the bus channel and the editors are plain Rust types that do not
+    /// derive it.
+    #[derive(Default, CompositeTemplate)]
+    #[template(resource = "/org/scanbus/Gui/ui/profiles-page.ui")]
+    pub struct ProfilesPage {
+        /// The daemon is not running, or exports no profile at all. Declared hidden, so
+        /// a render only ever flips it.
+        #[template_child]
+        pub absent: TemplateChild<adw::PreferencesGroup>,
+        /// Declared with no rows: there is one per advertised kind the daemon exports no
+        /// object for, and that count comes from the bus.
+        #[template_child]
+        pub unimplemented: TemplateChild<adw::PreferencesGroup>,
+
+        /// One editor per exported `Profile1`, keyed the way the store keys them.
+        pub(super) editors: RefCell<Vec<(ProfileKind, OptionsEditor)>>,
+        pub(super) unimplemented_rows: RefCell<Vec<adw::ActionRow>>,
+
+        /// A `OnceCell` for the reason `options.rs` gives at length: a template subclass
+        /// is constructed by `g_object_new` and can be handed no argument of ours, while
+        /// the channel an edited row writes down is not something the page can guess.
+        pub(super) commands: OnceCell<Sender<BusCommand>>,
+    }
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for ProfilesPage {
+        /// Must match `template $ProfilesPage` in `profiles-page.blp`.
+        const NAME: &'static str = "ProfilesPage";
+        type Type = super::ProfilesPage;
+        type ParentType = adw::PreferencesPage;
+
+        fn class_init(klass: &mut Self::Class) {
+            klass.bind_template();
+        }
+
+        fn instance_init(obj: &glib::subclass::InitializingObject<Self>) {
+            obj.init_template();
+        }
+    }
+
+    impl ObjectImpl for ProfilesPage {}
+    impl WidgetImpl for ProfilesPage {}
+    impl PreferencesPageImpl for ProfilesPage {}
+}
+
+glib::wrapper! {
+    /// The Profiles page, built from `profiles-page.blp` and written from the store.
+    pub struct ProfilesPage(ObjectSubclass<imp::ProfilesPage>)
+        @extends adw::PreferencesPage, gtk::Widget,
+        @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget;
 }
 
 impl ProfilesPage {
     pub fn new(commands: Sender<BusCommand>) -> Self {
-        let page = adw::PreferencesPage::new();
+        let page: Self = glib::Object::new();
 
-        let absent = adw::PreferencesGroup::builder().title("Profiles").build();
-        absent.add(
-            &adw::ActionRow::builder()
-                .title("No profiles")
-                .subtitle(
-                    "The scanbus service exports no profile objects. Start it from \
-                     Settings, then come back.",
-                )
-                .build(),
+        // Empty cell: the object was built on the line above and this is its only
+        // constructor, so the `set` cannot fail — see the note in `window.rs`.
+        assert!(
+            page.imp().commands.set(commands).is_ok(),
+            "commands set twice"
         );
-        absent.set_visible(false);
-        page.add(&absent);
 
-        let unimplemented = adw::PreferencesGroup::builder()
-            .title("Not implemented yet")
-            .description(
-                "The service reports these profile types but exports no object for them, \
-                 so they have no options to edit.",
-            )
-            .build();
-        unimplemented.set_visible(false);
-        page.add(&unimplemented);
-
-        let root = gtk::ScrolledWindow::new();
-        root.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
-        root.set_child(Some(&page));
-
-        Self {
-            root,
-            page,
-            editors: RefCell::new(Vec::new()),
-            unimplemented,
-            unimplemented_rows: RefCell::new(Vec::new()),
-            absent,
-            commands,
-        }
+        page
     }
 
-    pub fn widget(&self) -> &gtk::ScrolledWindow {
-        &self.root
+    /// The channel an edited row writes down.
+    fn commands(&self) -> &Sender<BusCommand> {
+        self.imp()
+            .commands
+            .get()
+            .expect("a ProfilesPage GtkBuilder made has no bus channel yet")
     }
 
     /// Renders the whole view from the store.
@@ -100,7 +129,7 @@ impl ProfilesPage {
     pub fn render(&self, profiles: &BTreeMap<ProfileKind, ProfileEntry>, advertised: &[String]) {
         self.rebuild(profiles);
 
-        for (kind, editor) in self.editors.borrow().iter() {
+        for (kind, editor) in self.imp().editors.borrow().iter() {
             let Some(entry) = profiles.get(kind) else {
                 continue;
             };
@@ -112,15 +141,16 @@ impl ProfilesPage {
         }
 
         self.render_unimplemented(profiles, advertised);
-        self.absent.set_visible(profiles.is_empty());
+        self.imp().absent.set_visible(profiles.is_empty());
     }
 
     /// Adds and removes editors when the exported profiles change, and only then — a
     /// profile whose `Options` moved keeps its widgets, so a `PropertiesChanged` does not
     /// scroll the view or close a dropdown.
     fn rebuild(&self, profiles: &BTreeMap<ProfileKind, ProfileEntry>) {
+        let imp = self.imp();
         let wanted: Vec<ProfileKind> = profiles.keys().copied().collect();
-        if self
+        if imp
             .editors
             .borrow()
             .iter()
@@ -130,17 +160,23 @@ impl ProfilesPage {
             return;
         }
 
-        for (_, editor) in self.editors.borrow().iter() {
-            self.page.remove(editor);
+        for (_, editor) in imp.editors.borrow().iter() {
+            self.remove(editor);
         }
-        self.editors.borrow_mut().clear();
+        imp.editors.borrow_mut().clear();
 
-        // The informational groups were added first and have to end up last, so they are
-        // lifted out and put back around the profiles.
-        self.page.remove(&self.unimplemented);
-
+        // Both informational groups are children of the page before the first render —
+        // that is what putting them in the template means — so `add` would append every
+        // editor *below* the unimplemented-kinds group. `insert` places each one at an
+        // explicit index instead: `absent` is the group at 0, so the editors take 1..n
+        // in the store's `BTreeMap` order and `unimplemented` is pushed along ahead of
+        // them, staying last.
+        //
+        // `adw_preferences_page_insert` is libadwaita 1.8; the crate asks for `v1_9`.
+        // Without it the same order costs a remove and a re-add of `unimplemented`
+        // around the loop, which is what this did while the feature level was 1.4.
         let mut editors = Vec::with_capacity(wanted.len());
-        for kind in wanted {
+        for (position, kind) in wanted.into_iter().enumerate() {
             let editor = OptionsEditor::new(Scope::Profile);
             editor.set_title(&humanize_profile(kind.as_str()));
             editor.set_description(Some(
@@ -149,18 +185,19 @@ impl ProfilesPage {
             ));
 
             {
-                let commands = self.commands.clone();
+                let commands = self.commands().clone();
                 editor.connect_write(move |options| {
                     let _ = commands.try_send(BusCommand::SetProfileOptions { kind, options });
                 });
             }
 
-            self.page.add(&editor);
+            // The editors already inserted shift the next one along, hence the running
+            // index rather than a constant one.
+            self.insert(&editor, 1 + position as i32);
             editors.push((kind, editor));
         }
 
-        self.page.add(&self.unimplemented);
-        *self.editors.borrow_mut() = editors;
+        *imp.editors.borrow_mut() = editors;
     }
 
     fn render_unimplemented(
@@ -168,6 +205,7 @@ impl ProfilesPage {
         profiles: &BTreeMap<ProfileKind, ProfileEntry>,
         advertised: &[String],
     ) {
+        let imp = self.imp();
         let missing: Vec<&String> = advertised
             .iter()
             .filter(|name| {
@@ -177,10 +215,10 @@ impl ProfilesPage {
             })
             .collect();
 
-        for row in self.unimplemented_rows.borrow().iter() {
-            self.unimplemented.remove(row);
+        for row in imp.unimplemented_rows.borrow().iter() {
+            imp.unimplemented.remove(row);
         }
-        self.unimplemented_rows.borrow_mut().clear();
+        imp.unimplemented_rows.borrow_mut().clear();
 
         let mut rows = Vec::with_capacity(missing.len());
         for name in missing {
@@ -193,12 +231,12 @@ impl ProfilesPage {
             tag.add_css_class("caption");
             tag.set_valign(gtk::Align::Center);
             row.add_suffix(&tag);
-            self.unimplemented.add(&row);
+            imp.unimplemented.add(&row);
             rows.push(row);
         }
 
-        self.unimplemented.set_visible(!rows.is_empty());
-        *self.unimplemented_rows.borrow_mut() = rows;
+        imp.unimplemented.set_visible(!rows.is_empty());
+        *imp.unimplemented_rows.borrow_mut() = rows;
     }
 }
 
@@ -235,9 +273,35 @@ pub(crate) mod widget_checks {
         names.iter().map(|name| (*name).to_owned()).collect()
     }
 
+    /// The page's groups, in the order they are drawn.
+    ///
+    /// `AdwPreferencesPage` publishes no list of its groups, and where it keeps them —
+    /// a box, a clamp, a scroller around both — is its template's business and has
+    /// changed across releases. So this walks the page's descendants in tree order,
+    /// which is draw order, and stops at each group: a group's own children are rows,
+    /// never groups, so nothing below one can be missed. The result is the sequence
+    /// `adw_preferences_page_insert` indexes into.
+    fn drawn(page: &ProfilesPage) -> Vec<adw::PreferencesGroup> {
+        fn walk(widget: &gtk::Widget, found: &mut Vec<adw::PreferencesGroup>) {
+            let mut next = widget.first_child();
+            while let Some(child) = next {
+                next = child.next_sibling();
+                match child.downcast::<adw::PreferencesGroup>() {
+                    Ok(group) => found.push(group),
+                    Err(other) => walk(&other, found),
+                }
+            }
+        }
+
+        let mut found = Vec::new();
+        walk(page.upcast_ref(), &mut found);
+        found
+    }
+
     pub(crate) fn run() {
         let (commands, sent) = async_channel::unbounded();
         let page = ProfilesPage::new(commands);
+        let imp = page.imp();
 
         // §2 advertises four kinds; this daemon exports two. Both halves are shown.
         page.render(
@@ -246,11 +310,36 @@ pub(crate) mod widget_checks {
         );
 
         {
-            let editors = page.editors.borrow();
+            let editors = imp.editors.borrow();
             assert_eq!(
                 editors.iter().map(|(kind, _)| *kind).collect::<Vec<_>>(),
                 [ProfileKind::Image, ProfileKind::Document],
                 "the view is the objects that exist, in the store's order"
+            );
+
+            // Order, and not only membership. Both fixed groups are on the page before
+            // the first render, so an editor added rather than inserted lands *below*
+            // the unimplemented-kinds group — the regression 10.23 is written around.
+            let drawn = drawn(&page);
+            let at = |group: &adw::PreferencesGroup| {
+                drawn
+                    .iter()
+                    .position(|candidate| candidate == group)
+                    .expect("a group the page does not hold")
+            };
+            assert_eq!(at(&imp.absent.get()), 0, "the absent group is not first");
+            assert_eq!(
+                editors
+                    .iter()
+                    .map(|(_, editor)| at(editor.upcast_ref()))
+                    .collect::<Vec<_>>(),
+                [1, 2],
+                "the editors are not between the two fixed groups"
+            );
+            assert_eq!(
+                at(&imp.unimplemented.get()),
+                drawn.len() - 1,
+                "the unimplemented-kinds group is not last"
             );
 
             // Acceptance: the whole widget vocabulary of §6, with no profile named in
@@ -284,8 +373,8 @@ pub(crate) mod widget_checks {
         }
 
         // The kinds with no object say so rather than going missing.
-        let rows = page.unimplemented_rows.borrow();
-        assert!(page.unimplemented.is_visible());
+        let rows = imp.unimplemented_rows.borrow();
+        assert!(imp.unimplemented.is_visible());
         assert_eq!(
             rows.iter()
                 .map(|row| row.title().to_string())
@@ -296,14 +385,14 @@ pub(crate) mod widget_checks {
 
         // A daemon that advertises only what it exports has nothing to disclaim.
         page.render(&exported(), &advertised(&["image", "document"]));
-        assert!(page.unimplemented_rows.borrow().is_empty());
-        assert!(!page.unimplemented.is_visible());
-        assert!(!page.absent.is_visible());
+        assert!(imp.unimplemented_rows.borrow().is_empty());
+        assert!(!imp.unimplemented.is_visible());
+        assert!(!imp.absent.is_visible());
 
         // A profile that stops being exported takes its editor with it.
         page.render(&BTreeMap::new(), &advertised(&["image", "document"]));
-        assert!(page.editors.borrow().is_empty());
-        assert!(page.absent.is_visible());
-        assert_eq!(page.unimplemented_rows.borrow().len(), 2);
+        assert!(imp.editors.borrow().is_empty());
+        assert!(imp.absent.is_visible());
+        assert_eq!(imp.unimplemented_rows.borrow().len(), 2);
     }
 }

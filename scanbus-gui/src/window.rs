@@ -155,17 +155,14 @@ impl ScanbusWindow {
         // The three pages of `page_stack`, added by instance because `window.blp`
         // declares the stack empty: a `Gtk.StackPage` there has to name a child *class*,
         // and a builder-instantiated child gets no constructor arguments — all three
-        // pages are handed the store and the bus channel when they are built. `add_named`
-        // takes an instance and so does not care what class it is, which is what lets
-        // Profiles sit in the same stack while it is still a plain widget ([10.23]).
+        // pages are handed the store and the bus channel when they are built.
         let model = Rc::clone(imp.scanners.get().expect("scanners set just above"));
         let commands = imp.commands.get().expect("commands set just above").clone();
 
         let scanners_pane = ScannersPane::new(Rc::clone(&model), commands.clone());
-        let profiles_page = Rc::new(ProfilesPage::new(commands.clone()));
+        let profiles_page = ProfilesPage::new(commands.clone());
         imp.page_stack.add_named(&scanners_pane, Some("scanners"));
-        imp.page_stack
-            .add_named(profiles_page.widget(), Some("profiles"));
+        imp.page_stack.add_named(&profiles_page, Some("profiles"));
         imp.page_stack.add_named(
             &SettingsPage::new(Rc::clone(&model), commands),
             Some("settings"),
@@ -177,13 +174,14 @@ impl ScanbusWindow {
         // does nothing, and the window would come up on an empty pane.
         imp.sections.select_row(Some(&*imp.scanners_row));
 
-        // The Profiles page renders from the store like every other page, but it is not
-        // a subclass yet, so its registration stays here instead of moving into its own
-        // constructor with [10.23]. It captures the page, which has no other owner, and
-        // the model — but not the window, which is the one that has to stay finalisable.
+        // The Profiles page renders from the store like every other page, and is given
+        // the bus channel only: the store is this window's, so the registration stays
+        // here rather than moving into `ProfilesPage::new`. The closure captures the
+        // page — which the stack also holds — and the model, but not the window, which
+        // is the one that has to stay finalisable.
         {
             let model = Rc::clone(&model);
-            let profiles_page = Rc::clone(&profiles_page);
+            let profiles_page = profiles_page.clone();
             let render = move || {
                 profiles_page.render(&model.profiles(), &model.service_details().profile_types);
             };

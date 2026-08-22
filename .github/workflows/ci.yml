@@ -48,7 +48,11 @@ jobs:
 
   gui:
     name: gui headless + xvfb
-    runs-on: ubuntu-latest
+    # Not ubuntu-latest, which is still noble and carries libadwaita 1.5.0:
+    # scanbus-gui asks for `v1_9`, so libadwaita-sys' pkg-config check fails there
+    # before a line is compiled. Resolute has 1.9.0, the same floor debian/control
+    # states and the same release the .deb is built against.
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v4
 
