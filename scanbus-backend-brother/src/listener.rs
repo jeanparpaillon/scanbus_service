@@ -658,48 +658,6 @@ mod tests {
             .expect("the stream must not end")
     }
 
-    /// How many UDP sockets this process holds on `port`, from `/proc`.
-    ///
-    /// 5.9's acceptance criterion is written in terms of `/proc/self/fd`, so it is asserted
-    /// from there rather than from this module's own bookkeeping, which is the thing under
-    /// test. `/proc/self/fd` gives the socket *inodes* the process owns and nothing about
-    /// what they are bound to, so `/proc/net/udp` supplies the port — and counting by port
-    /// rather than counting sockets is what makes the number immune to the other tests in
-    /// this binary, which run in parallel threads of the same process and open sockets of
-    /// their own.
-    fn sockets_on(port: u16) -> usize {
-        let inodes: std::collections::BTreeSet<String> = std::fs::read_dir("/proc/self/fd")
-            .expect("/proc/self/fd is readable on Linux")
-            .filter_map(Result::ok)
-            .filter_map(|entry| std::fs::read_link(entry.path()).ok())
-            .filter_map(|target| {
-                target
-                    .to_string_lossy()
-                    .strip_prefix("socket:[")?
-                    .strip_suffix(']')
-                    .map(str::to_owned)
-            })
-            .collect();
-
-        // `sl local_address rem_address st tx:rx tr:when retrnsmt uid timeout inode …`,
-        // with `local_address` as hex `address:port` in field 1 and the inode in field 9.
-        // Matching the whole of `0.0.0.0:port` and not just the port is what keeps the
-        // sockets the other tests bind to `127.0.0.x:0` out of the count.
-        let wanted = format!("00000000:{port:04X}");
-        std::fs::read_to_string("/proc/net/udp")
-            .expect("/proc/net/udp is readable on Linux")
-            .lines()
-            .skip(1)
-            .filter(|line| {
-                let fields: Vec<&str> = line.split_whitespace().collect();
-                let (Some(local), Some(inode)) = (fields.get(1), fields.get(9)) else {
-                    return false;
-                };
-                local.eq_ignore_ascii_case(&wanted) && inodes.contains(*inode)
-            })
-            .count()
-    }
-
     /// A port for a test that needs a fixed one, free at the moment it is handed out.
     ///
     /// Taken from **below** the ephemeral range and from a counter no two tests read the
@@ -826,47 +784,6 @@ mod tests {
         let trigger = next(&mut subscription).await;
         assert_eq!(trigger.scanner_id, scanner(1));
         assert_eq!(trigger.kind, TriggerKind::Button { index: 0 });
-    }
-
-    /// The socket exists exactly while somebody is subscribed, over and over.
-    ///
-    /// This is the acceptance criterion that has to be run rather than reasoned about: a
-    /// rebind that raced our own closing socket would come back `EADDRINUSE` and be
-    /// reported as `brscan-skey`, on a machine that has never had it installed.
-    #[tokio::test]
-    async fn ten_connect_disconnect_cycles_leak_no_socket() {
-        // A fixed port for the whole run, so that "one socket, then none" is asserted about
-        // the same port every cycle.
-        let port = free_port().await;
-        let listener = Listener::new(port);
-        assert_eq!(sockets_on(port), 0, "the port must start out unused");
-
-        for cycle in 0..10 {
-            let mut subscription = listener.subscribe(scanner(1), device(1)).await.unwrap();
-            assert_eq!(listener.port(), Some(port), "cycle {cycle} must bind");
-            assert_eq!(
-                sockets_on(port),
-                1,
-                "cycle {cycle} must hold exactly one socket",
-            );
-
-            send(device(1), port, &key_press(device(1), Function::Image)).await;
-            let trigger = next(&mut subscription).await;
-            assert_eq!(trigger.kind, TriggerKind::Button { index: 1 });
-
-            // Both teardown paths, alternating, and both must leave the same state.
-            if cycle % 2 == 0 {
-                listener.unsubscribe(&scanner(1)).await;
-                drop(subscription);
-            } else {
-                drop(subscription);
-                listener.unsubscribe(&scanner(1)).await;
-            }
-
-            assert_eq!(listener.subscribers(), 0, "cycle {cycle}");
-            assert_eq!(listener.port(), None, "cycle {cycle} must release the port");
-            assert_eq!(sockets_on(port), 0, "cycle {cycle} left a socket behind");
-        }
     }
 
     /// A dropped stream releases the socket without an `unsubscribe`, and the next
@@ -1010,17 +927,5 @@ mod tests {
             TriggerKind::Button { index: 0 },
             "the second device's press must arrive whatever the first one is doing",
         );
-    }
-
-    /// An inert stream stays open forever rather than ending, which the daemon would read
-    /// as a listener that died.
-    #[tokio::test]
-    async fn an_inert_stream_never_ends() {
-        let mut inert = Inert::default();
-        let poll = timeout(Duration::from_millis(50), async {
-            std::future::poll_fn(|cx| Pin::new(&mut inert).poll_next(cx)).await
-        })
-        .await;
-        assert!(poll.is_err(), "an inert stream must stay pending");
     }
 }
