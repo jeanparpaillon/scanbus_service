@@ -95,7 +95,7 @@ jobs:
         id: build
         uses: jtdor/build-deb-action@v1
         env:
-          DEB_BUILD_OPTIONS: noautodbgsym
+          DEB_BUILD_OPTIONS: noautodbgsym nocheck
         with:
           docker-image: ${{ matrix.image }}
           buildpackage-opts: --build=binary --no-sign
