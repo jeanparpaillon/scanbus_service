@@ -102,6 +102,12 @@ jobs:
           artifacts-dir: artifacts
           extra-build-deps: curl xz-utils ca-certificates
 
+      # build-deb-action builds inside a container running as root, so artifacts/ and
+      # everything in it comes back owned by uid 0. The runner can read those files but
+      # cannot write the directory, and signing has to replace the .changes in place.
+      - name: Take ownership of artifacts
+        run: sudo chown -R "$(id -u):$(id -g)" artifacts
+
       - name: Sign .changes
         env:
           GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}

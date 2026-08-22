@@ -43,6 +43,12 @@ die() {
 set -- "$artifacts"/*.changes
 [ -e "$1" ] || die "no .changes files in $artifacts"
 
+# Signing replaces the .changes in place, so the directory has to be writable. Under
+# Actions it is not by default: the .deb build runs in a container as root and leaves
+# artifacts/ owned by uid 0, which surfaces as a gpg "Permission denied" on its
+# --output file rather than as anything to do with the key.
+[ -w "$artifacts" ] || die "$artifacts is not writable by $(id -un) — chown it first"
+
 GNUPGHOME=$(mktemp -d)
 export GNUPGHOME
 chmod 700 "$GNUPGHOME"
